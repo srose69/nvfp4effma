@@ -15,12 +15,14 @@
 
 NVIDIA's native FP4 compute stack (NVFP4 in cuBLASLt, Transformer Engine and ModelOpt) starts at
 Blackwell-class GPUs (sm_100+). **NVFP4EffMA** brings the same data format to the GPUs most people still
-have — Maxwell, Pascal, Volta, Turing, Ampere, Jetson Orin, Ada and Hopper (sm_50 … sm_90). Weights stay
-in NVFP4 (E2M1 values, one 8-bit scale per 16 values, an FP32 global: 4.5 bits per value, 7× smaller than
+have — Maxwell, Pascal, Volta, Turing, Ampere, Jetson Orin, Ada and Hopper (sm_50 … sm_90). 
+
+Weights stay in NVFP4 (E2M1 values, one 8-bit scale per 16 values, an FP32 global: 4.5 bits per value, 7× smaller than
 FP32), products are exact, accumulation is FP32, and outputs come out in BF16 / FP16 / FP32. Every NVFP4
 variant NVIDIA uses is read and produced as it is, bit for bit: ModelOpt checkpoints, Transformer Engine's
 1 × 16 and 16 × 16 recipes (amax globals, row-scaled activations, 4over6, UE5M3 scales, columnwise data) and
 the GEMM-swizzled scale layout of cuBLASLt ([below](#nvidia-nvfp4-variants)).
+
 Activations can be BF16 / FP16 / FP32 (W4A16, exact), int8 with a scale per 16 values (W4A8) or NVFP4
 (W4A4); the PyTorch `linear` quantizes BF16 activations to int8 on the fly beyond 2 rows by default, where
 that is twice as fast as the exact path. Twice an E2M1 value is an exact int8, so from sm_61 on one DP4A does four exact products: W4A8 and
