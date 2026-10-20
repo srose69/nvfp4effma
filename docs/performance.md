@@ -47,16 +47,16 @@ describe the cooling in `COOLING`.
 
 Full tables: [benches/1080.md](../benches/1080.md).
 
-- **NVFP4 × NVFP4 and NVFP4 × INT8 GEMM are about 2× cuBLAS SGEMM**: 9.4–9.9 ms at 4096³ (7.0–7.3 TMAC/s,
-  197–202 MAC/clk/SM) vs 19.4–19.6 ms. On Pascal this is the only way past the FP32 FFMA rate: 4 exact
-  products per DP4A ([design.md](design.md)). Accumulating into an FP32 D costs 2 % more (the epilogue reads
+- **NVFP4 × NVFP4 and NVFP4 × INT8 GEMM are 2× cuBLAS SGEMM**: 9.5 ms at 4096³ (7.2 TMAC/s,
+  197–202 MAC/clk/SM) vs 19.4–19.5 ms. On Pascal this is the only way past the FP32 FFMA rate: 4 exact
+  products per DP4A ([design.md](design.md)). Accumulating into an FP32 D costs 4 % more (the epilogue reads
   D and nothing overlaps it with one block per SM).
-- **NVFP4 × BF16 / FP16 / FP32 GEMM runs at SGEMM speed** (19.7–20.0 ms, 74–75 % of the FP32 peak, one
+- **NVFP4 × BF16 / FP16 / FP32 GEMM runs at SGEMM speed** (19.8–20.0 ms, 75 % of the FP32 peak, one
   FFMA per MAC) while reading 7× fewer weight bytes than SGEMM's FP32 weights.
-- **GEMV is bandwidth-bound for small n**: 0.140 ms for an 8192 × 8192 NVFP4 matrix with a BF16 x, 269
-  GB/s or 84 % of the DRAM peak (96 % of a device-to-device copy) — 7.4× cuBLAS SGEMV on FP32 weights. With
+- **GEMV is bandwidth-bound for small n**: 0.139–0.142 ms for an 8192 × 8192 NVFP4 matrix, 266–271 GB/s
+  or 83–85 % of the DRAM peak (94–96 % of a device-to-device copy) — 7.3× cuBLAS SGEMV on FP32 weights. With
   NVFP4 or INT8 activations (DP4A per block) n = 2 runs as fast as n = 1 and n = 8 takes 0.16–0.20 ms,
-  7.7–9.7× SGEMM n = 8; with BF16 activations the per-value decode makes n = 4 … 8 compute-bound
+  7.7–9.6× SGEMM n = 8; with BF16 activations the per-value decode makes n = 4 … 8 compute-bound
   (178 → 109 GB/s), still 4.4× SGEMM at n = 8. Beyond 8 columns the GEMV kernel runs in groups of 8:
   0.32 ms for n = 16 with INT8 activations.
 - **Quantization** streams at 87–89 % of the DRAM peak (BF16 → NVFP4: 0.60 ms for 64 M values).

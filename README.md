@@ -44,17 +44,17 @@ taken at the SM clock measured while that row ran:
 
 | Workload | NVFP4EffMA | Utilization | Baseline: cuBLAS FP32 | Speed vs baseline |
 |---|---:|---|---:|---:|
-| GEMM 4096³, NVFP4 × NVFP4 → BF16 | 9.72 ms | **159 %** of FP32 peak (7.1 TMAC/s) | SGEMM 19.6 ms (76 % of FP32 peak) | **2.01×** |
-| GEMM 4096³, NVFP4 × NVFP4, FP32 D += (accumulate) | 9.89 ms | 150 % of FP32 peak | SGEMM 19.6 ms (76 % of FP32 peak) | **1.98×** |
-| GEMM 4096³, NVFP4 × INT8 (W4A8) → BF16 | 9.40 ms | 158 % of FP32 peak (7.3 TMAC/s) | SGEMM 19.6 ms (76 % of FP32 peak) | **2.1×** |
-| GEMM 4096³, NVFP4 weights × BF16 activations, exact | 19.8 ms | 74 % of FP32 peak | SGEMM 19.6 ms (76 % of FP32 peak) | 0.99× |
-| `linear` 4096³, BF16 activations, default `act="auto"` (int8 quantization included) | 10.0 ms | — | SGEMM 19.6 ms | **2.0×** |
-| GEMV 8192 × 8192, batch 1 (BF16 x) | 0.140 ms | 269 GB/s, **84 %** of DRAM peak | SGEMV 1.042 ms | **7.4×** |
-| GEMV 8192 × 8192, batch 8 (INT8 x) | 0.159 ms | 238 GB/s, 74 % of DRAM peak | SGEMM 1.538 ms | **9.7×** |
-| GEMV 8192 × 8192, batch 8 (BF16 x) | 0.347 ms | 109 GB/s, 34 % of DRAM peak | SGEMM 1.538 ms | **4.4×** |
+| GEMM 4096³, NVFP4 × NVFP4 → BF16 | 9.51 ms | **157 %** of FP32 peak (7.2 TMAC/s) | SGEMM 19.5 ms (76 % of FP32 peak) | **2.05×** |
+| GEMM 4096³, NVFP4 × INT8 (W4A8) → BF16 | 9.49 ms | **158 %** of FP32 peak (7.2 TMAC/s) | SGEMM 19.5 ms (76 % of FP32 peak) | **2.05×** |
+| GEMM 4096³, NVFP4 × NVFP4, FP32 D += (accumulate) | 9.89 ms | 151 % of FP32 peak | SGEMM 19.5 ms (76 % of FP32 peak) | **1.97×** |
+| GEMM 4096³, NVFP4 weights × BF16 activations, exact | 19.8 ms | 75 % of FP32 peak | SGEMM 19.5 ms (76 % of FP32 peak) | 0.98× |
+| `linear` 4096³, BF16 activations, default `act="auto"` (int8 quantization included) | 10.0 ms | — | SGEMM 19.5 ms | **2.0×** |
+| GEMV 8192 × 8192, batch 1 (BF16 x) | 0.142 ms | 266 GB/s, **83 %** of DRAM peak | SGEMV 1.042 ms | **7.3×** |
+| GEMV 8192 × 8192, batch 8 (INT8 x) | 0.160 ms | 237 GB/s, 74 % of DRAM peak | SGEMM 1.539 ms | **9.6×** |
+| GEMV 8192 × 8192, batch 8 (BF16 x) | 0.348 ms | 109 GB/s, 34 % of DRAM peak | SGEMM 1.539 ms | **4.4×** |
 | Quantization, 8192 × 8192 BF16 → NVFP4 | 0.60 ms | 286 GB/s, **89 %** of DRAM peak | — | — |
 
-FP32 peak: 20 SMs × 128 FFMA × SM clock (1737–1822 MHz in these rows); DRAM peak: 320 GB/s; GEMV
+FP32 peak: 20 SMs × 128 FFMA × SM clock (1793–1808 MHz in the GEMM rows); DRAM peak: 320 GB/s; GEMV
 bandwidth counts the values and the block scales. With both operands in NVFP4 the DP4A kernel does four
 exact products per instruction and exceeds the FP32 FFMA peak; with BF16 activations a MAC costs one FP32
 FFMA, so compute-bound GEMM tops out at SGEMM speed while reading 7× fewer weight bytes, and
