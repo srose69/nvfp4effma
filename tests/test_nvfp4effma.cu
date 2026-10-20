@@ -2,7 +2,8 @@
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // NVFP4EffMA core (src/nvfp4effma.cuh), exhaustively, and nvfp4a_quantize / nvfp4a_dequantize:
 //  1. block  : the DP4A kernel's scale step -- y = fma(bits(0x4B400000 + p), sa, -1.5 * 2^23 * sa) ==
-//              p * sa exactly, for every block sum p in [-2304, 2304] and every finite E4M3 scale.
+//              p * sa exactly, for every block sum p in [-24384, 24384] (NVFP4 x NVFP4: |p| <= 2304,
+//              NVFP4 x INT8: |p| <= 16 * 12 * 127) and every finite E4M3 scale.
 //  2. dec4   : the PRMT lookup (4 nibbles -> 4 int8) == 2 * value for all 2^16 inputs, and the FP32
 //              decode e2m1_value<0 / 1> of every nibble at every position of a word.
 //  3. prod   : the dense-B MAC operands -- mul_rn(e2m1, sa) times every BF16 / FP16 value, for every
@@ -14,7 +15,8 @@
 //              the nearest value (midpoint table, ties to the even code, saturation; NaN: E2M1 +-6, E4M3
 //              0x7F).
 //  6. nvfp4a_quantize / nvfp4a_dequantize: BF16 / FP16 / FP32 data with zero, tiny and saturating
-//              blocks, padded leading dimensions, against the host emulation of the documented formulas.
+//              blocks, padded leading dimensions, against the host emulation of the documented formulas;
+//              nvfp4a_quantize to INT8 likewise.
 // Build with -DNVFP4A_NEGATIVE_CONTROLS to check that deliberately broken variants are rejected.
 #include "test_util.h"
 
@@ -64,7 +66,7 @@ template <float (*OP)(int, float)>
 __global__ void k_block(uint64_t base, uint64_t n, Err *err) {
   for (uint64_t k = base + blockIdx.x * blockDim.x + threadIdx.x; k < base + n; k += (uint64_t)gridDim.x * blockDim.x) {
     const uint32_t code = (uint32_t)(k & 0xFF);
-    const int p = (int)(k >> 8) - 2304;
+    const int p = (int)(k >> 8) - 24384;
     if ((code & 0x7F) == 0x7F) continue;  // E4M3 NaN: not a block scale
     const float sa = nvfp4a::e4m3_value(code), got = OP(p, sa);
     const double exact = (double)p * (double)sa;
@@ -243,6 +245,34 @@ static int test_quant(nvfp4a_dtype t, int rows, int cols) {
   for (size_t i = 0; i < ey.size(); ++i) bad += ey[i] != gy[i];
   printf("dequantize %s %4d x %5d: %s%s\n", DN[t], rows, cols, bad ? "FAIL" : "ok", gam == eam ? "" : " (amax mismatch)");
   fails += bad != 0 || gam != eam;
+
+  // INT8 (W4A8 activations): sb = amax / 127, q = RNE(x / sb)
+  {
+    int8_t *d8; float *s8;
+    const int ld8 = cols + 16, lsc8 = cols / 16 + 4;
+    cudaMalloc(&d8, (size_t)rows * ld8); cudaMalloc(&s8, (size_t)rows * lsc8 * 4);
+    cudaMemset(d8, 0x55, (size_t)rows * ld8); cudaMemset(s8, 0x55, (size_t)rows * lsc8 * 4);
+    nvfp4a_tensor Q8 = {d8, NVFP4A_INT8, s8, lsc8, nullptr, nullptr};
+    fails += nvfp4a_quantize(&X, lds, &Q8, ld8, rows, cols, 0) != NVFP4A_OK;
+    std::vector<int8_t> g8((size_t)rows * ld8), e8(g8.size(), 0x55);
+    std::vector<float> gs8((size_t)rows * lsc8), es8(gs8.size());
+    { uint32_t u = 0x55555555u; float f; memcpy(&f, &u, 4); for (auto &x : es8) x = f; }
+    cudaDeviceSynchronize();
+    cudaMemcpy(g8.data(), d8, g8.size(), cudaMemcpyDeviceToHost); cudaMemcpy(gs8.data(), s8, gs8.size() * 4, cudaMemcpyDeviceToHost);
+    for (int r = 0; r < rows; ++r)
+      for (int b = 0; b < cols / 16; ++b) {
+        float x[16], bmax = 0.f;
+        for (int i = 0; i < 16; ++i) { x[i] = hload(t, hx.data(), (size_t)r * lds + 16 * b + i); bmax = fmaxf(bmax, fabsf(x[i])); }
+        const float sb = bmax / 127.f;
+        for (int i = 0; i < 16; ++i)
+          e8[(size_t)r * ld8 + 16 * b + i] = (int8_t)(sb > 0.f ? fminf(fmaxf(rintf(x[i] / sb), -127.f), 127.f) : 0.f);
+        es8[(size_t)r * lsc8 + b] = sb;
+      }
+    bad = memcmp(g8.data(), e8.data(), g8.size()) != 0 || memcmp(gs8.data(), es8.data(), gs8.size() * 4) != 0;
+    printf("quantize   %s %4d x %5d -> INT8: %s\n", DN[t], rows, cols, bad ? "FAIL" : "ok");
+    fails += bad != 0;
+    cudaFree(d8); cudaFree(s8);
+  }
   for (void *p : {(void *)dx, (void *)dq, (void *)dsc, (void *)dg, (void *)dam, (void *)dam2, (void *)dy}) cudaFree(p);
   return fails;
 }
@@ -263,7 +293,7 @@ int main(int argc, char **argv) {
     cudaMemcpyToSymbol(c_mid4, m4, sizeof m4);
   }
   const uint64_t total = (argc > 1 && !strcmp(argv[1], "--quick")) ? 1ull << 26 : 1ull << 32;
-  const uint64_t blocks = 4609ull * 256;
+  const uint64_t blocks = (2ull * 24384 + 1) * 256;
 #ifndef NVFP4A_NEGATIVE_CONTROLS
   int fails = 0;
   fails += run("block", BLOCK(block_ok), blocks);

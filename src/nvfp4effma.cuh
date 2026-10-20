@@ -132,7 +132,7 @@ __host__ __device__ __forceinline__ uint32_t f32_to_e2m1(float x) {
 namespace kern {
 
 // ---- typed element access (BF16 / FP16 / FP32) -----------------------------------------------
-template <int T> struct Elem { static constexpr int bytes = T == NVFP4A_FP32 ? 4 : 2; };
+template <int T> struct Elem { static constexpr int bytes = T == NVFP4A_FP32 ? 4 : T == NVFP4A_INT8 ? 1 : 2; };
 
 __device__ __forceinline__ float scale_or_one(const float *p) { return p ? *p : 1.0f; }
 
@@ -203,8 +203,17 @@ __device__ __forceinline__ void epi_end(const Epilogue &e, EpiState &st) {
 }
 
 // ---- per-architecture kernel tables ----------------------------------------------------------
-// B / x dtypes NVFP4, BF16, FP16, FP32 -> 0, 1, 2, 3 (the dtype codes)
-constexpr int kOperandTypes = 4;
+// B / x dtypes NVFP4, BF16, FP16, FP32, INT8 -> 0, 1, 2, 3, 4 (the dtype codes)
+constexpr int kOperandTypes = 5;
+
+// Largest n that runs the GEMV kernel (in groups of 8 columns, each group reading A once) instead of the
+// tiled kernel, per B dtype (NVFP4, BF16, FP16, FP32, INT8): where the tiled kernel has too few tiles to
+// fill the GPU, re-reading A per group is faster.  Measured on a GTX 1080 at m = k = 8192.
+#ifdef NVFP4A_GEMV_MAXN  // measurement builds: one limit for every dtype
+constexpr int kGemvMaxN[kOperandTypes] = {NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN};
+#else
+constexpr int kGemvMaxN[kOperandTypes] = {48, 56, 56, 32, 56};
+#endif
 
 struct ArchTable {
   int cc;                                // compute capability * 10 + minor (61 = sm_61); 0 = default

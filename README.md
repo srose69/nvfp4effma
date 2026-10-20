@@ -18,8 +18,11 @@ Blackwell-class GPUs (sm_100+). **NVFP4EffMA** brings the same data format to th
 have — Maxwell, Pascal, Volta, Turing, Ampere, Jetson Orin, Ada and Hopper (sm_50 … sm_90). Weights stay
 in NVFP4 (E2M1 values, one E4M3 scale per 16 values, one FP32 scale per tensor: 4.5 bits per value, 7×
 smaller than FP32), products are exact, accumulation is FP32, and outputs come out in BF16 / FP16 / FP32.
-Activations can be NVFP4 as well (W4A4: twice an E2M1 value is an exact int8, so from sm_61 on one DP4A
-does four exact products — 2× cuBLAS SGEMM on a GTX 1080) or BF16 / FP16 / FP32 (W4A16).
+Activations can be BF16 / FP16 / FP32 (W4A16, exact), int8 with a scale per 16 values (W4A8) or NVFP4
+(W4A4); the PyTorch `linear` quantizes BF16 activations to int8 on the fly beyond 2 rows by default, where
+that is twice as fast as the exact path. Twice an E2M1 value is an exact int8, so from sm_61 on one DP4A does four exact products: W4A8 and
+W4A4 run at 2× cuBLAS SGEMM on a GTX 1080, and faster than llama.cpp's own NVFP4 kernels on every shape
+measured (1.0–4.5×; 1.5× at 4096³, 3.9–4.5× for 8-token decoding).
 
 For FP8 on the same GPUs, see the sibling libraries [E4M3EffMA](https://github.com/srose69/e4m3effma)
 and [E5M2EffMA](https://github.com/srose69/e5m2effma); they can be used together with this one.
@@ -43,9 +46,11 @@ taken at the SM clock measured while that row ran:
 |---|---:|---|---:|---:|
 | GEMM 4096³, NVFP4 × NVFP4 → BF16 | 9.72 ms | **159 %** of FP32 peak (7.1 TMAC/s) | SGEMM 19.6 ms (76 % of FP32 peak) | **2.01×** |
 | GEMM 4096³, NVFP4 × NVFP4, FP32 D += (accumulate) | 9.89 ms | 150 % of FP32 peak | SGEMM 19.6 ms (76 % of FP32 peak) | **1.98×** |
-| GEMM 4096³, NVFP4 weights × BF16 activations | 19.8 ms | 74 % of FP32 peak | SGEMM 19.6 ms (76 % of FP32 peak) | 0.99× |
+| GEMM 4096³, NVFP4 × INT8 (W4A8) → BF16 | 9.40 ms | 158 % of FP32 peak (7.3 TMAC/s) | SGEMM 19.6 ms (76 % of FP32 peak) | **2.1×** |
+| GEMM 4096³, NVFP4 weights × BF16 activations, exact | 19.8 ms | 74 % of FP32 peak | SGEMM 19.6 ms (76 % of FP32 peak) | 0.99× |
+| `linear` 4096³, BF16 activations, default `act="auto"` (int8 quantization included) | 10.0 ms | — | SGEMM 19.6 ms | **2.0×** |
 | GEMV 8192 × 8192, batch 1 (BF16 x) | 0.140 ms | 269 GB/s, **84 %** of DRAM peak | SGEMV 1.042 ms | **7.4×** |
-| GEMV 8192 × 8192, batch 8 (NVFP4 x) | 0.199 ms | 190 GB/s, 59 % of DRAM peak | SGEMM 1.538 ms | **7.7×** |
+| GEMV 8192 × 8192, batch 8 (INT8 x) | 0.159 ms | 238 GB/s, 74 % of DRAM peak | SGEMM 1.538 ms | **9.7×** |
 | GEMV 8192 × 8192, batch 8 (BF16 x) | 0.347 ms | 109 GB/s, 34 % of DRAM peak | SGEMM 1.538 ms | **4.4×** |
 | Quantization, 8192 × 8192 BF16 → NVFP4 | 0.60 ms | 286 GB/s, **89 %** of DRAM peak | — | — |
 
@@ -53,27 +58,31 @@ FP32 peak: 20 SMs × 128 FFMA × SM clock (1737–1822 MHz in these rows); DRAM 
 bandwidth counts the values and the block scales. With both operands in NVFP4 the DP4A kernel does four
 exact products per instruction and exceeds the FP32 FFMA peak; with BF16 activations a MAC costs one FP32
 FFMA, so compute-bound GEMM tops out at SGEMM speed while reading 7× fewer weight bytes, and
-bandwidth-bound kernels (decoding) get the full benefit of the smaller weights. CUTLASS and llama.cpp have
-not been measured.
+bandwidth-bound kernels (decoding) get the full benefit of the smaller weights. Against llama.cpp's NVFP4
+kernels on the same GPU (int8 activations, like W4A8 here), interleaved runs: 1.0–4.5× faster on every
+shape measured — 1.47× at 4096³, 3.9–4.5× for 8-token decoding, 1.45–1.66× at 512 tokens
+([docs/performance.md](docs/performance.md#compared-with-llamacpp)). CUTLASS has not been measured.
 
 Results by GPU: [benches/table.md](benches/table.md) (full GTX 1080 run: [benches/1080.md](benches/1080.md));
 methodology and how to add your GPU: [docs/performance.md](docs/performance.md).
 
 ## Features
 
-- **Exact products, FP32 accumulation.** NVFP4 × NVFP4: exact integer sums per block of 16, one rounding
-  per block. NVFP4 × BF16 / FP16: every product is exact, one FFMA per MAC. One rounding to the output
+- **Exact products, FP32 accumulation.** NVFP4 × NVFP4 / INT8: exact integer sums per block of 16, one
+  rounding per block. NVFP4 × BF16 / FP16: every product is exact, one FFMA per MAC. One rounding to the output
   type at the end — deterministic and bit-reproducible for a fixed kernel path, and the same bits with or
   without DP4A. Details: [docs/numerics.md](docs/numerics.md).
 - **cuBLAS-style semantics.** `D = α·A·Bᵀ + bias + β·C`, column-major D, accumulation into D (e.g. an FP32
   `main_grad`), `amax` of the result, padded leading dimensions for the data and the block scales.
-- **Mixed operands.** NVFP4 weights × NVFP4, BF16, FP16 or FP32 activations.
-- **GEMV path for decoding**, picked automatically for up to 8 columns, reading each weight byte once.
+- **Mixed operands.** NVFP4 weights × BF16, FP16, FP32 (W4A16), INT8 (W4A8) or NVFP4 (W4A4) activations.
+- **GEMV path for decoding and small batches**, picked automatically, reading each weight byte once per 8
+  columns.
 - **Quantization and dequantization** with the rounding of ModelOpt / Transformer Engine (block scale
   rounded to nearest, values RNE with saturation) and the checkpoint layout (`weight`, `weight_scale`,
   `weight_scale_2`).
-- **PyTorch bindings**: functional API (`quantize`, `dequantize`, `linear`), `NVFP4Tensor`, and
-  `NVFP4Linear` with `quantize_linear_`, which swaps the `nn.Linear` layers of a model.
+- **PyTorch bindings**: functional API (`quantize`, `dequantize`, `linear` with `act="auto" / "exact" /
+  "int8" / "nvfp4"`), `NVFP4Tensor`, and `NVFP4Linear` with `quantize_linear_`, which swaps the
+  `nn.Linear` layers of a model.
 - **Strict input checking** with readable errors in C (`nvfp4a_last_error`) and Python (`TypeError` /
   `ValueError` / `NotImplementedError`).
 - **Per-architecture tuning** (`make tune`) and a 36-second build for all 14 architectures.
@@ -123,13 +132,15 @@ q = nf.quantize(w)                                  # NVFP4Tensor: data uint8 [4
                                                     # [4096, 256], global_scale = amax / (6 * 448)
 x = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
 
-y = nf.linear(x, q)                                 # W4A16, BF16 [8, 4096], GEMV kernel
-y = nf.linear(nf.quantize(x), q)                    # W4A4: DP4A from sm_61
+y = nf.linear(x, q)                                 # act="auto": exact for <= 2 rows, int8 (W4A8) beyond
+y = nf.linear(x, q, act="exact")                    # W4A16, every product exact
+y = nf.linear(x, q, act="int8")                     # W4A8: x to int8 per 16 values, DP4A from sm_61
+y = nf.linear(nf.quantize(x), q)                    # W4A4
 w2 = nf.dequantize(q, torch.float32)
 
 mlp = torch.nn.Sequential(torch.nn.Linear(4096, 11008), torch.nn.SiLU(),
                           torch.nn.Linear(11008, 4096)).cuda().bfloat16()
-nf.quantize_linear_(mlp)                            # nn.Linear -> NVFP4Linear
+nf.quantize_linear_(mlp)                            # nn.Linear -> NVFP4Linear (act="auto")
 y = mlp(x)                                          # NVFP4 x BF16 matmuls on NVFP4EffMA
 ```
 
@@ -215,7 +226,7 @@ Things that would make the library much faster on newer GPUs, none of which can 
 next steps:
 
 - [ ] **Tensor Core path for sm_75+.** Twice an E2M1 value is an exact int8, so INT8 `mma.sync` with int32
-      accumulation computes the same exact block sums as DP4A, on Tensor Cores.
+      accumulation computes the same exact block sums as DP4A (W4A4, W4A8), on Tensor Cores.
 - [ ] **`cp.async` + multi-stage pipelines for sm_80+**, and `ldmatrix` for operand fetch.
 - [ ] **Loading NVFP4 checkpoints** (ModelOpt / Hugging Face `weight`, `weight_scale`, `weight_scale_2`)
       straight into `NVFP4Linear`.

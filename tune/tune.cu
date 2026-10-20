@@ -41,14 +41,14 @@ int main(int argc, char **argv) {
 
   const size_t big = (size_t)8192 * 8192;
   uint8_t *dA, *dSA, *dB, *dSB; void *dD;
-  cudaMalloc(&dA, big / 2); cudaMalloc(&dSA, big / 16); cudaMalloc(&dB, big * 4); cudaMalloc(&dSB, big / 16);
+  cudaMalloc(&dA, big / 2); cudaMalloc(&dSA, big / 16); cudaMalloc(&dB, big * 4); cudaMalloc(&dSB, big / 4);
   cudaMalloc(&dD, big * 4);
   {  // NVFP4 codes, scales around 1; finite BF16 / FP16 / FP32 bit patterns (bytes & 0x37)
     std::vector<uint8_t> h(big * 4);
     unsigned r = 1;
     for (auto &x : h) { r ^= r << 13; r ^= r >> 17; r ^= r << 5; x = (r & 0x37); }
     cudaMemcpy(dA, h.data(), big / 2, cudaMemcpyHostToDevice); cudaMemcpy(dB, h.data(), h.size(), cudaMemcpyHostToDevice);
-    cudaMemset(dSA, 0x38, big / 16); cudaMemset(dSB, 0x38, big / 16);
+    cudaMemset(dSA, 0x38, big / 16); cudaMemset(dSB, 0x38, big / 4);  // as E4M3 bytes or FP32 words: finite
   }
 
   // ---- dense-B GEMM (NVFP4 x BF16, BF16 out; FP16 / FP32 B run the same kernel) ----
@@ -81,9 +81,9 @@ int main(int argc, char **argv) {
   if (ts > kMargin * ts_def) best_small = kDefaultTable.gemm_small;
   printf("-> large: %d, small: %d\n", best_large, best_small);
 
-  // ---- GEMV (NVFP4 A 8192 x 8192, n = 1..8, x NVFP4 / BF16 / FP16 / FP32) ----
+  // ---- GEMV (NVFP4 A 8192 x 8192, n = 1..8, x NVFP4 / BF16 / FP16 / FP32 / INT8) ----
   unsigned char gv[kOperandTypes][8];
-  const char *xn[] = {"NVFP4", "BF16", "FP16", "FP32"};
+  const char *xn[] = {"NVFP4", "BF16", "FP16", "FP32", "INT8"};
   printf("\nGEMV candidates, GB/s over A (8192 x 8192, values + block scales)\n");
   for (int xi = 0; xi < kOperandTypes; ++xi)
     for (int n = 1; n <= 8; ++n) {
@@ -102,6 +102,7 @@ int main(int argc, char **argv) {
           if (xi == NVFP4A_NVFP4) go_t(std::integral_constant<int, NVFP4A_NVFP4>());                             \
           else if (xi == NVFP4A_BF16) go_t(std::integral_constant<int, NVFP4A_BF16>());                          \
           else if (xi == NVFP4A_FP16) go_t(std::integral_constant<int, NVFP4A_FP16>());                          \
+          else if (xi == NVFP4A_INT8) go_t(std::integral_constant<int, NVFP4A_INT8>());                          \
           else go_t(std::integral_constant<int, NVFP4A_FP32>());                                                 \
         };                                                                                                       \
         switch (n) {                                                                                             \

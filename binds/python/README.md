@@ -32,28 +32,30 @@ w = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
 q = nf.quantize(w)                                   # NVFP4Tensor
 x = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
 
-y = nf.linear(x, q)                                  # W4A16: x @ W.T, BF16 [8, 4096]
+y = nf.linear(x, q)                                  # x @ W.T, BF16 [8, 4096]; act="auto": int8 activations here
+y = nf.linear(x, q, act="exact")                     # W4A16: every product exact
 y = nf.linear(x, q, bias, out_dtype=torch.float32)
-y = nf.linear(nf.quantize(x), q)                     # W4A4: exact block sums (DP4A from sm_61)
+y = nf.linear(x, q, act="int8")                      # W4A8: x to int8 per 16 values, exact block sums (DP4A)
+y = nf.linear(nf.quantize(x), q)                     # W4A4
 acc = torch.zeros(8, 4096, device="cuda")
-nf.linear(x, q, out=acc, beta=1.0)                   # acc += x @ W.T
+nf.linear(x, q, out=acc, beta=1.0, act="exact")      # acc += x @ W.T
 
 model = torch.nn.Linear(4096, 4096).cuda().bfloat16()
-nf.quantize_linear_(model)                           # or nf.NVFP4Linear.from_linear(layer)
+nf.quantize_linear_(model)                           # or nf.NVFP4Linear.from_linear(layer, act=...)
 ```
 
 | | |
 |---|---|
 | `quantize(x, global_scale=None, *, amax=None)` | BF16 / FP16 / FP32 `[..., K]` (K a multiple of 16) → `NVFP4Tensor`; `global_scale` defaults to `amax(|x|) / (6·448)`; `amax` (float32 `[1]`) receives `max |x|` |
 | `dequantize(t, dtype=torch.bfloat16)` | `(e2m1 · scale) · global_scale`, rounded once |
-| `linear(x, weight, bias=None, *, out_dtype, out, alpha, beta, amax_out)` | `alpha·x @ weight.T + bias + beta·out`; `weight` an `NVFP4Tensor` `[N, K]` (K a multiple of 64); `x` a dense `[..., K]` tensor or a 2-D `NVFP4Tensor`; output BF16 / FP16 / FP32 (default: the dtype of a dense `x`, else BF16) |
+| `linear(x, weight, bias=None, *, act, out_dtype, out, alpha, beta, amax_out)` | `alpha·x @ weight.T + bias + beta·out`; `weight` an `NVFP4Tensor` `[N, K]` (K a multiple of 64); `x` a dense `[..., K]` tensor or a 2-D `NVFP4Tensor`; `act`: `"exact"` (W4A16), `"int8"` (W4A8, x quantized to int8 per 16 values first), `"nvfp4"` (W4A4) or `"auto"` (default: `"exact"` up to `AUTO_EXACT_MAX_ROWS` = 2 rows, where both run at memory speed, `"int8"` beyond, where it is twice as fast); output BF16 / FP16 / FP32 (default: the dtype of a dense `x`, else BF16) |
 | `NVFP4Tensor(data, scales, global_scale)` | `data` uint8 `[..., K/2]` (the even column in the low nibble), `scales` float8_e4m3fn `[..., K/16]`, `global_scale` float32 `[1]`; `.shape`, `.dequantize()`, `NVFP4Tensor.from_float(x)` |
-| `NVFP4Linear(in_features, out_features, bias=True)` | `nn.Module` with buffers `weight` / `weight_scale` / `weight_scale_2` (the names of NVFP4 checkpoints); `NVFP4Linear.from_linear(layer)` |
-| `quantize_linear_(module)` | replaces every `nn.Linear` with `in_features % 64 == 0` by an `NVFP4Linear`, in place |
+| `NVFP4Linear(in_features, out_features, bias=True, act="auto")` | `nn.Module` with buffers `weight` / `weight_scale` / `weight_scale_2` (the names of NVFP4 checkpoints); `NVFP4Linear.from_linear(layer, act="auto")` |
+| `quantize_linear_(module, *, act="auto")` | replaces every `nn.Linear` with `in_features % 64 == 0` by an `NVFP4Linear`, in place |
 
-Up to 8 rows of `x` run a GEMV kernel that reads each weight byte once. NVFP4 × NVFP4 sums every block of
-16 exactly and rounds once per block; with a dense `x` every product is exact (BF16 / FP16) and
-accumulated in FP32 — [docs/numerics.md](../../docs/numerics.md) has the exact order.
+Few rows of `x` run a GEMV kernel that reads each weight byte once per 8 rows. NVFP4 × NVFP4 / INT8 sums
+every block of 16 exactly and rounds once per block; with a dense `x` every product is exact (BF16 / FP16)
+and accumulated in FP32 — [docs/numerics.md](../../docs/numerics.md) has the exact order.
 
 Wrong dtypes, devices, shapes or an output that overlaps an input raise `TypeError` / `ValueError` before
 anything runs; operands in a layout the kernels cannot read directly (strided views, unaligned slices) are

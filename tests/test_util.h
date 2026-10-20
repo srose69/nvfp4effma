@@ -17,7 +17,7 @@
 static uint32_t rng = 0x2545F491u;
 static uint32_t rnd() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 static float frnd() { return (float)(rnd() & 0xFFFFFF) / 16777216.0f * 2.f - 1.f; }
-static const char *DN[] = {"NVFP4", "BF16", "FP16", "FP32"};  // by nvfp4a_dtype
+static const char *DN[] = {"NVFP4", "BF16", "FP16", "FP32", "INT8"};  // by nvfp4a_dtype
 
 static float e4(uint8_t b) {  // E4M3, NaN included
   int e = (b >> 3) & 15, f = b & 7;
@@ -73,6 +73,20 @@ struct HostFp4 {
   float val(int r, int c) const { return e2(nib(r, c)) * scale(r, c); }  // exact
 };
 
+// A host INT8 activation matrix: int8 values, one FP32 scale per 16 values of a row
+struct HostQ8 {
+  int rows, cols, ld, ldsc;
+  std::vector<int8_t> data;
+  std::vector<float> sc;
+  float g;
+  HostQ8(int r, int c, int ld_, int ldsc_, float g_) : rows(r), cols(c), ld(ld_), ldsc(ldsc_), data((size_t)r * ld_), sc((size_t)r * ldsc_), g(g_) {
+    for (auto &x : data) x = (int8_t)(rnd() % 255 - 127);
+    for (auto &x : sc) x = rnd() % 16 == 0 ? 0.f : ldexpf(1.f + (rnd() & 1023) / 1024.f, (int)(rnd() % 12) - 10);
+  }
+  int q(int r, int c) const { return data[(size_t)r * ld + c]; }
+  float scale(int r, int c) const { return sc[(size_t)r * ldsc + c / 16]; }
+};
+
 // ---- nvfp4a_gemm ------------------------------------------------------------------------------
 struct Case {
   int m, n, k;
@@ -83,22 +97,26 @@ struct Case {
 
 // Runs nvfp4a_gemm on random data and compares D and amax bit for bit with the host emulation.
 static int run_case(const Case &c) {
-  const bool fp4b = c.bt == NVFP4A_NVFP4, gemv = c.n <= 8;
+  const bool fp4b = c.bt == NVFP4A_NVFP4, q8b = c.bt == NVFP4A_INT8, blk = fp4b || q8b;
+  const bool gemv = c.n <= nvfp4a::kern::kGemvMaxN[c.bt];
   const int lda = c.k + 64, ldb = c.k + (fp4b ? 128 : 64), ldd = c.m + 3, ldc = c.ct >= 0 ? c.m + 1 : ldd;
   const nvfp4a_dtype ct = c.ct >= 0 ? (nvfp4a_dtype)c.ct : c.dt;
   HostFp4 hA(c.m, c.k, lda, c.k / 16 + 4, 0.375f), hBq(fp4b ? c.n : 0, c.k, ldb, c.k / 16 + 8, 1.75f);
-  std::vector<uint8_t> hB(fp4b ? 0 : (size_t)ldb * c.n * esize(c.bt));
+  HostQ8 hB8(q8b ? c.n : 0, c.k, ldb, c.k / 16 + 8, 1.75f);
+  std::vector<uint8_t> hB(blk ? 0 : (size_t)ldb * c.n * esize(c.bt));
   std::vector<uint8_t> hC((size_t)ldc * c.n * esize(ct)), hD((size_t)ldd * c.n * esize(c.dt)), hbias(c.m * 4);
-  if (!fp4b) fill(c.bt, hB, 2.f);
+  if (!blk) fill(c.bt, hB, 2.f);
   fill(ct, hC, 4.f);
   if (c.ct < 0) { fill(c.dt, hD, 4.f); hC = hD; } else memset(hD.data(), 0xA5, hD.size());
   if (c.bias >= 0) fill((nvfp4a_dtype)c.bias, hbias, 8.f);
 
-  uint8_t *dA = dev(hA.data), *dSA = dev(hA.sc), *dB = fp4b ? dev(hBq.data) : dev(hB), *dSB = fp4b ? dev(hBq.sc) : nullptr;
+  uint8_t *dA = dev(hA.data), *dSA = dev(hA.sc);
+  void *dB = fp4b ? (void *)dev(hBq.data) : q8b ? (void *)dev(hB8.data) : (void *)dev(hB);
+  void *dSB = fp4b ? (void *)dev(hBq.sc) : q8b ? (void *)dev(hB8.sc) : nullptr;
   uint8_t *dC = dev(hC), *dD = dev(hD), *dbias = dev(hbias);
   float *dga = devf(hA.g), *dgb = devf(hBq.g), *damax = devf(0.f);
   nvfp4a_tensor A = {dA, NVFP4A_NVFP4, dSA, hA.ldsc, dga, nullptr};
-  nvfp4a_tensor B = {dB, c.bt, dSB, fp4b ? hBq.ldsc : 0, fp4b ? dgb : nullptr, nullptr};
+  nvfp4a_tensor B = {dB, c.bt, dSB, fp4b ? hBq.ldsc : q8b ? hB8.ldsc : 0, blk ? dgb : nullptr, nullptr};
   nvfp4a_tensor C = {dC, ct, nullptr, 0, nullptr, nullptr}, D = {dD, c.dt, nullptr, 0, nullptr, damax};
   nvfp4a_tensor bias = {dbias, c.bias >= 0 ? (nvfp4a_dtype)c.bias : NVFP4A_FP32, nullptr, 0, nullptr, nullptr};
   nvfp4a_status st = nvfp4a_gemm(c.m, c.n, c.k, c.alpha, &A, lda, &B, ldb, c.beta, c.ct >= 0 ? &C : nullptr, ldc, &D, ldd,
@@ -108,7 +126,15 @@ static int run_case(const Case &c) {
   cudaMemcpy(got.data(), dD, got.size(), cudaMemcpyDeviceToHost); cudaMemcpy(&gamax, damax, 4, cudaMemcpyDeviceToHost);
 
   auto Bval = [&](int j, int kk) { return fp4b ? hBq.val(j, kk) : hload(c.bt, hB.data(), (size_t)j * ldb + kk); };
-  const float s = (c.alpha * hA.g) * (fp4b ? hBq.g : 1.f);
+  // NVFP4 / INT8 B: the exact integer block sum and the two scale steps
+  auto block = [&](int i, int j, int kb, float acc) {
+    int p = 0;
+    for (int kk = kb; kk < kb + 16; ++kk)
+      p += (int)(2 * e2(hA.nib(i, kk))) * (fp4b ? (int)(2 * e2(hBq.nib(j, kk))) : hB8.q(j, kk));
+    return fmaf((float)p * hA.scale(i, kb), fp4b ? hBq.scale(j, kb) : hB8.scale(j, kb), acc);
+  };
+  const float kout = fp4b ? 0.25f : 0.5f;
+  const float s = (c.alpha * hA.g) * (fp4b ? hBq.g : q8b ? hB8.g : 1.f);
   std::vector<uint8_t> exp = hD;
   float eamax = 0.f;
   for (int j = 0; j < c.n; ++j)
@@ -119,10 +145,8 @@ static int run_case(const Case &c) {
         for (int l = 0; l < 32; ++l) {
           float p = 0.f;
           for (int kb = 16 * l; kb < c.k; kb += 512) {
-            if (fp4b) {  // exact block sum, then the two scale steps; x 1/4 after the butterfly
-              int q = 0;
-              for (int kk = kb; kk < kb + 16; ++kk) q += (int)(2 * e2(hA.nib(i, kk))) * (int)(2 * e2(hBq.nib(j, kk)));
-              p = fmaf((float)q * hA.scale(i, kb), hBq.scale(j, kb), p);
+            if (blk) {  // exact block sum, then the two scale steps; x 1/4 or 1/2 after the butterfly
+              p = block(i, j, kb, p);
             } else {
               for (int jj = 0; jj < 16; ++jj) p = fmaf(hA.val(i, kb + jj), Bval(j, kb + jj), p);
             }
@@ -134,14 +158,10 @@ static int run_case(const Case &c) {
           for (int l = 0; l < 32; ++l) nx[l] = lanes[l] + lanes[l ^ o];
           memcpy(lanes, nx, sizeof nx);
         }
-        acc = fp4b ? lanes[0] * 0.25f : lanes[0];
-      } else if (fp4b) {
-        for (int kb = 0; kb < c.k; kb += 16) {
-          int p = 0;
-          for (int kk = kb; kk < kb + 16; ++kk) p += (int)(2 * e2(hA.nib(i, kk))) * (int)(2 * e2(hBq.nib(j, kk)));
-          acc = fmaf((float)p * hA.scale(i, kb), hBq.scale(j, kb), acc);
-        }
-        acc *= 0.25f;
+        acc = blk ? lanes[0] * kout : lanes[0];
+      } else if (blk) {
+        for (int kb = 0; kb < c.k; kb += 16) acc = block(i, j, kb, acc);
+        acc *= kout;
       } else {
         for (int kk = 0; kk < c.k; ++kk) acc = fmaf(hA.val(i, kk), Bval(j, kk), acc);
       }

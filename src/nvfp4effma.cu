@@ -83,6 +83,35 @@ __global__ void quantize_kernel(const uint8_t *__restrict__ src, int lds, uint8_
   if (amax) amax_commit(amax, mx);
 }
 
+// INT8 destination: sb = amax_block / 127 (FP32), q = RNE(x / sb), one thread per block of 16.
+template <int T>
+__global__ void quantize_int8_kernel(const uint8_t *__restrict__ src, int lds, int8_t *__restrict__ dst, int ldd,
+                                     float *__restrict__ scales, int ld_scale, int rows, int cols, float *amax) {
+  const int bpr = cols / 16;
+  float mx = 0.f;
+  for (long long b = (long long)blockIdx.x * blockDim.x + threadIdx.x; b < (long long)rows * bpr;
+       b += (long long)gridDim.x * blockDim.x) {
+    const int r = (int)(b / bpr), c = (int)(b % bpr);
+    float x[16];
+    const uint8_t *p = src + ((size_t)r * lds + 16 * c) * Elem<T>::bytes;
+    load8<T>(p, x); load8<T>(p + 8 * Elem<T>::bytes, x + 8);
+    float bmax = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) bmax = fmaxf(bmax, fabsf(x[i]));
+    mx = fmaxf(mx, bmax);
+    const float sb = __fdiv_rn(bmax, 127.f);
+    uint32_t w[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      const int q = sb > 0.f ? (int)fminf(fmaxf(rintf(__fdiv_rn(x[i], sb)), -127.f), 127.f) : 0;
+      w[i / 4] |= (uint32_t)(uint8_t)(int8_t)q << (8 * (i % 4));
+    }
+    *(uint4 *)(dst + (size_t)r * ldd + 16 * c) = make_uint4(w[0], w[1], w[2], w[3]);
+    scales[(size_t)r * ld_scale + c] = sb;
+  }
+  if (amax) amax_commit(amax, mx);
+}
+
 // One thread per block: 8 bytes of nibbles and the scale -> 16 values (e2m1 * sb) * g.
 template <int T>
 __global__ void dequantize_kernel(const uint8_t *__restrict__ src, int lds, const uint8_t *__restrict__ scales,
@@ -164,6 +193,26 @@ extern "C" nvfp4a_status nvfp4a_quantize(const nvfp4a_tensor *src, int lds, cons
                                          int cols, cudaStream_t stream) {
   using namespace nvfp4a;
   clear_error();
+  if (dst && dst->dtype == NVFP4A_INT8) {  // W4A8 activations
+    nvfp4a_tensor q = *dst; q.dtype = NVFP4A_NVFP4;  // same checks, then the INT8 alignment
+    if (nvfp4a_status st = check_convert("nvfp4a_quantize", &q, ldd, src, lds, rows, cols)) return st;
+    if (((uintptr_t)dst->data & 15) || ((uintptr_t)dst->block_scale & 3))
+      return fail(NVFP4A_INVALID_VALUE, "nvfp4a_quantize: INT8 data must be 16-byte, its scales 4-byte aligned");
+    if ((long long)rows * cols == 0) return NVFP4A_OK;
+    if (nvfp4a_status st = check_device()) return st;
+    const long long blocks = (long long)rows * cols / 16;
+    const int grid = (int)((blocks + 255) / 256 < 8192 ? (blocks + 255) / 256 : 8192);
+    const int lsc = dst->ld_scale ? dst->ld_scale : cols / 16;
+    const uint8_t *s = (const uint8_t *)src->data;
+    int8_t *d = (int8_t *)dst->data;
+    float *sc = (float *)dst->block_scale;
+#define NVFP4A_Q8(T) kern::quantize_int8_kernel<T><<<grid, 256, 0, stream>>>(s, lds, d, ldd, sc, lsc, rows, cols, dst->amax)
+    if (src->dtype == NVFP4A_BF16) NVFP4A_Q8(NVFP4A_BF16);
+    else if (src->dtype == NVFP4A_FP16) NVFP4A_Q8(NVFP4A_FP16);
+    else NVFP4A_Q8(NVFP4A_FP32);
+#undef NVFP4A_Q8
+    return cuda_status(cudaGetLastError(), "nvfp4a_quantize: kernel launch");
+  }
   if (nvfp4a_status st = check_convert("nvfp4a_quantize", dst, ldd, src, lds, rows, cols)) return st;
   if ((long long)rows * cols == 0) return NVFP4A_OK;
   if (nvfp4a_status st = check_device()) return st;

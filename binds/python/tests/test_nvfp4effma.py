@@ -99,7 +99,7 @@ def test_linear_dense_x(T, xdtype):
     w = nf.quantize(rand((N, K), seed=1))
     x = rand((T, K), xdtype, seed=2)
     bias = rand((N,), xdtype, seed=3)
-    y = nf.linear(x, w, bias)
+    y = nf.linear(x, w, bias, act="exact")
     assert y.shape == (T, N) and y.dtype == xdtype
     wv = ref_value(w)
     ref = x.double() @ wv.t() + bias.double()
@@ -117,13 +117,44 @@ def test_linear_nvfp4_x(T):
     check_close(y, xv @ wv.t(), xv.abs() @ wv.abs().t(), K // 16, torch.float32)
 
 
+@pytest.mark.parametrize("T", [1, 8, 20, 200])
+def test_linear_int8_activations(T):
+    """W4A8: x quantized to int8 with an FP32 scale per 16 values, exact integer block sums."""
+    N, K = 130, 256
+    w = nf.quantize(rand((N, K), seed=10))
+    x = rand((T, K), torch.bfloat16, seed=11)
+    q, s = nf._C.quantize_int8(x)
+    assert q.dtype == torch.int8 and s.shape == (T, K // 16)
+    xb = x.float().reshape(T, -1, 16)
+    bmax = xb.abs().amax(-1)
+    assert torch.equal(s, bmax / torch.full_like(bmax, 127.0))  # tensor / tensor: a correctly rounded division
+    assert torch.equal(q.float(), torch.where(s[..., None] > 0, torch.round(xb / s[..., None]), torch.zeros_like(xb)).reshape(T, K))
+    xv, wv = q.double() * s.double().repeat_interleave(16, -1), ref_value(w)
+    y = nf.linear(x, w, act="int8", out_dtype=torch.float32)
+    check_close(y, xv @ wv.t(), xv.abs() @ wv.abs().t(), K // 16, torch.float32)
+    assert nf.linear(x, w, act="int8").dtype == torch.bfloat16
+    m = nf.NVFP4Linear.from_linear(torch.nn.Linear(K, N).cuda().bfloat16(), act="int8")
+    assert m(x).shape == (T, N)
+
+
+def test_linear_auto_activations():
+    """act="auto": the exact path for up to 2 rows, int8 activations beyond -- bit for bit."""
+    w = nf.quantize(rand((96, 256), seed=12))
+    for T in (1, 2, 3, 40):
+        x = rand((T, 256), torch.bfloat16, seed=13 + T)
+        want = "exact" if T <= nf.AUTO_EXACT_MAX_ROWS else "int8"
+        assert torch.equal(nf.linear(x, w), nf.linear(x, w, act=want))
+    with pytest.raises(ValueError):
+        nf.linear(x, w, act="fp8")
+
+
 def test_linear_batched_input_and_accumulate():
     w = nf.quantize(rand((64, 128), seed=6))
     x = rand((2, 3, 128), torch.bfloat16, seed=7)
     y = nf.linear(x, w)
     assert y.shape == (2, 3, 64)
     acc = torch.ones(6, 64, device=DEV)
-    nf.linear(x.reshape(6, 128), w, out=acc, beta=1.0)
+    nf.linear(x.reshape(6, 128), w, out=acc, beta=1.0, act="exact")
     ref = x.reshape(6, 128).double() @ ref_value(w).t() + 1
     check_close(acc, ref, x.reshape(6, 128).double().abs() @ ref_value(w).abs().t() + 1, 128, torch.float32)
 
@@ -132,6 +163,7 @@ def test_strided_inputs_are_copied():
     w = nf.quantize(rand((64, 256), seed=8))
     big = rand((10, 320), torch.bfloat16, seed=9)
     x = big[:, 32:288]  # row stride 320, offset: not usable as is
+    assert torch.equal(nf.linear(x, w, act="exact"), nf.linear(x.contiguous(), w, act="exact"))
     assert torch.equal(nf.linear(x, w), nf.linear(x.contiguous(), w))
 
 

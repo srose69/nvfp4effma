@@ -10,7 +10,7 @@ namespace kern {
 #define NVFP4A_DECL_GEMV_X(id, t)                                                                       \
   NVFP4A_GEMV_PROTO(id, t, 1); NVFP4A_GEMV_PROTO(id, t, 2); NVFP4A_GEMV_PROTO(id, t, 3); NVFP4A_GEMV_PROTO(id, t, 4); \
   NVFP4A_GEMV_PROTO(id, t, 5); NVFP4A_GEMV_PROTO(id, t, 6); NVFP4A_GEMV_PROTO(id, t, 7); NVFP4A_GEMV_PROTO(id, t, 8);
-#define NVFP4A_DECL_GEMV(id) NVFP4A_DECL_GEMV_X(id, 0) NVFP4A_DECL_GEMV_X(id, 1) NVFP4A_DECL_GEMV_X(id, 2) NVFP4A_DECL_GEMV_X(id, 3)
+#define NVFP4A_DECL_GEMV(id) NVFP4A_DECL_GEMV_X(id, 0) NVFP4A_DECL_GEMV_X(id, 1) NVFP4A_DECL_GEMV_X(id, 2) NVFP4A_DECL_GEMV_X(id, 3) NVFP4A_DECL_GEMV_X(id, 4)
 NVFP4A_GEMV_LIB(NVFP4A_DECL_GEMV)
 #undef NVFP4A_DECL_GEMV
 #undef NVFP4A_DECL_GEMV_X
@@ -25,7 +25,7 @@ cudaError_t launch_gemv(int xt, const uint8_t *A, int lda, const uint8_t *SA, in
    NVFP4A_GEMV_ENTRY(cid, t, 5), NVFP4A_GEMV_ENTRY(cid, t, 6), NVFP4A_GEMV_ENTRY(cid, t, 7), NVFP4A_GEMV_ENTRY(cid, t, 8)}
 #define NVFP4A_CASE(cid)                                                                                  \
   if (id == cid) {                                                                                        \
-    static const Fn f[kOperandTypes][8] = {NVFP4A_ROW(cid, 0), NVFP4A_ROW(cid, 1), NVFP4A_ROW(cid, 2), NVFP4A_ROW(cid, 3)}; \
+    static const Fn f[kOperandTypes][8] = {NVFP4A_ROW(cid, 0), NVFP4A_ROW(cid, 1), NVFP4A_ROW(cid, 2), NVFP4A_ROW(cid, 3), NVFP4A_ROW(cid, 4)}; \
     return f[xt][n - 1](A, lda, SA, ldsa, X, ldx, SX, ldsx, m, k, e, s);                                  \
   }
   NVFP4A_GEMV_LIB(NVFP4A_CASE)

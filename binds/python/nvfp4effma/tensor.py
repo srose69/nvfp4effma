@@ -56,11 +56,14 @@ class NVFP4Linear(torch.nn.Module):
     """``y = x @ W.T + bias`` with an NVFP4 weight ``W`` ``[out_features, in_features]`` (in_features a
     multiple of 64).  The buffers carry the names of NVFP4 checkpoints: ``weight`` (uint8, packed),
     ``weight_scale`` (float8_e4m3fn), ``weight_scale_2`` (float32 global scale).  ``x`` stays in its own
-    dtype (bfloat16 / float16 / float32); the output has the dtype of ``x``."""
+    dtype (bfloat16 / float16 / float32); the output has the dtype of ``x``.  ``act`` chooses how the
+    activations enter the matmul (default ``"auto"``: exact for up to 2 rows, int8 beyond; see
+    ``nvfp4effma.linear``)."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None,
-                 dtype: torch.dtype = torch.bfloat16):
+                 dtype: torch.dtype = torch.bfloat16, act: str = "auto"):
         super().__init__()
+        self.act = act  # "auto" / "exact" (W4A16) / "int8" (W4A8) / "nvfp4" (W4A4), see nvfp4effma.linear
         if in_features % 64:
             raise ValueError(f"in_features ({in_features}) must be a multiple of 64")
         self.in_features, self.out_features = in_features, out_features
@@ -71,11 +74,12 @@ class NVFP4Linear(torch.nn.Module):
         self.bias = torch.nn.Parameter(torch.zeros(out_features, dtype=dtype, device=device), requires_grad=False) if bias else None
 
     @classmethod
-    def from_linear(cls, linear: torch.nn.Linear, global_scale: Optional[torch.Tensor] = None) -> "NVFP4Linear":
+    def from_linear(cls, linear: torch.nn.Linear, global_scale: Optional[torch.Tensor] = None,
+                    act: str = "auto") -> "NVFP4Linear":
         """Quantize the weight of ``linear`` (a CUDA module) to NVFP4; the bias keeps its dtype."""
         w = linear.weight.detach()
         m = cls(linear.in_features, linear.out_features, linear.bias is not None, device=w.device,
-                dtype=linear.bias.dtype if linear.bias is not None else w.dtype)
+                dtype=linear.bias.dtype if linear.bias is not None else w.dtype, act=act)
         q = NVFP4Tensor.from_float(w, global_scale)
         m.weight.copy_(q.data); m.weight_scale.copy_(q.scales); m.weight_scale_2.copy_(q.global_scale)
         if linear.bias is not None:
@@ -88,18 +92,20 @@ class NVFP4Linear(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from . import linear
         bias = self.bias if self.bias is None or self.bias.dtype == x.dtype else self.bias.to(x.dtype)
-        return linear(x, self.nvfp4_weight(), bias)
+        return linear(x, self.nvfp4_weight(), bias, act=self.act)
 
     def extra_repr(self):
-        return f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, NVFP4"
+        return (f"in_features={self.in_features}, out_features={self.out_features}, bias={self.bias is not None}, "
+                f"NVFP4, act={self.act}")
 
 
-def quantize_linear_(module: torch.nn.Module) -> torch.nn.Module:
+def quantize_linear_(module: torch.nn.Module, *, act: str = "auto") -> torch.nn.Module:
     """Replace every ``nn.Linear`` inside ``module`` (in place) whose in_features is a multiple of 64 by an
-    ``NVFP4Linear`` with the quantized weight; other layers stay as they are.  Returns ``module``."""
+    ``NVFP4Linear`` with the quantized weight (``act``: activation quantization, see ``NVFP4Linear``); other
+    layers stay as they are.  Returns ``module``."""
     for name, child in list(module.named_children()):
         if isinstance(child, torch.nn.Linear) and child.in_features % 64 == 0:
-            setattr(module, name, NVFP4Linear.from_linear(child))
+            setattr(module, name, NVFP4Linear.from_linear(child, act=act))
         else:
-            quantize_linear_(child)
+            quantize_linear_(child, act=act)
     return module

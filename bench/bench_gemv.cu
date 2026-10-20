@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// nvfp4a_gemm on the GEMV path (n <= 8): NVFP4 weights (4.5 bits per value with the block scales) read
-// once, so the figure of merit is the effective bandwidth over A.  Compared with the DRAM peak, a
+// nvfp4a_gemm on the GEMV path (small n): NVFP4 weights (4.5 bits per value with the block scales) read
+// once per group of 8 columns, so the figure of merit is the effective bandwidth over A (n = 16 and 32 read
+// it 2 and 4 times).  Compared with the DRAM peak, a
 // device-to-device copy (practical bandwidth) and cuBLAS SGEMV / SGEMM on FP32 weights of the same
 // shape (7.1x the bytes).  Median time per row after an idle pause (see bench_util.h).
 #include <vector>
@@ -19,14 +20,14 @@ int main(int argc, char **argv) {
   const size_t abytes = (size_t)M * K / 2 + (size_t)M * K / 16;
   void *dA, *dsA, *dX, *dsX, *dY;
   cudaMalloc(&dA, (size_t)M * K / 2); cudaMalloc(&dsA, (size_t)M * K / 16);
-  cudaMalloc(&dX, (size_t)K * 8 * 4); cudaMalloc(&dsX, (size_t)K * 8 / 16); cudaMalloc(&dY, (size_t)M * 8 * 4);
+  cudaMalloc(&dX, (size_t)K * 32 * 4); cudaMalloc(&dsX, (size_t)K * 32 / 16 * 4); cudaMalloc(&dY, (size_t)M * 32 * 4);
   std::vector<unsigned char> h((size_t)M * K / 2), hs((size_t)M * K / 16);
   unsigned r = 7;
   auto rnd = [&] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
   for (auto &x : h) x = rnd();
   for (auto &x : hs) x = 0x30 + rnd() % 16;
   cudaMemcpy(dA, h.data(), h.size(), cudaMemcpyHostToDevice); cudaMemcpy(dsA, hs.data(), hs.size(), cudaMemcpyHostToDevice);
-  cudaMemset(dX, 0, (size_t)K * 8 * 4); cudaMemset(dsX, 0x38, (size_t)K * 8 / 16);
+  cudaMemset(dX, 0, (size_t)K * 32 * 4); cudaMemset(dsX, 0x38, (size_t)K * 32 / 16 * 4);  // E4M3 bytes / FP32 words
   void *cp0, *cp1; cudaMalloc(&cp0, abytes); cudaMalloc(&cp1, abytes); cudaMemset(cp0, 0, abytes);
   const BenchRow copy = bench.run([&] { cudaMemcpyAsync(cp1, cp0, abytes, cudaMemcpyDeviceToDevice); }, 200);
   const double copy_bw = 2.0 * abytes / copy.ms / 1e6;
@@ -40,9 +41,9 @@ int main(int argc, char **argv) {
     fflush(stdout);
   };
   nvfp4a_tensor A = {dA, NVFP4A_NVFP4, dsA, 0, nullptr, nullptr}, Y = {dY, NVFP4A_BF16, nullptr, 0, nullptr, nullptr};
-  const char *xn[] = {"NVFP4", "BF16", "FP16", "FP32"};  // by nvfp4a_dtype
-  for (nvfp4a_dtype xt : {NVFP4A_BF16, NVFP4A_NVFP4, NVFP4A_FP32})
-    for (int n : {1, 2, 4, 8}) {
+  const char *xn[] = {"NVFP4", "BF16", "FP16", "FP32", "INT8"};  // by nvfp4a_dtype
+  for (nvfp4a_dtype xt : {NVFP4A_BF16, NVFP4A_NVFP4, NVFP4A_INT8, NVFP4A_FP32})
+    for (int n : {1, 2, 4, 8, 16, 32}) {  // n > 8: groups of 8 columns, A read once per group
       nvfp4a_tensor X = {dX, xt, dsX, 0, nullptr, nullptr};
       nvfp4a_status st = NVFP4A_OK;
       const BenchRow x = bench.run([&] { st = nvfp4a_gemm(M, n, K, 1.f, &A, K, &X, K, 0.f, nullptr, 0, &Y, M, nullptr, 0); }, 200);

@@ -24,6 +24,10 @@ from .tensor import NVFP4Linear, NVFP4Tensor, quantize_linear_
 __version__ = _C.__version__
 __all__ = ["quantize", "dequantize", "linear", "NVFP4Tensor", "NVFP4Linear", "quantize_linear_", "__version__"]
 
+# act="auto": up to this many rows of x the exact W4A16 path runs (bandwidth-bound: as fast as W4A8 there);
+# beyond it the activations are quantized to int8 first (W4A8, DP4A), which is about twice as fast.
+AUTO_EXACT_MAX_ROWS = 2
+
 
 def quantize(x: torch.Tensor, global_scale: Optional[torch.Tensor] = None, *,
              amax: Optional[torch.Tensor] = None) -> NVFP4Tensor:
@@ -58,14 +62,19 @@ def dequantize(x: NVFP4Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Ten
 
 
 def linear(x: Union[torch.Tensor, NVFP4Tensor], weight: NVFP4Tensor, bias: Optional[torch.Tensor] = None, *,
-           out_dtype: Optional[torch.dtype] = None, out: Optional[torch.Tensor] = None, alpha: float = 1.0,
-           beta: float = 0.0, amax_out: Optional[torch.Tensor] = None) -> torch.Tensor:
+           act: str = "auto", out_dtype: Optional[torch.dtype] = None, out: Optional[torch.Tensor] = None,
+           alpha: float = 1.0, beta: float = 0.0, amax_out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """``alpha * x @ weight.T + bias + beta * out`` like ``torch.nn.functional.linear``.
 
     * ``weight``: ``NVFP4Tensor`` ``[N, K]``, K a multiple of 64.
     * ``x``: bfloat16 / float16 / float32 tensor ``[..., K]`` (W4A16: one FFMA per MAC on the exactly
       decoded weights), or a 2-D ``NVFP4Tensor`` ``[T, K]`` (W4A4: exact integer sums per block of 16, DP4A
-      from sm_61).  Up to 8 rows run a bandwidth-bound GEMV kernel that reads every weight byte once.
+      from sm_61).  For few rows a bandwidth-bound GEMV kernel reads every weight byte once per 8 rows.
+    * ``act`` (dense ``x``): ``"exact"`` keeps it as it is (W4A16, every product exact; on Pascal bound by
+      the FP32 FFMA rate); ``"int8"`` quantizes it first to int8 with an FP32 scale per 16 values (W4A8:
+      exact integer block sums on DP4A, about twice as fast, the accuracy class of llama.cpp's int8
+      activations); ``"nvfp4"`` to NVFP4 (W4A4); ``"auto"`` (default) is ``"exact"`` up to
+      ``AUTO_EXACT_MAX_ROWS`` (2) rows of ``x``, where both run at memory speed, and ``"int8"`` beyond.
     * ``out_dtype``: bfloat16, float16 or float32 (default: the dtype of a dense ``x``, else bfloat16);
       ``beta != 0`` accumulates into ``out``, which must then be given ``[T, N]``; ``amax_out`` (float32
       ``[1]``) gets max |result|.
@@ -84,8 +93,21 @@ def linear(x: Union[torch.Tensor, NVFP4Tensor], weight: NVFP4Tensor, bias: Optio
         raise TypeError("x must be a tensor or an NVFP4Tensor")
     if x.dim() < 1 or x.shape[-1] != K:
         raise ValueError(f"x must have shape [..., {K}], got {tuple(x.shape)}")
+    if act not in ("auto", "exact", "int8", "nvfp4"):
+        raise ValueError(f"act must be 'auto', 'exact', 'int8' or 'nvfp4', got {act!r}")
     x2 = x.reshape(-1, K)
+    if act == "auto":
+        act = "exact" if x2.shape[0] <= AUTO_EXACT_MAX_ROWS else "int8"
     o2 = out.reshape(-1, N) if out is not None else None
-    y = _C.linear(x2, None, None, weight.data, weight.scales, weight.global_scale, bias, out_dtype, o2, alpha, beta,
-                  amax_out)
+    od = out_dtype if out_dtype is not None or out is not None else x.dtype  # quantized x: output in x's dtype
+    if act == "int8":
+        q, s = _C.quantize_int8(x2)
+        y = _C.linear(q, s, None, weight.data, weight.scales, weight.global_scale, bias, od, o2, alpha, beta, amax_out)
+    elif act == "nvfp4":
+        q = quantize(x2)
+        y = _C.linear(q.data, q.scales, q.global_scale, weight.data, weight.scales, weight.global_scale, bias, od, o2,
+                      alpha, beta, amax_out)
+    else:
+        y = _C.linear(x2, None, None, weight.data, weight.scales, weight.global_scale, bias, out_dtype, o2, alpha, beta,
+                      amax_out)
     return out if out is not None else y.reshape(*x.shape[:-1], N)

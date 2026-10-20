@@ -10,11 +10,11 @@ namespace nvfp4a {
 namespace kern {
 
 // ---------------------------------------------------------------------------------------------
-// GEMV / small batch (A NVFP4 m x k, x n <= 8 rows of k values, NVFP4 / BF16 / FP16 / FP32): every byte
+// GEMV / small batch (A NVFP4 m x k, x n <= 8 rows of k values, NVFP4 / INT8 / BF16 / FP16 / FP32): every byte
 // of A read once.  A warp owns R rows; per pass a lane reads one NVFP4 block (8 bytes + its scale) of
 // each row; x values are converted once per pass and reused for all R rows.  Dense x: 16 x NB FFMAs per
 // row and pass (x in two halves of 8, which bounds the registers), lane l accumulating k = 512c + 16l + j
-// in (c, j) order.  NVFP4 x: per row, column and block the exact block sum, lane l accumulating the
+// in (c, j) order.  NVFP4 / INT8 x: per row, column and block the exact block sum, lane l accumulating the
 // blocks 32c + l.  Lanes are then combined with a butterfly (xor 16, 8, 4, 2, 1) -- tests/test_gemv.cu
 // emulates exactly this order.
 // ---------------------------------------------------------------------------------------------
@@ -48,20 +48,20 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
       aw[r] = *(const uint2 *)(A + row * (lda / 2) + kb / 2);
       sa[r] = e4m3_value(SA[row * ldsa + kb / 16]);
     }
-    if (XT == NVFP4A_NVFP4) {
-      // NVFP4 x: the exact block sum p of every (row, column), then acc = fma(p * sa, sx, acc) -- the values
-      // of the tiled kernels.  DP4A on int8 from sm_61, FFMA on integer-valued floats below.
-      uint2 xw[NB];
+    if (XT == NVFP4A_NVFP4 || XT == NVFP4A_INT8) {
+      // NVFP4 / INT8 x: the exact block sum p of every (row, column), then acc = fma(p * sa, sx, acc) -- the
+      // values of the tiled kernels.  DP4A on int8 from sm_61, FFMA on integer-valued floats below.
       float sx[NB];
 #pragma unroll
-      for (int b = 0; b < NB; ++b) {
-        xw[b] = *(const uint2 *)(X + (size_t)b * (ldx / 2) + kb / 2);
-        sx[b] = e4m3_value(SX[(size_t)b * ldsx + kb / 16]);
-      }
+      for (int b = 0; b < NB; ++b)
+        sx[b] = XT == NVFP4A_INT8 ? ((const float *)SX)[(size_t)b * ldsx + kb / 16] : e4m3_value(SX[(size_t)b * ldsx + kb / 16]);
 #if __CUDA_ARCH__ >= 610
       uint4 xi[NB];
 #pragma unroll
-      for (int b = 0; b < NB; ++b) xi[b] = dec16(xw[b].x, xw[b].y);
+      for (int b = 0; b < NB; ++b) {
+        if (XT == NVFP4A_INT8) xi[b] = *(const uint4 *)(X + (size_t)b * ldx + kb);
+        else { const uint2 w = *(const uint2 *)(X + (size_t)b * (ldx / 2) + kb / 2); xi[b] = dec16(w.x, w.y); }
+      }
 #pragma unroll
       for (int r = 0; r < C::R; ++r) {
         const uint4 ai = dec16(aw[r].x, aw[r].y);
@@ -76,14 +76,23 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
         }
       }
 #else
+      uint4 xw[NB];  // NVFP4: 8 bytes of nibbles in .x / .y; INT8: 16 bytes
+#pragma unroll
+      for (int b = 0; b < NB; ++b) {
+        if (XT == NVFP4A_INT8) xw[b] = *(const uint4 *)(X + (size_t)b * ldx + kb);
+        else { const uint2 w = *(const uint2 *)(X + (size_t)b * (ldx / 2) + kb / 2); xw[b] = make_uint4(w.x, w.y, 0, 0); }
+      }
 #pragma unroll
       for (int r = 0; r < C::R; ++r)
 #pragma unroll
         for (int b = 0; b < NB; ++b) {
+          const uint32_t xq[4] = {xw[b].x, xw[b].y, xw[b].z, xw[b].w};
           float p = 0.f;
 #pragma unroll
-          for (int q = 0; q < 16; ++q)
-            p = fma_rn(e2m1_value<1>(q < 8 ? aw[r].x : aw[r].y, q % 8), e2m1_value<1>(q < 8 ? xw[b].x : xw[b].y, q % 8), p);
+          for (int q = 0; q < 16; ++q) {
+            const float xv = XT == NVFP4A_INT8 ? (float)(int8_t)(xq[q / 4] >> (8 * (q % 4))) : e2m1_value<1>(xq[q / 8], q % 8);
+            p = fma_rn(e2m1_value<1>(q < 8 ? aw[r].x : aw[r].y, q % 8), xv, p);
+          }
           acc[r][b] = fma_rn(mul_rn(p, sa[r]), sx[b], acc[r][b]);
         }
 #endif
@@ -123,7 +132,7 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
       float v = acc[r][b];
 #pragma unroll
       for (int o = 16; o; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
-      v = __fmul_rn(v, XT == NVFP4A_NVFP4 ? 0.25f : 512.f);  // exact
+      v = __fmul_rn(v, XT == NVFP4A_NVFP4 ? 0.25f : XT == NVFP4A_INT8 ? 0.5f : 512.f);  // exact
       if (((r * NB + b) & 31) == lane) mine[(r * NB + b) >> 5] = v;
     }
   EpiState st = epi_begin(e);

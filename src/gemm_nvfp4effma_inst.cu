@@ -14,7 +14,7 @@ namespace kern {
 // (a template on the id, not a plain struct: kernel names must differ between instance objects)
 template <int ID> struct LibGemm : NVFP4A_CFG(NVFP4A_ID) {
   template <int TB> struct On {
-    static constexpr bool value = TB == NVFP4A_NVFP4 ? NVFP4A_ARCH_CC < 61 : gemm_selected(NVFP4A_ARCH_CC, ID);
+    static constexpr bool value = TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8 ? NVFP4A_ARCH_CC < 61 : gemm_selected(NVFP4A_ARCH_CC, ID);
   };
 };
 

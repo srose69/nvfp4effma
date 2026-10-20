@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// nvfp4a_gemm throughput: NVFP4 weights x NVFP4 / BF16 / FP16 / FP32 activations -> BF16, and FP32
+// nvfp4a_gemm throughput: NVFP4 weights x NVFP4 / INT8 / BF16 / FP16 / FP32 activations -> BF16, and FP32
 // accumulation, vs cuBLAS SGEMM of the same shape (FP32 in/out).  Median time per row; % of FP32 peak =
 // SMs x 128 FFMA x the SM clock measured during that very row (see bench_util.h) -- the DP4A kernel
-// (NVFP4 x NVFP4, sm_61+) does more than one MAC per FP32 issue slot and can exceed 100 %.
+// (NVFP4 x NVFP4 / INT8, sm_61+) does more than one MAC per FP32 issue slot and can exceed 100 %.
 #include <vector>
 #include <cublas_v2.h>
 #include "../include/nvfp4effma.h"
@@ -44,6 +44,15 @@ int main(int argc, char **argv) {
     row(full, x);
   };
   gemm("nvfp4a_gemm NVFP4 x NVFP4 -> BF16", B, D, 0.f);
+  {  // W4A8: int8 activations with an FP32 scale per 16 values
+    void *q8, *s8; cudaMalloc(&q8, (size_t)N * K); cudaMalloc(&s8, (size_t)N * K / 16 * 4);
+    std::vector<signed char> hq((size_t)N * K); for (auto &x : hq) x = (signed char)(rnd() % 255 - 127);
+    std::vector<float> hsq((size_t)N * K / 16, 0.01f);
+    cudaMemcpy(q8, hq.data(), hq.size(), cudaMemcpyHostToDevice); cudaMemcpy(s8, hsq.data(), hsq.size() * 4, cudaMemcpyHostToDevice);
+    nvfp4a_tensor B8 = {q8, NVFP4A_INT8, s8, 0, nullptr, nullptr};
+    gemm("nvfp4a_gemm NVFP4 x INT8 -> BF16", B8, D, 0.f);
+    cudaFree(q8); cudaFree(s8);
+  }
   void *dX; cudaMalloc(&dX, (size_t)K * N * 4); cudaMemset(dX, 0, (size_t)K * N * 4);
   for (nvfp4a_dtype bt : {NVFP4A_BF16, NVFP4A_FP16, NVFP4A_FP32}) {
     nvfp4a_tensor X = {dX, bt, nullptr, 0, nullptr, nullptr};

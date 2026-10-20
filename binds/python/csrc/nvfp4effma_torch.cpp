@@ -127,6 +127,30 @@ std::tuple<Tensor, Tensor> quantize(const Tensor &x, const Tensor &global_scale,
   return {data, scales};
 }
 
+// x [rows, cols] -> (int8 [rows, cols], float32 scales [rows, cols / 16]): sb = amax_block / 127,
+// q = RNE(x / sb) -- the activations of the W4A8 path.
+std::tuple<Tensor, Tensor> quantize_int8(const Tensor &x) {
+  TORCH_CHECK_VALUE(x.is_cuda(), "x must be a CUDA tensor, got a tensor on ", x.device());
+  const at::Device dev = x.device();
+  check_gpu(dev);
+  const nvfp4a_dtype t = dense_dtype(x.scalar_type(), "x");
+  TORCH_CHECK_VALUE(x.dim() == 2, "x must be 2-D, got shape ", x.sizes());
+  const int64_t rows = x.size(0), cols = x.size(1);
+  TORCH_CHECK_VALUE(cols % 16 == 0, "the last dimension (", cols, ") must be a multiple of 16");
+  Tensor xs = x;
+  if (x.stride(1) != 1 || (rows > 1 && x.stride(0) % 16) || reinterpret_cast<uintptr_t>(x.data_ptr()) % 16) xs = x.contiguous();
+  Tensor q = at::empty({rows, cols}, x.options().dtype(at::kChar));
+  Tensor scales = at::empty({rows, cols / 16}, x.options().dtype(at::kFloat));
+  if (rows == 0 || cols == 0) return {q, scales};
+  const c10::cuda::CUDAGuard guard(dev);
+  const nvfp4a_tensor S = {xs.data_ptr(), t, nullptr, 0, nullptr, nullptr};
+  const nvfp4a_tensor Q = {q.data_ptr(), NVFP4A_INT8, scales.data_ptr(), (int)(cols / 16), nullptr, nullptr};
+  check_status(nvfp4a_quantize(&S, as_int(rows <= 1 ? cols : xs.stride(0), "ld(x)"), &Q, as_int(cols, "cols"),
+                               as_int(rows, "rows"), as_int(cols, "cols"), at::cuda::getCurrentCUDAStream().stream()),
+               "nvfp4a_quantize");
+  return {q, scales};
+}
+
 // (data, scales, global_scale) of an NVFP4 [rows, cols] -> dense tensor of dtype
 Tensor dequantize(const Tensor &data, const Tensor &scales, const Tensor &global_scale, at::ScalarType dtype) {
   TORCH_CHECK_VALUE(data.is_cuda(), "data must be a CUDA tensor, got a tensor on ", data.device());
@@ -149,8 +173,9 @@ Tensor dequantize(const Tensor &data, const Tensor &scales, const Tensor &global
   return y;
 }
 
-// out [T, N] = alpha * x @ W^T + bias + beta * out, W NVFP4 [N, K]; x [T, K] dense or NVFP4 (x_scales
-// given).  K a multiple of 64.
+// out [T, N] = alpha * x @ W^T + bias + beta * out, W NVFP4 [N, K]; x [T, K] dense, NVFP4 (uint8
+// [T, K / 2] with E4M3 x_scales) or INT8 (int8 [T, K] with float32 x_scales [T, K / 16]).  K a multiple
+// of 64.
 Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global_scale, const Tensor &w, const Tensor &w_scales,
               const Tensor &w_global_scale, const OptT &bias, std::optional<at::ScalarType> out_dtype, OptT out,
               double alpha, double beta, const OptT &amax_out) {
@@ -159,7 +184,7 @@ Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global_scale,
   check_device(x, dev, "x");
   check_gpu(dev);
   TORCH_CHECK_VALUE(w.dim() == 2 && x.dim() == 2, "x and weight.data must be 2-D, got shapes ", x.sizes(), " and ", w.sizes());
-  const bool x_fp4 = x_scales.has_value();
+  const bool x_q8 = x_scales.has_value() && x.scalar_type() == at::kChar, x_fp4 = x_scales.has_value() && !x_q8;
   const int64_t N = w.size(0), K = w.size(1) * 2, T = x.size(0), xk = x_fp4 ? x.size(1) * 2 : x.size(1);
   TORCH_CHECK_VALUE(xk == K, "x has ", xk, " input features, the weight ", K);
   TORCH_CHECK_VALUE(K % 64 == 0, "the number of input features (", K, ") must be a multiple of 64 (pad with zeros)");
@@ -170,6 +195,19 @@ Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global_scale,
   if (x_fp4) {
     X = fp4_operand(x, *x_scales, T, K, dev, "x", 64, 4);
     ldx = X.ld;
+  } else if (x_q8) {
+    TORCH_CHECK_TYPE(x_scales->scalar_type() == at::kFloat, "the scales of an int8 x must be torch.float32, got ",
+                     x_scales->scalar_type());
+    check_device(*x_scales, dev, "x scales");
+    TORCH_CHECK_VALUE(x_scales->dim() == 2 && x_scales->size(0) == T && x_scales->size(1) == K / 16,
+                      "the scales of an int8 x must have shape [", T, ", ", K / 16, "], got ", x_scales->sizes());
+    xd = x.stride(1) == 1 && (T <= 1 || x.stride(0) % 64 == 0) && reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0
+             ? x : x.contiguous();
+    X.scales = x_scales->stride(1) == 1 && (T <= 1 || x_scales->stride(0) % 4 == 0) &&
+                       reinterpret_cast<uintptr_t>(x_scales->data_ptr()) % 16 == 0
+                   ? *x_scales : x_scales->contiguous();
+    ldx = (int)(T <= 1 ? K : xd.stride(0));
+    X.ld_scale = (int)(T <= 1 ? K / 16 : X.scales.stride(0));
   } else {
     dense_dtype(x.scalar_type(), "x");
     xd = x;
@@ -189,7 +227,7 @@ Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global_scale,
     TORCH_CHECK_VALUE(at::has_internal_overlap(*out) != at::MemOverlap::Yes, "out must not have internally overlapping memory");
     TORCH_CHECK_VALUE(at::get_overlap_status(*out, x) == at::MemOverlapStatus::No, "out must not share memory with x");
   } else {
-    out = at::empty({T, N}, x.options().dtype(out_dtype.value_or(x_fp4 ? at::kBFloat16 : x.scalar_type())));
+    out = at::empty({T, N}, x.options().dtype(out_dtype.value_or(x_fp4 || x_q8 ? at::kBFloat16 : x.scalar_type())));
   }
   if (bias) {
     check_device(*bias, dev, "bias");
@@ -203,7 +241,8 @@ Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global_scale,
                            scalar_ptr(w_global_scale, dev, "weight.global_scale"), nullptr};
   const nvfp4a_tensor B = x_fp4 ? nvfp4a_tensor{X.data.data_ptr(), NVFP4A_NVFP4, X.scales.data_ptr(), X.ld_scale,
                                                 scalar_ptr(x_global_scale, dev, "x.global_scale"), nullptr}
-                                : nvfp4a_tensor{xd.data_ptr(), dense_dtype(x.scalar_type(), "x"), nullptr, 0, nullptr, nullptr};
+                          : x_q8 ? nvfp4a_tensor{xd.data_ptr(), NVFP4A_INT8, X.scales.data_ptr(), X.ld_scale, nullptr, nullptr}
+                                 : nvfp4a_tensor{xd.data_ptr(), dense_dtype(x.scalar_type(), "x"), nullptr, 0, nullptr, nullptr};
   const nvfp4a_tensor D = {out->data_ptr(), dense_dtype(out->scalar_type(), "out"), nullptr, 0, nullptr,
                            scalar_ptr(amax_out, dev, "amax_out")};
   nvfp4a_tensor BIAS = {};
@@ -220,6 +259,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "NVFP4EffMA: NVFP4 GEMM / GEMV / quantization for GPUs without native FP4 (sm_50..sm_90)";
   m.attr("__version__") = NVFP4EFFMA_VERSION;
   m.def("quantize", &quantize, py::arg("x"), py::arg("global_scale"), py::arg("amax") = py::none());
+  m.def("quantize_int8", &quantize_int8, py::arg("x"));
   m.def("dequantize", &dequantize, py::arg("data"), py::arg("scales"), py::arg("global_scale"), py::arg("dtype"));
   m.def("linear", &linear, py::arg("x"), py::arg("x_scales"), py::arg("x_global_scale"), py::arg("w"),
         py::arg("w_scales"), py::arg("w_global_scale"), py::arg("bias") = py::none(), py::arg("out_dtype") = py::none(),

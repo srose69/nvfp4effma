@@ -47,10 +47,10 @@ GEMV_H = $(CORE_H) src/gemv_nvfp4effma.cuh
 TUNED_IDS = $(shell sed -n 's/^\#define NVFP4A_$(1)_USED(X)//p' src/nvfp4effma_tuned.h | grep -o '[0-9]\+')
 GEMM_IDS  = 0 1 $(call TUNED_IDS,GEMM)
 GEMV_IDS  = 0 $(call TUNED_IDS,GEMV)
-# objects of similar compile cost: GEMM per config x dense B dtype plus the NVFP4 x NVFP4 FFMA kernel
-# (0_0), GEMV per config x x dtype (dtype codes: NVFP4 0, BF16 1, FP16 2, FP32 3)
-INST = $(foreach i,$(GEMV_IDS),$(foreach t,0 1 2 3,inst_gemv_$(i)_$(t))) \
-       $(foreach i,$(GEMM_IDS),$(foreach t,1 2 3,inst_gemm_$(i)_$(t))) inst_gemm_0_0
+# objects of similar compile cost: GEMM per config x dense B dtype plus the NVFP4 x NVFP4 / INT8 FFMA
+# kernels (0_0, 0_4), GEMV per config x x dtype (dtype codes: NVFP4 0, BF16 1, FP16 2, FP32 3, INT8 4)
+INST = $(foreach i,$(GEMV_IDS),$(foreach t,0 1 2 3 4,inst_gemv_$(i)_$(t))) \
+       $(foreach i,$(GEMM_IDS),$(foreach t,1 2 3,inst_gemm_$(i)_$(t))) inst_gemm_0_0 inst_gemm_0_4
 OBJS = nvfp4effma gemm_nvfp4effma gemv_nvfp4effma $(INST)
 NVCC_THREADS := $(shell t=$$(( $(JOBS) / $(words $(OBJS)) )); [ $$t -lt 1 ] && t=1; a=$(words $(ARCHS)); [ $$t -gt $$a ] && t=$$a; echo $$t)
 word_ = $(word $(1),$(subst _, ,$(2)))

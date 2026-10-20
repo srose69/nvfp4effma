@@ -47,15 +47,48 @@ describe the cooling in `COOLING`.
 
 Full tables: [benches/1080.md](../benches/1080.md).
 
-- **NVFP4 × NVFP4 GEMM is 2× cuBLAS SGEMM**: 9.72 ms at 4096³ (7.1 TMAC/s, 197–202 MAC/clk/SM)
-  vs 19.56 ms. On Pascal this is the only way past the FP32 FFMA rate: 4 exact products per DP4A
-  ([design.md](design.md)). Accumulating into an FP32 D costs 2 % more (9.89 ms: the epilogue reads D and nothing
-  overlaps it with one block per SM).
-- **NVFP4 × BF16 / FP16 / FP32 GEMM runs at SGEMM speed** (19.7–19.8 ms, 74–75 % of the FP32 peak, one
+- **NVFP4 × NVFP4 and NVFP4 × INT8 GEMM are about 2× cuBLAS SGEMM**: 9.4–9.9 ms at 4096³ (7.0–7.3 TMAC/s,
+  197–202 MAC/clk/SM) vs 19.4–19.6 ms. On Pascal this is the only way past the FP32 FFMA rate: 4 exact
+  products per DP4A ([design.md](design.md)). Accumulating into an FP32 D costs 2 % more (the epilogue reads
+  D and nothing overlaps it with one block per SM).
+- **NVFP4 × BF16 / FP16 / FP32 GEMM runs at SGEMM speed** (19.7–20.0 ms, 74–75 % of the FP32 peak, one
   FFMA per MAC) while reading 7× fewer weight bytes than SGEMM's FP32 weights.
 - **GEMV is bandwidth-bound for small n**: 0.140 ms for an 8192 × 8192 NVFP4 matrix with a BF16 x, 269
   GB/s or 84 % of the DRAM peak (96 % of a device-to-device copy) — 7.4× cuBLAS SGEMV on FP32 weights. With
-  NVFP4 activations n = 2 runs as fast as n = 1 (DP4A per block), n = 8 at 190 GB/s, 7.7× SGEMM n = 8;
-  with BF16 activations the per-value decode makes n = 4 … 8 compute-bound (178 → 109 GB/s), still
-  4.4× SGEMM at n = 8.
+  NVFP4 or INT8 activations (DP4A per block) n = 2 runs as fast as n = 1 and n = 8 takes 0.16–0.20 ms,
+  7.7–9.7× SGEMM n = 8; with BF16 activations the per-value decode makes n = 4 … 8 compute-bound
+  (178 → 109 GB/s), still 4.4× SGEMM at n = 8. Beyond 8 columns the GEMV kernel runs in groups of 8:
+  0.32 ms for n = 16 with INT8 activations.
 - **Quantization** streams at 87–89 % of the DRAM peak (BF16 → NVFP4: 0.60 ms for 64 M values).
+
+## Compared with llama.cpp
+
+llama.cpp (ggml) has an NVFP4 type with CUDA kernels, including a DP4A path for Pascal; it quantizes the
+activations to int8 (q8_1, blocks of 32) for its matmuls, so its accuracy class is W4A8. Same GTX 1080,
+same shapes (ggml's own perf shapes m × k = 4096 × 14336 plus 8192 × 8192 and 4096³), FP32 activations
+whose int8 quantization is included in both timings, FP32 output. ggml measured with `test-backend-ops
+perf` (MUL_MAT), NVFP4EffMA with `nvfp4a_quantize` + `nvfp4a_gemm`; three interleaved rounds (ggml, then
+NVFP4EffMA, 20 s idle before each run), median per shape. Stock board settings; the GPU ran at
+~1800 MHz during ggml's runs and ~1775 MHz during NVFP4EffMA's (which draw more power).
+
+| m, n, k | ggml NVFP4 | NVFP4EffMA W4A8 | vs ggml | NVFP4EffMA W4A16, exact |
+|---|---:|---:|---:|---:|
+| 4096, 4096, 4096 | 14.49 ms | 9.89 ms | **1.47×** | 20.86 ms |
+| 4096, 1, 14336 | 158 µs | 153 µs | 1.04× | 154 µs |
+| 4096, 2, 14336 | 193 µs | 152 µs | 1.27× | 160 µs |
+| 4096, 4, 14336 | 357 µs | 182 µs | 1.96× | 188 µs |
+| 4096, 8, 14336 | 704 µs | 181 µs | **3.89×** | 328 µs |
+| 4096, 16, 14336 | 451 µs | 357 µs | 1.26× | 657 µs |
+| 4096, 32, 14336 | 717 µs | 708 µs | 1.01× | 1.33 ms |
+| 4096, 64, 14336 | 958 µs | 799 µs | 1.20× | 2.49 ms |
+| 4096, 128, 14336 | 2.02 ms | 1.21 ms | 1.67× | 2.54 ms |
+| 4096, 512, 14336 | 6.14 ms | 4.25 ms | **1.45×** | 10.53 ms |
+| 8192, 1, 8192 | 175 µs | 143 µs | 1.23× | 144 µs |
+| 8192, 8, 8192 | 744 µs | 165 µs | **4.51×** | 353 µs |
+| 8192, 64, 8192 | 1.21 ms | 755 µs | 1.60× | 2.85 ms |
+| 8192, 512, 8192 | 8.36 ms | 5.04 ms | **1.66×** | 11.13 ms |
+
+The W4A16 path is the exact one (no activation quantization at all) and is compute-bound at SGEMM speed
+(on Pascal no exact path can beat the FP32 FFMA rate: ≥ ~15 ms at 4096³). The PyTorch `linear` therefore
+quantizes BF16 activations to int8 by default beyond 2 rows (`act="auto"`): 10.0 ms at 4096³ including
+the quantization, with `act="exact"` for the exact path.

@@ -45,11 +45,23 @@ k-tile (tile t + 1 is decoded at the start of iteration t, the loads of tile t +
   Prefetching C into L2 during the k loop was tried and was slower.
 - **Result:** 197–202 MAC/clk/SM, 9.7–9.9 ms at 4096³ (about 7 TMAC/s at 1.8 GHz), 1.96× cuBLAS SGEMM.
   Accumulating into an FP32 D (`β = 1`) adds the read of D to the unoverlapped epilogue: 189 MAC/clk/SM.
+- **A 64-wide tile** (8 × 4 outputs per thread, ~120 registers, two blocks per SM) for n where the last
+  128-wide tile would be at most half full: n = 57 … 64 and 129 … 192. It costs about 2/3 of the
+  128-wide tile for half the work, so beyond that the large tile wins; at n = 64 it takes 0.76–0.80 ms
+  instead of 1.2–1.4 ms (m × k = 4096 × 14336 and 8192²).
 - **Below sm_61** (no DP4A: sm_50 … sm_53, sm_60) the FFMA kernel runs on integer-valued FP32 tiles: 16
   FFMAs give the exact block sum, then the same `fma(p · sa, sb, acc)`, so both paths produce the same
   bits. Packing two products into one FFMA (`a = x0 + W·x1`, the middle field of the product carries two
   MACs) works exactly for W = 2¹² up to about 14 k per extraction, but a whole block of 16 at the extremes
   exceeds it (0.03 % of cases): not used.
+
+## NVFP4 × INT8 (W4A8)
+
+The same kernel with int8 activations: B tiles are stored as they arrive (no decode), the block scales of B
+are FP32 (one float4 per row and k-tile), and the block sums reach 16 · 12 · 127 = 24384 — still far below
+the 2²² the magic-constant conversion allows, and `p · sa` stays exact. 9.4 ms at 4096³ (7.3 TMAC/s), as
+fast as W4A4 or slightly faster: B needs no decode. With llama.cpp's int8 activations as the reference
+point this is the like-for-like comparison (below).
 
 ## NVFP4 × BF16 / FP16 / FP32: the scale goes into the decode
 
@@ -59,7 +71,7 @@ block into the FP32 shared tile as `a · sa` — `sign | (n & 7) << 22` is the F
 restore it exactly. The inner loop is LDS.128 + one FFMA per MAC and does not know the format; it runs at
 cuBLAS SGEMM speed (74–75 % of the FP32 peak) while reading 7× fewer weight bytes.
 
-## GEMV (n ≤ 8)
+## GEMV (small n)
 
 Bandwidth-bound, every byte of A read once: a lane takes one block (8 bytes + its scale) of each of R
 rows per pass. At 4.5 bits per value the decode is the critical part — at the DRAM peak of a GTX 1080 there
@@ -68,8 +80,12 @@ are about 8 issue slots per weight value.
 - **Dense x:** the two FMULs of the decode become one: the raw encoding times `sa · 2¹¹⁷` (cannot overflow:
   sa ≤ 448 < 2⁹) is `a · sa · 2⁻⁹`, and the exact factor 2⁹ is applied once per output before the
   epilogue.
-- **NVFP4 x:** int8 decode of both sides and DP4A per block, as in the tiled kernel (FFMA on integers
-  below sm_61). This made n = 4 … 8 2–3× faster than decoding x to FP32.
+- **NVFP4 / INT8 x:** int8 decode of both sides (INT8 x as it is) and DP4A per block, as in the tiled
+  kernel (FFMA on integers below sm_61). This made n = 4 … 8 2–3× faster than decoding x to FP32.
+- **More than 8 columns** run as groups of 8, each reading A once. The tiled kernels have a single row of
+  128-wide tiles there and leave most of the GPU idle: at m = k = 8192 the DP4A kernel takes ~1.34 ms for
+  any n ≤ 64. Grouped GEMV wins up to n = 48 (NVFP4), 56 (INT8, BF16, FP16) and 32 (FP32) on a GTX 1080
+  (`kGemvMaxN`).
 
 ## Kernel configurations
 
@@ -78,6 +94,6 @@ Kernels are templates; the candidates are those that can win on some target, cho
 
 - **Dense-B GEMM**: 128 × 128, 64 × 64, 128 × 64 and 64 × 128 blocks, all with an 8 × 8 thread tile and a
   16-deep k-slice (one NVFP4 block); register budget 512 threads per SM at ≤ 128 registers.
-- **NVFP4 × NVFP4**: the DP4A kernel has one configuration (above); the FFMA kernel below sm_61 uses the
+- **NVFP4 × NVFP4 / INT8**: the DP4A kernel has a 128- and a 64-wide tile (above); the FFMA kernel below sm_61 uses the
   128 × 128 configuration with one block per SM (64 accumulators plus 64 block sums per thread).
 - **GEMV**: 2, 4 or 8 rows per warp (8 only for n ≤ 2).

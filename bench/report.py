@@ -116,21 +116,22 @@ def main(res, out_dir):
 
     # summary row in benches/table.md
     w4a4 = g.get('nvfp4a_gemm NVFP4 x NVFP4 -> BF16'); w4a16 = g.get('nvfp4a_gemm NVFP4 x BF16 -> BF16')
+    w4a8 = g.get('nvfp4a_gemm NVFP4 x INT8 -> BF16')
     v1 = v.get('nvfp4a gemv n=1 x=BF16 -> BF16')
     sv = v.get('cuBLAS SGEMV FP32 (same M, K)'); qb = q.get('quantize BF16 -> NVFP4')
     def speedup(base, r, digits=2): return f"{base['ms'] / r['ms']:.{digits}f}×" if base and r else '—'
     def bw(r): return f"{r['gbs']:.0f} GB/s ({r['dram']:.0f} %)" if r else '—'
     def gm(r): return f"{r['gmacs']:.0f}" if r else '—'
-    row = (f"| [{gpu}]({key}.md) | {env.get('compute_cap', '—')} | {gm(w4a4)} | {speedup(cub, w4a4)} | {speedup(cub, w4a16)} "
+    row = (f"| [{gpu}]({key}.md) | {env.get('compute_cap', '—')} | {gm(w4a4)} | {speedup(cub, w4a4)} | {speedup(cub, w4a8)} | {speedup(cub, w4a16)} "
            f"| {bw(v1)} | {speedup(sv, v1, 1)} | {bw(qb)} | {env.get('date', '—')} |")
     tpath = os.path.join(out_dir, 'table.md')
     head = ['# Results by GPU', '',
             'One row per GPU, produced by `bench/run_bench.sh` (see [docs/performance.md](../docs/performance.md)); the',
             'linked file has the full tables and the conditions of the run. Percentages of the FP32 peak use the SM',
             'clock measured during each row; the baseline is cuBLAS on FP32 data of the same shape.', '',
-            '| GPU | CC | GEMM NVFP4 × NVFP4, GMAC/s | NVFP4 × NVFP4 vs SGEMM | NVFP4 × BF16 vs SGEMM '
+            '| GPU | CC | GEMM NVFP4 × NVFP4, GMAC/s | NVFP4 × NVFP4 vs SGEMM | NVFP4 × INT8 vs SGEMM | NVFP4 × BF16 vs SGEMM '
             '| GEMV n = 1, BF16 x (% of DRAM peak) | GEMV n = 1 vs SGEMV | Quantize BF16 (% of DRAM peak) | Date |',
-            '|---|---|---:|---:|---:|---:|---:|---:|---|']
+            '|---|---|---:|---:|---:|---:|---:|---:|---:|---|']
     rows = []
     if os.path.exists(tpath):
         rows = [l for l in open(tpath).read().split('\n') if l.startswith('| [') and f']({key}.md)' not in l]

@@ -4,8 +4,8 @@
 // the per-instance objects (gemm_nvfp4effma_inst.cu).  Host API and dispatch: gemm_nvfp4effma.cu.
 //   gemm_kernel       FFMA, A NVFP4 x B BF16 / FP16 / FP32 (block scale applied when A is decoded into the
 //                     FP32 tile), and NVFP4 x NVFP4 below sm_61 (integer-valued tiles, exact block sums)
-//   gemm_dp4a_kernel  NVFP4 x NVFP4 from sm_61: int8 tiles, 4 DP4A + 2 FFMA per output and block
-// Both NVFP4 x NVFP4 kernels compute the same values bit for bit.
+//   gemm_dp4a_kernel  NVFP4 x NVFP4 / INT8 from sm_61: int8 tiles, 4 DP4A + 2 FFMA per output and block
+// Both kernels compute the same NVFP4 x NVFP4 / INT8 values bit for bit.
 #pragma once
 #include <type_traits>
 #include "nvfp4effma.cuh"
@@ -40,9 +40,10 @@ struct GemmCfg {
 // constant per kk).  Rows past the end of the matrix read row 0: they only feed outputs that the
 // epilogue does not store, so neither a branch nor zeroing is needed.
 //   NVFP4, INT = false: values a * sa (exact)        NVFP4, INT = true: integers 2a, sa to ss[row]
+//   INT8 (INT = true): the int8 values, their FP32 block scale to ss[row]
 template <class C, int R, int T, bool INT>
 struct TileLoader {
-  static constexpr bool FP4 = T == NVFP4A_NVFP4;
+  static constexpr bool FP4 = T == NVFP4A_NVFP4, Q8 = T == NVFP4A_INT8;
   static constexpr int E = R * C::BK / C::NT < 8 ? R * C::BK / C::NT : 8;
   static constexpr int CH = R * C::BK / (E * C::NT), LPR = C::BK / E;  // chunks per thread, lanes per row
   static_assert(CH >= 1 && (R * C::BK) % (E * C::NT) == 0, "tile does not split into chunks");
@@ -60,7 +61,7 @@ struct TileLoader {
       const int w = threadIdx.x + C::NT * j, rl = w / LPR, kc = (w % LPR) * E;
       const size_t r = r0 + rl < rmax ? r0 + rl : 0;
       p[j] = FP4 ? X + r * (ld / 2) + kc / 2 : X + (r * ld + kc) * Elem<FP4 ? NVFP4A_FP32 : T>::bytes;
-      ps[j] = FP4 ? S + r * lds : nullptr;
+      ps[j] = FP4 ? S + r * lds : Q8 ? S + r * lds * 4 : nullptr;
       dst[j] = kc * (R + C::PAD) + (rl ^ swz(kc));
       row[j] = rl; first[j] = kc == 0;
     }
@@ -71,7 +72,10 @@ struct TileLoader {
 #pragma unroll
     for (int j = 0; j < CH; ++j) {
       if (FP4) { raw[j][0] = *(const uint32_t *)p[j]; sc[j] = *ps[j]; }
-      else if (RW == 2) { const uint2 w = *(const uint2 *)p[j]; raw[j][0] = w.x; raw[j][1] = w.y; }
+      else if (RW == 2) {
+        const uint2 w = *(const uint2 *)p[j]; raw[j][0] = w.x; raw[j][1] = w.y;
+        if (Q8) sc[j] = *(const uint32_t *)ps[j];
+      }
       else {
 #pragma unroll
         for (int q = 0; q < RW; q += 4) {
@@ -86,7 +90,7 @@ struct TileLoader {
 #pragma unroll
     for (int j = 0; j < CH; ++j) {
       p[j] += more ? (FP4 ? C::BK / 2 : C::BK * Elem<FP4 ? NVFP4A_FP32 : T>::bytes) : 0;
-      if (FP4) ps[j] += more ? 1 : 0;
+      if (FP4 || Q8) ps[j] += more ? (FP4 ? 1 : 4) : 0;
     }
   }
   __device__ __forceinline__ void store(float *s, float *ss) const {
@@ -98,6 +102,10 @@ struct TileLoader {
 #pragma unroll
         for (int q = 0; q < E; ++q) v[q] = INT ? e2m1_value<1>(raw[j][0], q) : mul_rn(e2m1_value<0>(raw[j][0], q), sa);
         if (INT && first[j]) ss[row[j]] = sa;
+      } else if (Q8) {
+#pragma unroll
+        for (int q = 0; q < E; ++q) v[q] = (float)(int8_t)(raw[j][q / 4] >> (8 * (q % 4)));
+        if (INT && first[j]) ss[row[j]] = __uint_as_float(sc[j]);
       } else {
 #pragma unroll
         for (int q = 0; q < RW; ++q) {
@@ -127,12 +135,14 @@ __device__ __forceinline__ void epi_staged_pass(const Epilogue &e, EpiState &st,
 }
 
 template <class C, int TB>
-__global__ void __launch_bounds__(C::NT, TB == NVFP4A_NVFP4 ? 1 : C::MINB)
+__global__ void __launch_bounds__(C::NT, TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8 ? 1 : C::MINB)
 gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
             const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n, int k,
             Epilogue e) {
   if (!C::template On<TB>::value) { __trap(); return; }
-  constexpr bool INT = TB == NVFP4A_NVFP4;  // NVFP4 x NVFP4: exact block sums, then the two scale FFMAs
+  // NVFP4 x NVFP4 / INT8: exact block sums, then the two scale FFMAs; the result times kOut
+  constexpr bool INT = TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8;
+  constexpr float kOut = TB == NVFP4A_INT8 ? 0.5f : 0.25f;
   __shared__ __align__(16) float sA[C::BK * (C::BM + C::PAD)];
   __shared__ __align__(16) float sB[C::BK * (C::BN + C::PAD)];
   __shared__ __align__(16) float ssA[INT ? C::BM : 1], ssB[INT ? C::BN : 1];
@@ -220,7 +230,7 @@ gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
 #pragma unroll
         for (int g = 0; g < C::TM / 4; ++g)
           *reinterpret_cast<float4 *>(&sA[ty * C::BM + g * C::TX * 4 + tx * 4]) =
-              INT ? make_float4(acc[4 * g][jj] * 0.25f, acc[4 * g + 1][jj] * 0.25f, acc[4 * g + 2][jj] * 0.25f, acc[4 * g + 3][jj] * 0.25f)
+              INT ? make_float4(acc[4 * g][jj] * kOut, acc[4 * g + 1][jj] * kOut, acc[4 * g + 2][jj] * kOut, acc[4 * g + 3][jj] * kOut)
                   : make_float4(acc[4 * g][jj], acc[4 * g + 1][jj], acc[4 * g + 2][jj], acc[4 * g + 3][jj]);
       }
     __syncthreads();
@@ -267,10 +277,18 @@ __device__ __forceinline__ void store4_any(void *p, size_t i, bool vec, const fl
   } else for (int q = 0; q < 4; ++q) store_any(T, p, i + q, v[q]);
 }
 
-struct Dp4aCfg { static constexpr int BM = 128, BN = 128, TX = 16, TY = 16, TM = 8, TN = 8, NT = 256, KBT = 4; };
+// BN_ x TN_: 128 x 8 (the large tile) or 64 x 4 (for n up to a few hundred, where 128-wide tiles are half
+// empty and too few to fill the GPU); MINB_ resident blocks per SM.
+template <int BN_, int TN_, int MINB_>
+struct Dp4aCfgT {
+  static constexpr int BM = 128, BN = BN_, TX = 16, TY = 16, TM = 8, TN = TN_, NT = 256, KBT = 4, MINB = MINB_;
+  static_assert(BN == TY * TN && TN % 4 == 0 && BN <= BM, "unsupported DP4A tile");
+};
+using Dp4aCfg = Dp4aCfgT<128, 8, 1>;
+using Dp4aCfgNarrow = Dp4aCfgT<64, 4, 2>;  // ~120 registers: two blocks per SM
 
-template <class C>
-__global__ void __launch_bounds__(C::NT, 1)
+template <class C, int TB>
+__global__ void __launch_bounds__(C::NT, C::MINB)
 gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
                  const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n,
                  int k, Epilogue e) {
@@ -279,45 +297,63 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
 #else
   constexpr int BM = C::BM, BN = C::BN, KBT = C::KBT;
   __shared__ __align__(16) uint4 sAB[2][2][KBT * BM];  // [A / B][buffer][block][row]: 16 int8 per block and row
-  uint4 (*sA2)[KBT * BM] = sAB[0], (*sB2)[KBT * BN] = sAB[1];
+  uint4 (*sA2)[KBT * BM] = sAB[0], (*sB2)[KBT * BM] = sAB[1];  // B buffers sized for BM >= BN
   __shared__ __align__(16) float2 ssa2[2][KBT][BM];  // (sa, -1.5 * 2^23 * sa)
   __shared__ __align__(16) float ssb2[2][KBT][BN];   // [block][ty * TN + j]
   const int tid = threadIdx.x, tx = tid % C::TX, ty = tid / C::TX;
   const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-  // loads: every thread takes 16 bytes (two blocks) of one row of A and of B per k-tile; threads 0..127
-  // the 4 block scales (one 32-bit word) of a row of A, threads 128..255 those of a row of B.  Rows past
-  // the end of the matrix read row 0 (outputs that are not stored).
+  // loads: every thread takes two blocks of one row of A (16 bytes) and of B (16 bytes of NVFP4, 32 of
+  // INT8) per k-tile; threads 0..127 the 4 block scales of a row of A (one 32-bit word), threads 128..255
+  // those of a row of B (a word of 4 E4M3, or 4 floats for INT8).  Rows past the end of the matrix read
+  // row 0 (outputs that are not stored).
+  constexpr bool Q8 = TB == NVFP4A_INT8;
+  constexpr float kOut = Q8 ? 0.5f : 0.25f;  // the A values are doubled; NVFP4 B values too
+  constexpr int BW = Q8 ? 2 : 1;  // uint4 per thread and k-tile of B
   const int row = tid >> 1, half = tid & 1;
   const uint4 *pa = (const uint4 *)(A + (size_t)(m0 + row < m ? m0 + row : 0) * (lda / 2)) + half;
-  const uint4 *pb = (const uint4 *)(B + (size_t)(n0 + row < n ? n0 + row : 0) * (ldb / 2)) + half;
+  const uint4 *pb = (const uint4 *)(B + (size_t)(n0 + row < n ? n0 + row : 0) * (Q8 ? ldb : ldb / 2)) + BW * half;
   const bool sa_thr = tid < BM;
   const int srow = tid & (BM - 1);
+  const bool b_row = row < BN, b_srow = srow < BN;  // narrow tiles: only these threads carry B
+  const size_t brow = n0 + srow < n ? n0 + srow : 0;
   const uint32_t *ps = (const uint32_t *)(sa_thr ? SA + (size_t)(m0 + srow < m ? m0 + srow : 0) * ldsa
-                                                 : SB + (size_t)(n0 + srow < n ? n0 + srow : 0) * ldsb);
+                                                 : (Q8 ? SA : SB + brow * ldsb));
+  const float4 *psb = Q8 ? (const float4 *)((const float *)SB + brow * ldsb) : nullptr;
   const int sbslot = srow % C::TY * C::TN + srow / C::TY;  // B row n0 + ty + TY * j -> slot ty * TN + j
   float acc[C::TM][C::TN];
 #pragma unroll
   for (int i = 0; i < C::TM; ++i)
 #pragma unroll
     for (int j = 0; j < C::TN; ++j) acc[i][j] = 0.f;
-  uint4 ra = pa[0], rb = pb[0];
-  uint32_t rs = ps[0];
+  uint4 ra = pa[0], rb = pb[0], rb2 = Q8 ? pb[1] : make_uint4(0, 0, 0, 0);
+  uint32_t rs = sa_thr || !Q8 ? ps[0] : 0;
+  float4 rsb = Q8 && !sa_thr ? psb[0] : make_float4(0.f, 0.f, 0.f, 0.f);
   const int tiles = k / (16 * KBT);
   auto decode = [&](int buf) {
     uint4 *sA = sA2[buf], *sB = sB2[buf];
     sA[(2 * half) * BM + row] = dec16(ra.x, ra.y);
     sA[(2 * half + 1) * BM + row] = dec16(ra.z, ra.w);
-    sB[(2 * half) * BN + row] = dec16(rb.x, rb.y);
-    sB[(2 * half + 1) * BN + row] = dec16(rb.z, rb.w);
+    if (b_row) {
+      if (Q8) { sB[(2 * half) * BN + row] = rb; sB[(2 * half + 1) * BN + row] = rb2; }
+      else { sB[(2 * half) * BN + row] = dec16(rb.x, rb.y); sB[(2 * half + 1) * BN + row] = dec16(rb.z, rb.w); }
+    }
     if (sa_thr) {
 #pragma unroll
       for (int b = 0; b < KBT; ++b) { const float v = e4m3_value((rs >> (8 * b)) & 0xFF); ssa2[buf][b][srow] = make_float2(v, -12582912.f * v); }
+    } else if (!b_srow) {
+    } else if (Q8) {
+      ssb2[buf][0][sbslot] = rsb.x; ssb2[buf][1][sbslot] = rsb.y; ssb2[buf][2][sbslot] = rsb.z; ssb2[buf][3][sbslot] = rsb.w;
     } else {
 #pragma unroll
       for (int b = 0; b < KBT; ++b) ssb2[buf][b][sbslot] = e4m3_value((rs >> (8 * b)) & 0xFF);
     }
   };
-  auto load_next = [&] { pa += 2; ra = *pa; pb += 2; rb = *pb; rs = *++ps; };
+  auto load_next = [&] {
+    pa += 2; ra = *pa;
+    pb += 2 * BW; rb = pb[0];
+    if (Q8) rb2 = pb[1];
+    if (Q8 && !sa_thr) rsb = *++psb; else rs = *++ps;
+  };
   decode(0);
   if (tiles > 1) load_next();
   __syncthreads();
@@ -374,7 +410,7 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
 #pragma unroll
       for (int i = 0; i < C::TM; ++i) {
         const int gi = m0 + tx + C::TX * i, gj = n0 + ty + C::TY * j;
-        float v = __fmul_rn(acc[i][j] * 0.25f, st.s);
+        float v = __fmul_rn(acc[i][j] * kOut, st.s);
         if (full) { store_any(T, e.d, (size_t)gj * e.ldd + gi, v); continue; }
         if (gi < m && gj < n) {
           if (e.bias) v = __fadd_rn(v, bv[i]);
@@ -393,12 +429,12 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
     const auto vec_ok = [](const void *p, int ld, int bytes) { return ((uintptr_t)p % (4 * bytes)) == 0 && ld % 4 == 0; };
     const bool vc = vec_ok(e.c, e.ldc, Elem<CT>::bytes), vd = vec_ok(e.d, e.ldd, Elem<DT>::bytes);
 #pragma unroll
-    for (int h = 0; h < 2; ++h) {
+    for (int h = 0; h < C::TN / 4; ++h) {
       __syncthreads();  // the k loop, or the previous half, is done with the buffers
 #pragma unroll
       for (int jl = 0; jl < 4; ++jl)
 #pragma unroll
-        for (int i = 0; i < C::TM; ++i) stage[(jl * C::TY + ty) * BM + tx + C::TX * i] = __fmul_rn(acc[i][4 * h + jl] * 0.25f, st.s);
+        for (int i = 0; i < C::TM; ++i) stage[(jl * C::TY + ty) * BM + tx + C::TX * i] = __fmul_rn(acc[i][4 * h + jl] * kOut, st.s);
       __syncthreads();
 #pragma unroll 1
       for (int q = 0; q < 4 * C::TY * BM / 4 / C::NT; ++q) {

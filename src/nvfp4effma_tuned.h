@@ -5,7 +5,7 @@
 // One entry per compute capability; re-running the tuner on another GPU adds or replaces its entry.
 #pragma once
 #define NVFP4A_TUNED_TABLES \
-  , nvfp4a::kern::ArchTable{61, 0, 0, {{0, 2, 0, 2, 0, 0, 0, 0}, {0, 0, 2, 2, 0, 0, 2, 2}, {0, 0, 2, 2, 0, 2, 2, 0}, {0, 0, 0, 0, 0, 0, 0, 0}}} /* entry cc=61 gemm=0,0 gemv=02 NVIDIA GeForce GTX 1080 */ \
+  , nvfp4a::kern::ArchTable{61, 0, 0, {{0, 2, 0, 2, 0, 0, 0, 0}, {0, 0, 2, 2, 0, 0, 2, 2}, {0, 0, 2, 2, 0, 2, 2, 0}, {0, 0, 0, 0, 0, 0, 0, 0}, {2, 2, 0, 0, 0, 2, 2, 0}}} /* entry cc=61 gemm=0,0 gemv=02 NVIDIA GeForce GTX 1080 */ \
 
 #define NVFP4A_GEMM_USED(X)
 #define NVFP4A_GEMV_USED(X) X(2)
