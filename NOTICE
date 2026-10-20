@@ -1,0 +1,23 @@
+NVFP4EffMA
+Copyright (C) 2026 srose69
+Home page: https://github.com/srose69/nvfp4effma
+
+NVFP4EffMA is free software: you can redistribute it and/or modify it under the terms of the GNU
+Affero General Public License, version 3 (LICENSE), together with the Linking and Attribution
+Exception (LICENSE-EXCEPTION). It is distributed WITHOUT ANY WARRANTY; see the AGPL for details.
+
+In short:
+  - Programs that use NVFP4EffMA (link it, call it, load its Python bindings) may be distributed or
+    run as a service under any license, including proprietary ones.
+  - Changes to NVFP4EffMA itself stay under the AGPL with the exception, with their source available,
+    and must be marked as modified.
+  - Every work that uses NVFP4EffMA must show the attribution below (LICENSE-EXCEPTION, section 2).
+
+Attribution
+-----------
+Short form:  NVFP4EffMA (https://github.com/srose69/nvfp4effma)
+Long form:   This product uses NVFP4EffMA, NVFP4 GEMM, GEMV and quantization kernels for GPUs without
+             native FP4 (https://github.com/srose69/nvfp4effma), Copyright (C) 2026 srose69.
+
+A request, not a condition: if you run or publish a model with NVFP4EffMA, a mention in the model card
+or paper is much appreciated. CITATION.cff has the citation.

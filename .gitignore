@@ -1,0 +1,16 @@
+# build output
+out/
+# Python build artifacts
+binds/python/build/
+binds/python/*.egg-info/
+binds/python/nvfp4effma/*.so
+binds/python/LICENSE
+binds/python/LICENSE-EXCEPTION
+binds/python/NOTICE
+__pycache__/
+.pytest_cache/
+# release tooling and artifacts (dev/release.sh -> dist/vX.Y.Z)
+dev/
+dist/
+# prototypes and measurements (local only)
+proto/
