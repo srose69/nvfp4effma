@@ -25,8 +25,15 @@ describe the cooling in `COOLING`.
 
 - **Median per row.** Every row (one kernel, one shape) gets one untimed call, then 2 s of idle GPU
   (`NVFP4A_BENCH_COOL`), then 50–2000 timed calls (`NVFP4A_BENCH_REPS`); the median is reported. The
-  benchmarks are separated by 10 s of idle GPU and there is no warm-up, so every row starts from a
-  similar temperature.
+  benchmarks are separated by 10 s of idle GPU, so every row starts from a similar temperature.
+- **Warm-up.** Each benchmark first runs 4 plain FP32 matrix products 2048 × 2048, 0.5 s apart
+  (`NVFP4A_BENCH_WARMUP`), so that GPU Boost has raised the clocks before the first row.
+- **Transformer Engine formats.** Each benchmark ends with a block of rows for the operand formats (one
+  feature at a time — swizzled or UE5M3 scales, amax and per-row globals, 16 × 16 tiles, 4over6,
+  columnwise — then the combinations Transformer Engine produces); `x` is the time over the block's
+  "plain" row of the same run, so a format's cost is read off directly.
+  `NVFP4A_BENCH_FILTER="16x16|4over6"` runs only the rows whose names contain one of the `|`-separated
+  substrings (and the "plain" baselines), to measure one change without the whole suite.
 - **FP32 peak at the row's own clock.** % of FP32 peak = GMAC/s / (SMs × 128 × SM clock), one FFMA = one
   MAC (the DP4A kernel does more than one MAC per issue slot and exceeds 100 %), with the SM clock sampled through NVML every 5 ms while the row runs (`bench/bench_util.h`).
   GPU Boost moves the clock with temperature and power, and kernels draw different power, so one clock
@@ -60,6 +67,25 @@ Full tables: [benches/1080.md](../benches/1080.md).
   (178 → 109 GB/s), still 4.4× SGEMM at n = 8. Beyond 8 columns the GEMV kernel runs in groups of 8:
   0.32 ms for n = 16 with INT8 activations.
 - **Quantization** streams at 87–89 % of the DRAM peak (BF16 → NVFP4: 0.60 ms for 64 M values).
+
+## Transformer Engine formats: using them is cheap, creating them is not
+
+The GEMM and GEMV kernels hardly pay for the format of their operands: swizzled or UE5M3 scales, amax and
+per-row globals are within 1.5 % of plain NVFP4 in GEMM and −6.5 … +3 % in GEMV (swizzled x scales are
+the faster ones there). Producing those representations is another matter — GTX 1080, 8192 × 8192:
+
+| Quantization | BF16 | FP32 |
+|---|---:|---:|
+| plain 1 × 16, global given | 0.63 ms | 1.10 ms |
+| 16 × 16 tiles | 0.74 ms | 1.09 ms |
+| amax computed first (current scaling) | 1.13 ms | 2.03 ms |
+| 4over6 (MAE / MSE; 16 × 16) | 1.91–1.94 ms (2.15 ms) | 1.94–1.96 ms (2.19 ms) |
+| columnwise | 3.03 ms | 2.99 ms |
+| Transformer Engine weight: rowwise + columnwise, 16 × 16, swizzled, amax | 4.32 ms | 5.34 ms |
+
+So a ready NVFP4 checkpoint is worth a lot: in inference, quantize or convert the weights once at load
+time (or load them already quantized) and keep the representation; the per-call cost is then only the
+activations' rowwise 1 × 16 quantization of W4A4 (or the int8 one of W4A8), which runs at memory speed.
 
 ## Compared with llama.cpp
 

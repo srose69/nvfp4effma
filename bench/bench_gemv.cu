@@ -33,10 +33,10 @@ int main(int argc, char **argv) {
   const double copy_bw = 2.0 * abytes / copy.ms / 1e6;
   printf("%s: M=%d K=%d, A = %.0f MB NVFP4 (values + block scales); DRAM peak %.0f GB/s (%d-bit bus), D2D copy %.0f GB/s (read+write)\n\n",
          p.name, M, K, abytes / 1e6, peak_bw, p.memoryBusWidth, copy_bw);
-  printf("%-36s %9s %12s %8s %8s %9s\n", "", "time", "A bytes/s", "of DRAM", "of copy", "SM clock");
+  printf("%-56s %9s %12s %8s %8s %9s\n", "", "time", "A bytes/s", "of DRAM", "of copy", "SM clock");
   auto row = [&](const char *name, BenchRow x, double bytes, const char *note) {
     const double gbs = bytes / x.ms / 1e6;
-    printf("%-36s %6.3f ms %7.1f GB/s %7.0f%% %7.0f%% %5.0f MHz%s\n", name, x.ms, gbs, 100 * gbs / peak_bw, 100 * gbs / copy_bw,
+    printf("%-56s %6.3f ms %7.1f GB/s %7.0f%% %7.0f%% %5.0f MHz%s\n", name, x.ms, gbs, 100 * gbs / peak_bw, 100 * gbs / copy_bw,
            x.mhz, note);
     fflush(stdout);
   };
@@ -50,6 +50,30 @@ int main(int argc, char **argv) {
       char name[64]; snprintf(name, 64, "nvfp4a gemv n=%d x=%s -> BF16%s", n, xn[xt], st == NVFP4A_OK ? "" : " FAILED");
       row(name, x, (double)abytes, "");
     }
+  // Transformer Engine / cuBLASLt formats (bench_util.h): per x dtype and n every format against its "plain"
+  // row.  dsA / dsX hold the swizzled layout's padding (M a multiple of 128; x: 128 rows of K / 16 bytes).
+  printf("\nTransformer Engine formats, -> BF16 (x = time / plain of the same x dtype and n)\n");
+  {
+    float *gA = te_globals(M), *gB = te_globals(32);
+    for (nvfp4a_dtype xt : {NVFP4A_NVFP4, NVFP4A_BF16, NVFP4A_INT8})
+      for (int n : {1, 8, 32}) {
+        float plain = 0.f;
+        for (const TeFmt &f : kTeFmts) {
+          if (xt != NVFP4A_NVFP4 && f.fb) continue;  // B flags exist on NVFP4 x only
+          if (&f != kTeFmts && !bench_want(f.name)) continue;  // "plain": the baseline of x, always
+          nvfp4a_tensor a = {dA, NVFP4A_NVFP4, dsA, 0, gA, nullptr, f.fa, 0};
+          nvfp4a_tensor X = {dX, xt, dsX, 0, xt == NVFP4A_BF16 ? nullptr : gB, nullptr, f.fb, 0};
+          nvfp4a_status st = NVFP4A_OK;
+          const BenchRow x = bench.run([&] { st = nvfp4a_gemm(M, n, K, 1.f, &a, K, &X, K, 0.f, nullptr, 0, &Y, M, nullptr, 0); }, 200);
+          if (!plain) plain = x.ms;
+          char name[96], note[32];
+          snprintf(name, sizeof name, "TE n=%d x=%s %s%s", n, xn[xt], f.name, st == NVFP4A_OK ? "" : " FAILED");
+          snprintf(note, sizeof note, "   x%.3f", x.ms / plain);
+          row(name, x, (double)abytes, note);
+        }
+      }
+  }
+
   float *fA; cudaMalloc(&fA, (size_t)M * K * 4); cudaMemset(fA, 0, (size_t)M * K * 4);
   cublasHandle_t hb; cublasCreate(&hb);
   const float one = 1, zero = 0;

@@ -16,8 +16,11 @@
 NVIDIA's native FP4 compute stack (NVFP4 in cuBLASLt, Transformer Engine and ModelOpt) starts at
 Blackwell-class GPUs (sm_100+). **NVFP4EffMA** brings the same data format to the GPUs most people still
 have — Maxwell, Pascal, Volta, Turing, Ampere, Jetson Orin, Ada and Hopper (sm_50 … sm_90). Weights stay
-in NVFP4 (E2M1 values, one E4M3 scale per 16 values, one FP32 scale per tensor: 4.5 bits per value, 7×
-smaller than FP32), products are exact, accumulation is FP32, and outputs come out in BF16 / FP16 / FP32.
+in NVFP4 (E2M1 values, one 8-bit scale per 16 values, an FP32 global: 4.5 bits per value, 7× smaller than
+FP32), products are exact, accumulation is FP32, and outputs come out in BF16 / FP16 / FP32. Every NVFP4
+variant NVIDIA uses is read and produced as it is, bit for bit: ModelOpt checkpoints, Transformer Engine's
+1 × 16 and 16 × 16 recipes (amax globals, row-scaled activations, 4over6, UE5M3 scales, columnwise data) and
+the GEMM-swizzled scale layout of cuBLASLt ([below](#nvidia-nvfp4-variants)).
 Activations can be BF16 / FP16 / FP32 (W4A16, exact), int8 with a scale per 16 values (W4A8) or NVFP4
 (W4A4); the PyTorch `linear` quantizes BF16 activations to int8 on the fly beyond 2 rows by default, where
 that is twice as fast as the exact path. Twice an E2M1 value is an exact int8, so from sm_61 on one DP4A does four exact products: W4A8 and
@@ -44,21 +47,29 @@ taken at the SM clock measured while that row ran:
 
 | Workload | NVFP4EffMA | Utilization | Baseline: cuBLAS FP32 | Speed vs baseline |
 |---|---:|---|---:|---:|
-| GEMM 4096³, NVFP4 × NVFP4 → BF16 | 9.51 ms | **157 %** of FP32 peak (7.2 TMAC/s) | SGEMM 19.5 ms (76 % of FP32 peak) | **2.05×** |
-| GEMM 4096³, NVFP4 × INT8 (W4A8) → BF16 | 9.49 ms | **158 %** of FP32 peak (7.2 TMAC/s) | SGEMM 19.5 ms (76 % of FP32 peak) | **2.05×** |
-| GEMM 4096³, NVFP4 × NVFP4, FP32 D += (accumulate) | 9.89 ms | 151 % of FP32 peak | SGEMM 19.5 ms (76 % of FP32 peak) | **1.97×** |
-| GEMM 4096³, NVFP4 weights × BF16 activations, exact | 19.8 ms | 75 % of FP32 peak | SGEMM 19.5 ms (76 % of FP32 peak) | 0.98× |
-| `linear` 4096³, BF16 activations, default `act="auto"` (int8 quantization included) | 10.0 ms | — | SGEMM 19.5 ms | **2.0×** |
-| GEMV 8192 × 8192, batch 1 (BF16 x) | 0.142 ms | 266 GB/s, **83 %** of DRAM peak | SGEMV 1.042 ms | **7.3×** |
-| GEMV 8192 × 8192, batch 8 (INT8 x) | 0.160 ms | 237 GB/s, 74 % of DRAM peak | SGEMM 1.539 ms | **9.6×** |
-| GEMV 8192 × 8192, batch 8 (BF16 x) | 0.348 ms | 109 GB/s, 34 % of DRAM peak | SGEMM 1.539 ms | **4.4×** |
-| Quantization, 8192 × 8192 BF16 → NVFP4 | 0.60 ms | 286 GB/s, **89 %** of DRAM peak | — | — |
+| GEMM 4096³, NVFP4 × NVFP4 → BF16 | 9.42 ms | **156 %** of FP32 peak (7.3 TMAC/s) | SGEMM 19.1 ms (76 % of FP32 peak) | **2.03×** |
+| GEMM 4096³, NVFP4 × INT8 (W4A8) → BF16 | 9.33 ms | **158 %** of FP32 peak (7.4 TMAC/s) | SGEMM 19.1 ms (76 % of FP32 peak) | **2.05×** |
+| GEMM 4096³, NVFP4 × NVFP4, FP32 D += (accumulate) | 9.77 ms | 150 % of FP32 peak | SGEMM 19.1 ms (76 % of FP32 peak) | **1.96×** |
+| GEMM 4096³, NVFP4 weights × BF16 activations, exact | 19.6 ms | 75 % of FP32 peak | SGEMM 19.1 ms (76 % of FP32 peak) | 0.98× |
+| `linear` 4096³, BF16 activations, default `act="auto"` (int8 quantization included) | 10.0 ms | — | SGEMM 19.1 ms | **1.9×** |
+| GEMV 8192 × 8192, batch 1 (BF16 x) | 0.139 ms | 272 GB/s, **85 %** of DRAM peak | SGEMV 1.042 ms | **7.5×** |
+| GEMV 8192 × 8192, batch 8 (INT8 x) | 0.158 ms | 238 GB/s, 74 % of DRAM peak | SGEMM 1.538 ms | **9.7×** |
+| GEMV 8192 × 8192, batch 8 (BF16 x) | 0.346 ms | 109 GB/s, 34 % of DRAM peak | SGEMM 1.538 ms | **4.4×** |
+| Quantization, 8192 × 8192 BF16 → NVFP4 | 0.64 ms | 270 GB/s, **84 %** of DRAM peak | — | — |
 
-FP32 peak: 20 SMs × 128 FFMA × SM clock (1793–1808 MHz in the GEMM rows); DRAM peak: 320 GB/s; GEMV
+Most Transformer Engine representations (swizzled or UE5M3 scales, amax and per-row globals) compute
+within a few percent of plain NVFP4 — within 1.5 % in GEMM, −6.5 … +3 % in GEMV, where swizzled x scales
+are even about 5 % faster. Creating them costs more than using them: quantize once, not per call
+([docs/performance.md](docs/performance.md#transformer-engine-formats-using-them-is-cheap-creating-them-is-not);
+full tables: [benches/1080.md](benches/1080.md)).
+
+FP32 peak: 20 SMs × 128 FFMA × SM clock (1818–1837 MHz in the GEMM rows); DRAM peak: 320 GB/s; GEMV
 bandwidth counts the values and the block scales. With both operands in NVFP4 the DP4A kernel does four
 exact products per instruction and exceeds the FP32 FFMA peak; with BF16 activations a MAC costs one FP32
 FFMA, so compute-bound GEMM tops out at SGEMM speed while reading 7× fewer weight bytes, and
-bandwidth-bound kernels (decoding) get the full benefit of the smaller weights. Against llama.cpp's NVFP4
+bandwidth-bound kernels (decoding) get the full benefit of the smaller weights. **On Pascal, use W4A8 for
+prefill speed** (`act="auto"` / `"int8"`): exact W4A16 is bound by the FP32 FFMA rate there (no fast FP16, no
+int path for BF16 values) and runs at SGEMM speed. Against llama.cpp's NVFP4
 kernels on the same GPU (int8 activations, like W4A8 here), interleaved runs: 1.0–4.5× faster on every
 shape measured — 1.47× at 4096³, 3.9–4.5× for 8-token decoding, 1.45–1.66× at 512 tokens
 ([docs/performance.md](docs/performance.md#compared-with-llamacpp)). CUTLASS has not been measured.
@@ -77,17 +88,39 @@ methodology and how to add your GPU: [docs/performance.md](docs/performance.md).
 - **Mixed operands.** NVFP4 weights × BF16, FP16, FP32 (W4A16), INT8 (W4A8) or NVFP4 (W4A4) activations.
 - **GEMV path for decoding and small batches**, picked automatically, reading each weight byte once per 8
   columns.
-- **Quantization and dequantization** with the rounding of ModelOpt / Transformer Engine (block scale
-  rounded to nearest, values RNE with saturation) and the checkpoint layout (`weight`, `weight_scale`,
-  `weight_scale_2`).
+- **Every NVIDIA NVFP4 variant** in GEMM, GEMV, quantization and dequantization, with Transformer Engine's
+  arithmetic bit for bit (see [NVIDIA NVFP4 variants](#nvidia-nvfp4-variants)); scale layout conversion
+  (linear ↔ GEMM-swizzled) and the transpose of 16 × 16-tiled tensors.
 - **PyTorch bindings**: functional API (`quantize`, `dequantize`, `linear` with `act="auto" / "exact" /
   "int8" / "nvfp4"`), `NVFP4Tensor`, and `NVFP4Linear` with `quantize_linear_`, which swaps the
   `nn.Linear` layers of a model.
 - **Strict input checking** with readable errors in C (`nvfp4a_last_error`) and Python (`TypeError` /
   `ValueError` / `NotImplementedError`).
-- **Per-architecture tuning** (`make tune`) and a 36-second build for all 14 architectures.
-- **Heavily tested**: bit-exact against host emulation on both NVFP4 × NVFP4 paths, exhaustive 2³² checks
-  of the rounding, exhaustive checks of the decode.
+- **Per-architecture tuning** (`make tune`) and a parallel build (about 3 minutes for all 14 architectures
+  on 20 cores).
+- **Heavily tested**: bit-exact against host emulation on both NVFP4 × NVFP4 paths and for every operand
+  format, the quantization against an emulation of Transformer Engine's arithmetic, exhaustive 2³² checks
+  of the rounding and the decode.
+
+## NVIDIA NVFP4 variants
+
+| Variant | Where it comes from | Support |
+|---|---|---|
+| 1 × 16 blocks, E4M3 block scales, FP32 decode factor | ModelOpt checkpoints (`weight`, `weight_scale`, `weight_scale_2`) | ✅ |
+| 1 × 16 blocks, FP32 amax global (current scaling) | Transformer Engine activations and gradients | ✅ |
+| 16 × 16 tiles (one scale per tile) | Transformer Engine **weights (its default)** | ✅ |
+| rowwise and columnwise data (`x` and `xᵀ` quantized) | Transformer Engine, for the backward GEMMs | ✅ (`nvfp4a_gemm_dual`) |
+| GEMM-swizzled scales (128 × 4 tiles, padded) | cuBLASLt FP4 GEMM, Transformer Engine | ✅ |
+| row-scaled: one amax per row (rowwise only) | Transformer Engine activations | ✅ |
+| 4over6: map-to-4 / map-to-6 per block, MAE or MSE, E4M3 bound 448 or 256 | Transformer Engine | ✅ |
+| UE5M3 block scales | Transformer Engine | ✅ |
+| random Hadamard transform, stochastic rounding, 4over6 fast-math error | Transformer Engine (gradients) | ❌ |
+
+A ModelOpt checkpoint (`weight` + `weight_scale` + `weight_scale_2`, one scale per 16 values of a row) is
+the 1 × 16 representation; Transformer Engine quantizes weights with 16 × 16 tiles by default. Both — and
+every combination above, A and B independently — go straight into `nvfp4a_gemm` / `nf.linear` (C flags:
+[docs/c-api.md](docs/c-api.md#nvidia-nvfp4-formats); Python: `nf.quantize(..., block="16x16",
+swizzled=True, ...)`, `NVFP4Tensor.from_te`).
 
 ## Supported GPUs
 
@@ -129,7 +162,8 @@ import torch, nvfp4effma as nf
 
 w = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
 q = nf.quantize(w)                                  # NVFP4Tensor: data uint8 [4096, 2048], scales E4M3
-                                                    # [4096, 256], global_scale = amax / (6 * 448)
+                                                    # [4096, 256], global: amax (TE current scaling)
+qt = nf.quantize(w, block="16x16", swizzled=True)   # Transformer Engine's weight format
 x = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
 
 y = nf.linear(x, q)                                 # act="auto": exact for <= 2 rows, int8 (W4A8) beyond
@@ -137,6 +171,7 @@ y = nf.linear(x, q, act="exact")                    # W4A16, every product exact
 y = nf.linear(x, q, act="int8")                     # W4A8: x to int8 per 16 values, DP4A from sm_61
 y = nf.linear(nf.quantize(x), q)                    # W4A4
 w2 = nf.dequantize(q, torch.float32)
+# t = nf.NVFP4Tensor.from_te(te_tensor)             # a Transformer Engine NVFP4 tensor, as it is
 
 mlp = torch.nn.Sequential(torch.nn.Linear(4096, 11008), torch.nn.SiLU(),
                           torch.nn.Linear(11008, 4096)).cuda().bfloat16()
@@ -154,6 +189,7 @@ More (`out` / accumulation, `amax`, `NVFP4Linear`, error behaviour):
 
 // Y[out, batch] (BF16) = W[out, in] (NVFP4) · X[in, batch] (BF16), column-major, both K-contiguous
 nvfp4a_tensor W = {d_w, NVFP4A_NVFP4, d_w_scale, 0, d_w_scale_2, NULL};  // data, dtype, scales, ld_scale, global, amax
+// (Transformer Engine tensors: .flags = NVFP4A_SCALES_SWIZZLED | NVFP4A_GLOBAL_AMAX | ..., see docs/c-api.md)
 nvfp4a_tensor X = {d_x, NVFP4A_BF16, NULL, 0, NULL, NULL};
 nvfp4a_tensor Y = {d_y, NVFP4A_BF16, NULL, 0, NULL, NULL};
 nvfp4a_status st = nvfp4a_gemm(out, batch, in, 1.0f, &W, in, &X, in,
@@ -228,8 +264,9 @@ next steps:
 - [ ] **Tensor Core path for sm_75+.** Twice an E2M1 value is an exact int8, so INT8 `mma.sync` with int32
       accumulation computes the same exact block sums as DP4A (W4A4, W4A8), on Tensor Cores.
 - [ ] **`cp.async` + multi-stage pipelines for sm_80+**, and `ldmatrix` for operand fetch.
-- [ ] **Loading NVFP4 checkpoints** (ModelOpt / Hugging Face `weight`, `weight_scale`, `weight_scale_2`)
-      straight into `NVFP4Linear`.
+- [ ] **A direct Hugging Face / ModelOpt checkpoint loader into `NVFP4Linear`.** The formats are supported
+      (`NVFP4Tensor` takes `weight`, `weight_scale`, `weight_scale_2` as they are, `from_te` wraps
+      Transformer Engine tensors); what is missing is the loader plumbing.
 - [ ] **Faster GEMV with BF16 activations for 4 … 8 columns**, where the per-value decode, not the memory,
       is the limit ([docs/design.md](docs/design.md)).
 - [ ] **128-thread variants of the heaviest kernels for Jetson TX1 / TX2** (sm_53 / sm_62 allow 32 K

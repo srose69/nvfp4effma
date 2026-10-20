@@ -42,15 +42,23 @@ MAKEFLAGS += -j$(JOBS)
 CORE_H = include/nvfp4effma.h src/nvfp4effma.cuh src/nvfp4effma_tuned.h
 GEMM_H = $(CORE_H) src/gemm_nvfp4effma.cuh
 GEMV_H = $(CORE_H) src/gemv_nvfp4effma.cuh
+QUANT_H = $(CORE_H) src/quant_nvfp4effma.cuh
 
 # kernel configurations the library instantiates: defaults + those used by tuned entries
 TUNED_IDS = $(shell sed -n 's/^\#define NVFP4A_$(1)_USED(X)//p' src/nvfp4effma_tuned.h | grep -o '[0-9]\+')
 GEMM_IDS  = 0 1 $(call TUNED_IDS,GEMM)
 GEMV_IDS  = 0 $(call TUNED_IDS,GEMV)
-# objects of similar compile cost: GEMM per config x dense B dtype plus the NVFP4 x NVFP4 / INT8 FFMA
-# kernels (0_0, 0_4), GEMV per config x x dtype (dtype codes: NVFP4 0, BF16 1, FP16 2, FP32 3, INT8 4)
-INST = $(foreach i,$(GEMV_IDS),$(foreach t,0 1 2 3 4,inst_gemv_$(i)_$(t))) \
-       $(foreach i,$(GEMM_IDS),$(foreach t,1 2 3,inst_gemm_$(i)_$(t))) inst_gemm_0_0 inst_gemm_0_4
+# one object per kernel instance -- block scale formats F (src/nvfp4effma.cuh: kF_*) are template parameters,
+# all 16 for NVFP4 B, the 4 without B bits for the other B dtypes -- so the build runs in parallel: GEMV per
+# config x x dtype x F, the FFMA GEMM per config x dense B dtype x F plus its NVFP4 / INT8 B kernels below
+# sm_61 (0_0, 0_4), the DP4A GEMM per B dtype x F, the quantization per dense dtype x rowwise / columnwise x
+# tile rows (dtype codes: NVFP4 0, BF16 1, FP16 2, FP32 3, INT8 4)
+F_ALL = $(shell seq 0 15)
+F_A   = 0 1 2 3
+INST = $(foreach i,$(GEMV_IDS),$(foreach f,$(F_ALL),inst_gemv_$(i)_0_$(f)) $(foreach t,1 2 3 4,$(foreach f,$(F_A),inst_gemv_$(i)_$(t)_$(f)))) \
+       $(foreach i,$(GEMM_IDS),$(foreach t,1 2 3,$(foreach f,$(F_A),inst_gemm_$(i)_$(t)_$(f)))) \
+       $(foreach f,$(F_ALL),inst_gemm_0_0_$(f) inst_dp4a_0_$(f)) $(foreach f,$(F_A),inst_gemm_0_4_$(f) inst_dp4a_4_$(f)) \
+       $(foreach t,1 2 3,$(foreach c,0 1,inst_quant_$(t)_$(c)_1 inst_quant_$(t)_$(c)_16))
 OBJS = nvfp4effma gemm_nvfp4effma gemv_nvfp4effma $(INST)
 NVCC_THREADS := $(shell t=$$(( $(JOBS) / $(words $(OBJS)) )); [ $$t -lt 1 ] && t=1; a=$(words $(ARCHS)); [ $$t -gt $$a ] && t=$$a; echo $$t)
 word_ = $(word $(1),$(subst _, ,$(2)))
@@ -59,16 +67,20 @@ all: lib test-bin bench-bin
 
 # ---- library: all pre-FP4 architectures (out/obj) and the local one (out/native) ---------------
 define LIBRARY  # $(1) = object dir, $(2) = arch flags
-$(1)/nvfp4effma.o: src/nvfp4effma.cu $(CORE_H) | $(1)
+$(1)/nvfp4effma.o: src/nvfp4effma.cu $(QUANT_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
 $(1)/gemm_nvfp4effma.o: src/gemm_nvfp4effma.cu $(GEMM_H) src/gemv_nvfp4effma.cuh | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
 $(1)/gemv_nvfp4effma.o: src/gemv_nvfp4effma.cu $(GEMV_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
 $(1)/inst_gemm_%.o: src/gemm_nvfp4effma_inst.cu $(GEMM_H) | $(1)
-	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TB=$$(call word_,2,$$*) -c -o $$@ $$<
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TB=$$(call word_,2,$$*) -DNVFP4A_F=$$(call word_,3,$$*) -c -o $$@ $$<
+$(1)/inst_dp4a_%.o: src/gemm_dp4a_inst.cu $(GEMM_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_F=$$(call word_,2,$$*) -c -o $$@ $$<
+$(1)/inst_quant_%.o: src/quant_nvfp4effma_inst.cu $(QUANT_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_QT=$$(call word_,1,$$*) -DNVFP4A_QCOL=$$(call word_,2,$$*) -DNVFP4A_QTILE=$$(call word_,3,$$*) -c -o $$@ $$<
 $(1)/inst_gemv_%.o: src/gemv_nvfp4effma_inst.cu $(GEMV_H) | $(1)
-	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TX=$$(call word_,2,$$*) -c -o $$@ $$<
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TX=$$(call word_,2,$$*) -DNVFP4A_F=$$(call word_,3,$$*) -c -o $$@ $$<
 $(1)/libnvfp4effma.a: $(foreach o,$(OBJS),$(1)/$(o).o)
 	rm -f $$@ && ar rcs $$@ $$^
 $(1):

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// One GEMV instance object: -DNVFP4A_ID=<config> -DNVFP4A_TX=<x dtype>, n = 1..8.  The kernel bodies are
-// compiled only for the architectures whose table (or the defaults) select the configuration for that
-// x dtype and n, trapping stubs elsewhere.
+// One GEMV instance object: -DNVFP4A_ID=<config> -DNVFP4A_TX=<x dtype> -DNVFP4A_F=<formats>, n = 1..8.  The
+// kernel bodies are compiled only for the architectures whose table (or the defaults) select the
+// configuration for that x dtype and n, trapping stubs elsewhere.
 #include "gemv_nvfp4effma.cuh"
 
 namespace nvfp4a {
@@ -14,14 +14,18 @@ namespace kern {
 template <int ID> struct LibGemv : NVFP4A_CFG(NVFP4A_ID) {
   template <int NB, int XT> struct On { static constexpr bool value = gemv_selected(NVFP4A_ARCH_CC, ID, XT, NB); };
 };
-using C = LibGemv<NVFP4A_ID>;
 
-#define NVFP4A_GEMV_DEF(nb)                                                     \
-  NVFP4A_GEMV_PROTO(NVFP4A_ID, NVFP4A_TX, nb) {                                 \
-    return gemv_launch<C, nb, NVFP4A_TX>(A, lda, SA, ldsa, X, ldx, SX, ldsx, m, k, e, s); \
-  }
-NVFP4A_GEMV_DEF(1) NVFP4A_GEMV_DEF(2) NVFP4A_GEMV_DEF(3) NVFP4A_GEMV_DEF(4)
-NVFP4A_GEMV_DEF(5) NVFP4A_GEMV_DEF(6) NVFP4A_GEMV_DEF(7) NVFP4A_GEMV_DEF(8)
+template <int ID, int XT, int NB, int F>
+cudaError_t gemv_entry(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *X, int ldx, const uint8_t *SX,
+                       int ldsx, int m, int k, const Epilogue &e, cudaStream_t s) {
+  return gemv_launch<LibGemv<ID>, NB, XT, F>(A, lda, SA, ldsa, X, ldx, SX, ldsx, m, k, e, s);
+}
+#define NVFP4A_GEMV_INST(nb)                                                                                     \
+  template cudaError_t gemv_entry<NVFP4A_ID, NVFP4A_TX, nb, NVFP4A_F>(const uint8_t *, int, const uint8_t *, int, \
+                                                                      const uint8_t *, int, const uint8_t *, int, int, int, \
+                                                                      const Epilogue &, cudaStream_t);
+NVFP4A_GEMV_INST(1) NVFP4A_GEMV_INST(2) NVFP4A_GEMV_INST(3) NVFP4A_GEMV_INST(4)
+NVFP4A_GEMV_INST(5) NVFP4A_GEMV_INST(6) NVFP4A_GEMV_INST(7) NVFP4A_GEMV_INST(8)
 
 }  // namespace kern
 }  // namespace nvfp4a

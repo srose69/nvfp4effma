@@ -26,7 +26,9 @@ struct GemvCfg {
   template <int NB, int XT> struct On { static constexpr bool value = true; };
 };
 
-template <class C, int NB, int XT>
+// F: operand formats (kF_*).  The scales of the x rows of a launch start at SX (the host offsets SX to the
+// launch's first row, a multiple of 8, so in the swizzled layout row b of the launch is 16 b bytes on).
+template <class C, int NB, int XT, int F>
 __global__ void __launch_bounds__(C::WARPS * 32)
 gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
             const uint8_t *__restrict__ X, int ldx, const uint8_t *__restrict__ SX, int ldsx, int m, int k, Epilogue e) {
@@ -38,6 +40,13 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
   for (int r = 0; r < C::R; ++r)
 #pragma unroll
     for (int b = 0; b < NB; ++b) acc[r][b] = 0.f;
+  // swizzled scales: per row a pointer, lane l starting at scale column l and moving 32 columns (8 tiles of
+  // 512 bytes) per iteration.  Rows of A past m read row 0.
+  constexpr bool SWA = F & kF_ASWZ, SWX = XT == NVFP4A_NVFP4 && (F & kF_BSWZ);
+  constexpr bool UEA = F & kF_AUE, UEX = XT == NVFP4A_NVFP4 && (F & kF_BUE);
+  const uint8_t *psa[SWA ? C::R : 1], *psx = SX + (SWX ? swz_col(lane) : 0);
+#pragma unroll
+  for (int r = 0; r < (SWA ? C::R : 0); ++r) psa[r] = SA + swz_row(row0 + r < m ? row0 + r : 0, -ldsa) + swz_col(lane);
 
   for (int kb = lane * 16; kb < k; kb += 512) {
     uint2 aw[C::R];
@@ -46,7 +55,8 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
     for (int r = 0; r < C::R; ++r) {  // rows past m read row 0 (not stored)
       const size_t row = row0 + r < m ? row0 + r : 0;
       aw[r] = *(const uint2 *)(A + row * (lda / 2) + kb / 2);
-      sa[r] = e4m3_value(SA[row * ldsa + kb / 16]);
+      if (SWA) { sa[r] = scale_val<UEA>(*psa[r]); psa[r] += 4096; }
+      else sa[r] = scale_val<UEA>(SA[row * ldsa + kb / 16]);
     }
     if (XT == NVFP4A_NVFP4 || XT == NVFP4A_INT8) {
       // NVFP4 / INT8 x: the exact block sum p of every (row, column), then acc = fma(p * sa, sx, acc) -- the
@@ -54,7 +64,9 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
       float sx[NB];
 #pragma unroll
       for (int b = 0; b < NB; ++b)
-        sx[b] = XT == NVFP4A_INT8 ? ((const float *)SX)[(size_t)b * ldsx + kb / 16] : e4m3_value(SX[(size_t)b * ldsx + kb / 16]);
+        sx[b] = XT == NVFP4A_INT8 ? ((const float *)SX)[(size_t)b * ldsx + kb / 16]
+                : SWX ? scale_val<UEX>(psx[16 * b]) : scale_val<UEX>(SX[(size_t)b * ldsx + kb / 16]);
+      if (SWX) psx += 4096;
 #if __CUDA_ARCH__ >= 610
       uint4 xi[NB];
 #pragma unroll
@@ -97,11 +109,11 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
         }
 #endif
     } else {
-      // dense x: one FFMA per MAC with a = e2m1 * sa * 2^-9, decoded with a single FMUL (the raw E2M1
-      // encoding value * 2^-126 times sa * 2^117, which cannot overflow); the 2^9 returns before the
-      // epilogue, exactly
+      // dense x: one FFMA per MAC with a = e2m1 * sa * 2^-9 (2^-15 for UE5M3 scales, up to 2^17), decoded
+      // with a single FMUL (the raw E2M1 encoding value * 2^-126 times sa * 2^117 / 2^111, which cannot
+      // overflow); the 2^9 / 2^15 returns before the epilogue, exactly
 #pragma unroll
-      for (int r = 0; r < C::R; ++r) sa[r] = mul_rn(sa[r], 0x1p117f);
+      for (int r = 0; r < C::R; ++r) sa[r] = mul_rn(sa[r], UEA ? 0x1p111f : 0x1p117f);
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         float xv[NB][8];
@@ -132,7 +144,7 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
       float v = acc[r][b];
 #pragma unroll
       for (int o = 16; o; o >>= 1) v = __fadd_rn(v, __shfl_xor_sync(0xFFFFFFFFu, v, o));
-      v = __fmul_rn(v, XT == NVFP4A_NVFP4 ? 0.25f : XT == NVFP4A_INT8 ? 0.5f : 512.f);  // exact
+      v = __fmul_rn(v, XT == NVFP4A_NVFP4 ? 0.25f : XT == NVFP4A_INT8 ? 0.5f : UEA ? 32768.f : 512.f);  // exact
       if (((r * NB + b) & 31) == lane) mine[(r * NB + b) >> 5] = v;
     }
   EpiState st = epi_begin(e);
@@ -144,11 +156,11 @@ gemv_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
   epi_end(e, st);
 }
 
-template <class C, int NB, int XT>
+template <class C, int NB, int XT, int F = 0>
 cudaError_t gemv_launch(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *X, int ldx,
                         const uint8_t *SX, int ldsx, int m, int k, const Epilogue &e, cudaStream_t s) {
   const int rows = C::WARPS * C::R;
-  gemv_kernel<C, NB, XT><<<(m + rows - 1) / rows, C::WARPS * 32, 0, s>>>(A, lda, SA, ldsa, X, ldx, SX, ldsx, m, k, e);
+  gemv_kernel<C, NB, XT, F><<<(m + rows - 1) / rows, C::WARPS * 32, 0, s>>>(A, lda, SA, ldsa, X, ldx, SX, ldsx, m, k, e);
   return cudaGetLastError();
 }
 
@@ -161,19 +173,18 @@ cudaError_t gemv_launch(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, 
 NVFP4A_GEMV_CANDIDATES(NVFP4A_DEF_GEMV)
 #undef NVFP4A_DEF_GEMV
 
-// GEMV of NVFP4 A by n <= 8 rows of x (dtype xt) with the configuration the device's table selects.
-cudaError_t launch_gemv(int xt, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *X, int ldx,
+// GEMV of NVFP4 A by n <= 8 rows of x (dtype xt, formats f) with the configuration the device's table selects.
+cudaError_t launch_gemv(int xt, int f, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *X, int ldx,
                         const uint8_t *SX, int ldsx, int m, int n, int k, const Epilogue &e, cudaStream_t s);
+
+// Entry point of one kernel: config id x x dtype x n x formats, explicitly instantiated by the instance
+// objects (gemv_nvfp4effma_inst.cu, one per id, x dtype and formats).
+template <int ID, int XT, int NB, int F>
+cudaError_t gemv_entry(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *X, int ldx, const uint8_t *SX,
+                       int ldsx, int m, int k, const Epilogue &e, cudaStream_t s);
 
 }  // namespace kern
 }  // namespace nvfp4a
 
 // configurations the library builds: the default (0) and those the tuned tables use
 #define NVFP4A_GEMV_LIB(X) X(0) NVFP4A_GEMV_USED(X)
-
-// entry point of one kernel: config id x x dtype x n
-#define NVFP4A_GEMV_ENTRY(id, t, nb) NVFP4A_CAT6(gemv_entry_, id, _, t, _, nb)
-#define NVFP4A_GEMV_PROTO(id, t, nb)                                                                    \
-  cudaError_t NVFP4A_GEMV_ENTRY(id, t, nb)(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *X, \
-                                           int ldx, const uint8_t *SX, int ldsx, int m, int k,                      \
-                                           const nvfp4a::kern::Epilogue &e, cudaStream_t s)

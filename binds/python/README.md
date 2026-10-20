@@ -29,7 +29,7 @@ CUDA 12.0–12.3), `MAX_JOBS`.
 import torch, nvfp4effma as nf
 
 w = torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16)
-q = nf.quantize(w)                                   # NVFP4Tensor
+q = nf.quantize(w)                                   # NVFP4Tensor, Transformer Engine's current scaling
 x = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
 
 y = nf.linear(x, q)                                  # x @ W.T, BF16 [8, 4096]; act="auto": int8 activations here
@@ -42,14 +42,25 @@ nf.linear(x, q, out=acc, beta=1.0, act="exact")      # acc += x @ W.T
 
 model = torch.nn.Linear(4096, 4096).cuda().bfloat16()
 nf.quantize_linear_(model)                           # or nf.NVFP4Linear.from_linear(layer, act=...)
+
+# Transformer Engine's formats, as TE produces them (bit for bit) or straight from a TE tensor
+qw = nf.quantize(w, block="16x16", swizzled=True)    # TE weights: 16 x 16 tiles, GEMM-swizzled scales
+qx = nf.quantize(x, row_scaled=True, swizzled=True)  # row-scaled activations
+q6 = nf.quantize(w, four_over_six="mse")             # 4over6 (E4M3 bound 256)
+qc = nf.quantize(x, columnwise=True)                 # + qc.columnwise = the quantization of x^T
+y = nf.linear(qx, qw)                                # any formats on either side
+t = nf.NVFP4Tensor.from_te(te_tensor)                # wraps a TE NVFP4Tensor / NVFP4TensorStorage, no copy
 ```
+
+On Pascal, use W4A8 (`act="auto"` / `"int8"`) for prefill speed: the exact W4A16 path is bound by the FP32
+FFMA rate there and runs at SGEMM speed.
 
 | | |
 |---|---|
-| `quantize(x, global_scale=None, *, amax=None)` | BF16 / FP16 / FP32 `[..., K]` (K a multiple of 16) → `NVFP4Tensor`; `global_scale` defaults to `amax(|x|) / (6·448)`; `amax` (float32 `[1]`) receives `max |x|` |
-| `dequantize(t, dtype=torch.bfloat16)` | `(e2m1 · scale) · global_scale`, rounded once |
+| `quantize(x, global_scale=None, *, amax=None, block="1x16", four_over_six=None, scale_max=None, row_scaled=False, columnwise=False, swizzled=False, scale_dtype="e4m3")` | BF16 / FP16 / FP32 `[..., K]` (K a multiple of 16) → `NVFP4Tensor`, Transformer Engine's arithmetic. Global: by default the amax of `x` (of each row with `row_scaled`) is computed and stored (TE current scaling); a given `global_scale` is a decode factor (ModelOpt's `weight_scale_2`). `block` `"1x16"` / `"16x16"`; `four_over_six` `"mae"` / `"mse"`; `columnwise` (rows a multiple of 16) also quantizes `x^T` into `.columnwise`; `swizzled` scales in the GEMM layout; `scale_dtype` `"e4m3"` / `"ue5m3"`; `amax` (float32 `[1]`) receives `max |x|` |
+| `dequantize(t, dtype=torch.bfloat16)` | `(e2m1 · scale) · global`, or TE's `e2m1 · ((scale · amax) / (6 · scale_max))`, rounded once |
 | `linear(x, weight, bias=None, *, act, out_dtype, out, alpha, beta, amax_out)` | `alpha·x @ weight.T + bias + beta·out`; `weight` an `NVFP4Tensor` `[N, K]` (K a multiple of 64); `x` a dense `[..., K]` tensor or a 2-D `NVFP4Tensor`; `act`: `"exact"` (W4A16), `"int8"` (W4A8, x quantized to int8 per 16 values first), `"nvfp4"` (W4A4) or `"auto"` (default: `"exact"` up to `AUTO_EXACT_MAX_ROWS` = 2 rows, where both run at memory speed, `"int8"` beyond, where it is twice as fast); output BF16 / FP16 / FP32 (default: the dtype of a dense `x`, else BF16) |
-| `NVFP4Tensor(data, scales, global_scale)` | `data` uint8 `[..., K/2]` (the even column in the low nibble), `scales` float8_e4m3fn `[..., K/16]`, `global_scale` float32 `[1]`; `.shape`, `.dequantize()`, `NVFP4Tensor.from_float(x)` |
+| `NVFP4Tensor(data, scales, global_scale=None, *, amax=None, scale_max=0, swizzled=False, ue5m3=False, cols=None, columnwise=None, block=None)` | `data` uint8 `[..., K/2]` (the even column in the low nibble), `scales` float8_e4m3fn `[..., K/16]` (linear; padded 2-D buffers as TE allocates them are fine) or the swizzled `[roundup(rows, 128), roundup(K/16, 4)]` buffer, UE5M3 as uint8; `global_scale` (decode factor) or `amax` (TE), float32 `[1]` or one per row; `.shape`, `.dequantize()`, `.with_scale_layout(swizzled)`, `.transpose_2d()` (16 × 16 tiles), `NVFP4Tensor.from_float(x, **recipe)`, `NVFP4Tensor.from_te(t)` |
 | `NVFP4Linear(in_features, out_features, bias=True, act="auto")` | `nn.Module` with buffers `weight` / `weight_scale` / `weight_scale_2` (the names of NVFP4 checkpoints); `NVFP4Linear.from_linear(layer, act="auto")` |
 | `quantize_linear_(module, *, act="auto")` | replaces every `nn.Linear` with `in_features % 64 == 0` by an `NVFP4Linear`, in place |
 

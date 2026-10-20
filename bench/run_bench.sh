@@ -8,16 +8,18 @@
 #
 # Raises the power limit to its maximum, allows the SM clock up to its top and locks the memory clock
 # at its maximum (without a display the driver otherwise runs CUDA work in P2 at a reduced memory
-# clock); all three are restored on exit, also on Ctrl+C.  Needs sudo for nvidia-smi.  No warm-up:
-# every row of a benchmark starts after NVFP4A_BENCH_COOL (2) s of idle GPU and the benchmarks are
-# separated by PACK_COOL (10) s; each row reports its median time and the SM clock measured while it
-# ran.  Raw results go to out/bench_<gpu>/; bench/report.py turns them into benches/<gpu>.md and the
+# clock); all three are restored on exit, also on Ctrl+C.  Needs sudo for nvidia-smi.  Each benchmark
+# starts with a warm-up (NVFP4A_BENCH_WARMUP = 4 plain FP32 products 2048 x 2048, 0.5 s apart, so that
+# GPU Boost has raised the clocks); every row then starts after NVFP4A_BENCH_COOL (2) s of idle GPU and
+# the benchmarks are separated by PACK_COOL (10) s; each row reports its median time and the SM clock
+# measured while it ran.  Raw results go to out/bench_<gpu>/; bench/report.py turns them into benches/<gpu>.md and the
 # GPU's row in benches/table.md.  Set GPU_NAME to choose the file name (default: from the GPU name).
 set -u
 cd "$(dirname "$0")/.."
 GPU=${GPU:-0}
 PACK_COOL=${PACK_COOL:-10}
 export NVFP4A_BENCH_COOL=${NVFP4A_BENCH_COOL:-2}
+export NVFP4A_BENCH_WARMUP=${NVFP4A_BENCH_WARMUP:-4}  # 2048 x 2048 FP32 products before the first row
 GEMM_REPS=${GEMM_REPS:-50}       # ~0.5-1 s per GEMM row (10-20 ms each on a GTX 1080)
 GEMV_REPS=${GEMV_REPS:-2000}     # ~0.5 s per GEMV row
 QUANT_REPS=${QUANT_REPS:-500}    # ~0.5 s per quantization row

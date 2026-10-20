@@ -41,7 +41,8 @@ struct GemmCfg {
 // epilogue does not store, so neither a branch nor zeroing is needed.
 //   NVFP4, INT = false: values a * sa (exact)        NVFP4, INT = true: integers 2a, sa to ss[row]
 //   INT8 (INT = true): the int8 values, their FP32 block scale to ss[row]
-template <class C, int R, int T, bool INT>
+// NVFP4 scales: SWZ = swizzled layout (lds = -padded columns), UE = UE5M3.
+template <class C, int R, int T, bool INT, bool SWZ = false, bool UE = false>
 struct TileLoader {
   static constexpr bool FP4 = T == NVFP4A_NVFP4, Q8 = T == NVFP4A_INT8;
   static constexpr int E = R * C::BK / C::NT < 8 ? R * C::BK / C::NT : 8;
@@ -54,14 +55,16 @@ struct TileLoader {
   int dst[CH], row[CH];
   bool first[CH];  // the chunk at k = 0 of its row (stores the row's scale in INT mode)
   uint32_t raw[CH][RW], sc[CH];
+  int kt;          // SWZ: k-tile (= scale column) being fetched
 
   __device__ void init(const uint8_t *X, int ld, const uint8_t *S, int lds, int r0, int rmax) {
+    kt = 0;
 #pragma unroll
     for (int j = 0; j < CH; ++j) {
       const int w = threadIdx.x + C::NT * j, rl = w / LPR, kc = (w % LPR) * E;
       const size_t r = r0 + rl < rmax ? r0 + rl : 0;
       p[j] = FP4 ? X + r * (ld / 2) + kc / 2 : X + (r * ld + kc) * Elem<FP4 ? NVFP4A_FP32 : T>::bytes;
-      ps[j] = FP4 ? S + r * lds : Q8 ? S + r * lds * 4 : nullptr;
+      ps[j] = FP4 ? S + (SWZ ? swz_row((int)r, -lds) : r * lds) : Q8 ? S + r * lds * 4 : nullptr;
       dst[j] = kc * (R + C::PAD) + (rl ^ swz(kc));
       row[j] = rl; first[j] = kc == 0;
     }
@@ -90,15 +93,17 @@ struct TileLoader {
 #pragma unroll
     for (int j = 0; j < CH; ++j) {
       p[j] += more ? (FP4 ? C::BK / 2 : C::BK * Elem<FP4 ? NVFP4A_FP32 : T>::bytes) : 0;
-      if (FP4 || Q8) ps[j] += more ? (FP4 ? 1 : 4) : 0;
+      // swizzled: 4 consecutive scales, then the next 512-byte tile
+      if (FP4 || Q8) ps[j] += more ? (FP4 ? (SWZ && (kt & 3) == 3 ? 509 : 1) : 4) : 0;
     }
+    if (SWZ) kt += more ? 1 : 0;
   }
   __device__ __forceinline__ void store(float *s, float *ss) const {
 #pragma unroll
     for (int j = 0; j < CH; ++j) {
       float v[E];
       if (FP4) {
-        const float sa = e4m3_value(sc[j]);
+        const float sa = scale_val<UE>(sc[j]);
 #pragma unroll
         for (int q = 0; q < E; ++q) v[q] = INT ? e2m1_value<1>(raw[j][0], q) : mul_rn(e2m1_value<0>(raw[j][0], q), sa);
         if (INT && first[j]) ss[row[j]] = sa;
@@ -134,7 +139,7 @@ __device__ __forceinline__ void epi_staged_pass(const Epilogue &e, EpiState &st,
   }
 }
 
-template <class C, int TB>
+template <class C, int TB, int F>
 __global__ void __launch_bounds__(C::NT, TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8 ? 1 : C::MINB)
 gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
             const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n, int k,
@@ -148,8 +153,8 @@ gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
   __shared__ __align__(16) float ssA[INT ? C::BM : 1], ssB[INT ? C::BN : 1];
   const int tx = threadIdx.x % C::TX, ty = threadIdx.x / C::TX;
   const int m0 = blockIdx.y * C::BM, n0 = blockIdx.x * C::BN;
-  using LA = TileLoader<C, C::BM, NVFP4A_NVFP4, INT>;
-  using LB = TileLoader<C, C::BN, TB, INT>;
+  using LA = TileLoader<C, C::BM, NVFP4A_NVFP4, INT, (F & kF_ASWZ) != 0, (F & kF_AUE) != 0>;
+  using LB = TileLoader<C, C::BN, TB, INT, (F & kF_BSWZ) != 0, (F & kF_BUE) != 0>;
   static_assert(C::TX * 4 >= 32 && C::TY * 4 >= 32, "fragment XOR must stay inside a 32-column block");
   LA la; la.init(A, lda, SA, ldsa, m0, m);
   LB lb; lb.init(B, ldb, SB, ldsb, n0, n);
@@ -240,11 +245,11 @@ gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
   epi_end(e, st);
 }
 
-template <class C, int TB>
+template <class C, int TB, int F = 0>
 cudaError_t gemm_launch(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb,
                         const uint8_t *SB, int ldsb, int m, int n, int k, const Epilogue &e, cudaStream_t s) {
   dim3 grid((n + C::BN - 1) / C::BN, (m + C::BM - 1) / C::BM);
-  gemm_kernel<C, TB><<<grid, C::NT, 0, s>>>(A, lda, SA, ldsa, B, ldb, SB, ldsb, m, n, k, e);
+  gemm_kernel<C, TB, F><<<grid, C::NT, 0, s>>>(A, lda, SA, ldsa, B, ldb, SB, ldsb, m, n, k, e);
   return cudaGetLastError();
 }
 
@@ -287,7 +292,7 @@ struct Dp4aCfgT {
 using Dp4aCfg = Dp4aCfgT<128, 8, 1>;
 using Dp4aCfgNarrow = Dp4aCfgT<64, 4, 2>;  // ~120 registers: two blocks per SM
 
-template <class C, int TB>
+template <class C, int TB, int F>
 __global__ void __launch_bounds__(C::NT, C::MINB)
 gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
                  const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n,
@@ -316,8 +321,14 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
   const int srow = tid & (BM - 1);
   const bool b_row = row < BN, b_srow = srow < BN;  // narrow tiles: only these threads carry B
   const size_t brow = n0 + srow < n ? n0 + srow : 0;
-  const uint32_t *ps = (const uint32_t *)(sa_thr ? SA + (size_t)(m0 + srow < m ? m0 + srow : 0) * ldsa
-                                                 : (Q8 ? SA : SB + brow * ldsb));
+  // scale words: the 4 scales of a k-tile are 4 consecutive bytes in both layouts; one word per k-tile in
+  // the linear layout, 512 bytes apart in the swizzled one
+  constexpr bool SWA = F & kF_ASWZ, SWB = F & kF_BSWZ, UEA = F & kF_AUE, UEB = F & kF_BUE;
+  const size_t arow = m0 + srow < m ? m0 + srow : 0;
+  const uint32_t *ps = (const uint32_t *)(sa_thr ? SA + (SWA ? swz_row((int)arow, -ldsa) : arow * ldsa)
+                                                 : (Q8 ? SA : SB + (SWB ? swz_row((int)brow, -ldsb) : brow * ldsb)));
+  constexpr int PSA = SWA ? 128 : 1, PSB = SWB ? 128 : 1;  // words per k-tile
+  const int pstep = PSA == PSB ? PSA : sa_thr ? PSA : PSB;
   const float4 *psb = Q8 ? (const float4 *)((const float *)SB + brow * ldsb) : nullptr;
   const int sbslot = srow % C::TY * C::TN + srow / C::TY;  // B row n0 + ty + TY * j -> slot ty * TN + j
   float acc[C::TM][C::TN];
@@ -339,20 +350,20 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
     }
     if (sa_thr) {
 #pragma unroll
-      for (int b = 0; b < KBT; ++b) { const float v = e4m3_value((rs >> (8 * b)) & 0xFF); ssa2[buf][b][srow] = make_float2(v, -12582912.f * v); }
+      for (int b = 0; b < KBT; ++b) { const float v = scale_val<UEA>((rs >> (8 * b)) & 0xFF); ssa2[buf][b][srow] = make_float2(v, -12582912.f * v); }
     } else if (!b_srow) {
     } else if (Q8) {
       ssb2[buf][0][sbslot] = rsb.x; ssb2[buf][1][sbslot] = rsb.y; ssb2[buf][2][sbslot] = rsb.z; ssb2[buf][3][sbslot] = rsb.w;
     } else {
 #pragma unroll
-      for (int b = 0; b < KBT; ++b) ssb2[buf][b][sbslot] = e4m3_value((rs >> (8 * b)) & 0xFF);
+      for (int b = 0; b < KBT; ++b) ssb2[buf][b][sbslot] = scale_val<UEB>((rs >> (8 * b)) & 0xFF);
     }
   };
   auto load_next = [&] {
     pa += 2; ra = *pa;
     pb += 2 * BW; rb = pb[0];
     if (Q8) rb2 = pb[1];
-    if (Q8 && !sa_thr) rsb = *++psb; else rs = *++ps;
+    if (Q8 && !sa_thr) rsb = *++psb; else if (PSA == 1 && PSB == 1) rs = *++ps; else { ps += pstep; rs = *ps; }
   };
   decode(0);
   if (tiles > 1) load_next();
@@ -405,12 +416,18 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
       const int gi = m0 + tx + C::TX * i;
       bv[i] = !full && e.bias ? load_any(e.bias_dtype, e.bias, gi < m ? gi : 0) : 0.f;
     }
+    // the row and column parts of the output scales, loaded once (rows / columns past the end: row 0)
+    float ra[C::TM], rb[C::TN];
+#pragma unroll
+    for (int i = 0; i < C::TM; ++i) { const int gi = m0 + tx + C::TX * i; ra[i] = epi_row_part(e, gi < m ? gi : 0); }
+#pragma unroll
+    for (int j = 0; j < C::TN; ++j) { const int gj = n0 + ty + C::TY * j; rb[j] = epi_col_part(e, gj < n ? gj : 0); }
 #pragma unroll
     for (int j = 0; j < C::TN; ++j)
 #pragma unroll
       for (int i = 0; i < C::TM; ++i) {
         const int gi = m0 + tx + C::TX * i, gj = n0 + ty + C::TY * j;
-        float v = __fmul_rn(acc[i][j] * kOut, st.s);
+        float v = __fmul_rn(acc[i][j] * kOut, epi_scale_ab(e, ra[i], rb[j]));
         if (full) { store_any(T, e.d, (size_t)gj * e.ldd + gi, v); continue; }
         if (gi < m && gj < n) {
           if (e.bias) v = __fadd_rn(v, bv[i]);
@@ -428,13 +445,20 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
     EpiState st = epi_begin(e);
     const auto vec_ok = [](const void *p, int ld, int bytes) { return ((uintptr_t)p % (4 * bytes)) == 0 && ld % 4 == 0; };
     const bool vc = vec_ok(e.c, e.ldc, Elem<CT>::bytes), vd = vec_ok(e.d, e.ldd, Elem<DT>::bytes);
+    // the output scales from row / column parts loaded once (as direct); scaled values are staged
+    float ra[C::TM], rb[C::TN];
+#pragma unroll
+    for (int i = 0; i < C::TM; ++i) { const int gi = m0 + tx + C::TX * i; ra[i] = epi_row_part(e, gi < m ? gi : 0); }
+#pragma unroll
+    for (int j = 0; j < C::TN; ++j) { const int gj = n0 + ty + C::TY * j; rb[j] = epi_col_part(e, gj < n ? gj : 0); }
 #pragma unroll
     for (int h = 0; h < C::TN / 4; ++h) {
       __syncthreads();  // the k loop, or the previous half, is done with the buffers
 #pragma unroll
       for (int jl = 0; jl < 4; ++jl)
 #pragma unroll
-        for (int i = 0; i < C::TM; ++i) stage[(jl * C::TY + ty) * BM + tx + C::TX * i] = __fmul_rn(acc[i][4 * h + jl] * kOut, st.s);
+        for (int i = 0; i < C::TM; ++i)
+          stage[(jl * C::TY + ty) * BM + tx + C::TX * i] = __fmul_rn(acc[i][4 * h + jl] * kOut, epi_scale_ab(e, ra[i], rb[4 * h + jl]));
       __syncthreads();
 #pragma unroll 1
       for (int q = 0; q < 4 * C::TY * BM / 4 / C::NT; ++q) {
@@ -493,9 +517,15 @@ NVFP4A_GEMM_CANDIDATES(NVFP4A_DEF_GEMM)
 // configurations the library builds: the defaults (0, 1) and those the tuned tables use
 #define NVFP4A_GEMM_LIB(X) X(0) X(1) NVFP4A_GEMM_USED(X)
 
-// entry point of one instance object: config id x B dtype
-#define NVFP4A_GEMM_ENTRY(id, tb) NVFP4A_CAT6(gemm_entry_, id, _, tb, , )
-#define NVFP4A_GEMM_PROTO(id, tb)                                                                       \
-  cudaError_t NVFP4A_GEMM_ENTRY(id, tb)(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, \
-                                        int ldb, const uint8_t *SB, int ldsb, int m, int n, int k,               \
-                                        const nvfp4a::kern::Epilogue &e, cudaStream_t s)
+namespace nvfp4a {
+namespace kern {
+// Entry points, explicitly instantiated by the instance objects: the FFMA kernel of config ID for B dtype TB
+// (gemm_nvfp4effma_inst.cu) and the DP4A kernel, wide or narrow tile (gemm_dp4a_inst.cu), per formats F.
+template <int ID, int TB, int F>
+cudaError_t gemm_entry(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb, const uint8_t *SB,
+                       int ldsb, int m, int n, int k, const Epilogue &e, cudaStream_t s);
+template <int TB, int F>
+cudaError_t dp4a_entry(bool narrow, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb,
+                       const uint8_t *SB, int ldsb, int m, int n, int k, const Epilogue &e, cudaStream_t s);
+}  // namespace kern
+}  // namespace nvfp4a

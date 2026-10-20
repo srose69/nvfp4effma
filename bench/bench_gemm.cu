@@ -66,5 +66,38 @@ int main(int argc, char **argv) {
   const float one = 1, zero = 0;
   row("cuBLAS SGEMM NN FP32 -> FP32", bench.run([&] { cublasSgemm(hb, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K, &one, fA, M, fB, K, &zero, fC, M); }, 20));
   row("cuBLAS SGEMM TN FP32 -> FP32", bench.run([&] { cublasSgemm(hb, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &one, fA, K, fB, K, &zero, fC, M); }, 20));
+
+  // Transformer Engine / cuBLASLt formats (bench_util.h): per B dtype every format against its "plain" row.
+  // The scale buffers hold the swizzled layout's padding; the values do not change the speed.
+  printf("\nTransformer Engine formats, -> BF16 (x = time / plain of the same B dtype)\n");
+  {
+    const size_t pad = (size_t)((S + 127) / 128 * 128) * ((K / 16 + 3) / 4 * 4);
+    void *tsA, *tsB, *q8, *s8; cudaMalloc(&tsA, pad); cudaMalloc(&tsB, pad); cudaMalloc(&q8, (size_t)N * K); cudaMalloc(&s8, (size_t)N * K / 16 * 4);
+    std::vector<unsigned char> hp(pad); for (auto &x : hp) x = 0x30 + rnd() % 16;
+    cudaMemcpy(tsA, hp.data(), pad, cudaMemcpyHostToDevice); cudaMemcpy(tsB, hp.data(), pad, cudaMemcpyHostToDevice);
+    cudaMemset(q8, 0, (size_t)N * K);
+    std::vector<float> hsq((size_t)N * K / 16, 0.01f); cudaMemcpy(s8, hsq.data(), hsq.size() * 4, cudaMemcpyHostToDevice);
+    float *gA = te_globals(M), *gB = te_globals(N);
+    for (nvfp4a_dtype bt : {NVFP4A_NVFP4, NVFP4A_INT8, NVFP4A_BF16}) {
+      const char *bn = bt == NVFP4A_NVFP4 ? "NVFP4" : bt == NVFP4A_INT8 ? "INT8" : "BF16";
+      float plain = 0.f;
+      for (const TeFmt &f : kTeFmts) {
+        if (bt != NVFP4A_NVFP4 && f.fb) continue;  // B flags exist on NVFP4 B only
+        if (&f != kTeFmts && !bench_want(f.name)) continue;  // "plain": the baseline of x, always
+        nvfp4a_tensor a = {dA, NVFP4A_NVFP4, tsA, 0, gA, nullptr, f.fa, 0};
+        nvfp4a_tensor b = bt == NVFP4A_NVFP4 ? nvfp4a_tensor{dB, bt, tsB, 0, gB, nullptr, f.fb, 0}
+                        : bt == NVFP4A_INT8  ? nvfp4a_tensor{q8, bt, s8, 0, gB, nullptr, 0, 0}
+                                             : nvfp4a_tensor{dX, bt, nullptr, 0, nullptr, nullptr, 0, 0};
+        nvfp4a_status st = NVFP4A_OK;
+        const BenchRow x = bench.run([&] { st = nvfp4a_gemm(M, N, K, 1.f, &a, K, &b, K, 0.f, nullptr, 0, &D, M, nullptr, 0); }, 20);
+        if (!plain) plain = x.ms;
+        char name[96]; snprintf(name, sizeof name, "TE %s x %s%s", bn, f.name, st == NVFP4A_OK ? "" : " (FAILED)");
+        const double gmacs = macs / x.ms / 1e6, peak = p.multiProcessorCount * 128 * x.mhz / 1e3;
+        printf("%-50s %6.3f ms %7.1f GMAC/s %5.0f MHz %10.1f%%   x%.3f\n", name, x.ms, gmacs, x.mhz, x.mhz > 0 ? 100 * gmacs / peak : 0.0,
+               x.ms / plain);
+        fflush(stdout);
+      }
+    }
+  }
   return 0;
 }

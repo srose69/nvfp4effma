@@ -24,6 +24,20 @@ static float e4(uint8_t b) {  // E4M3, NaN included
   float v = (b & 0x7F) == 0x7F ? NAN : e ? ldexpf(1.f + f / 8.f, e - 7) : ldexpf(f / 8.f, -6);
   return (b & 0x80) ? -v : v;
 }
+static float ue5(uint8_t b) {  // UE5M3 (unsigned, bias 15)
+  int e = (b >> 3) & 31, f = b & 7;
+  return e ? ldexpf(1.f + f / 8.f, e - 15) : ldexpf(f / 8.f, -14);
+}
+// position of block scale (r, c) of a [rows][cols] NVFP4 matrix: linear (ld scales per row) or swizzled
+// (the cuBLASLt / TE GEMM layout, written out from its definition)
+static size_t sc_pos(bool swz, int ld, int cols, int r, int c) {
+  if (!swz) return (size_t)r * ld + c;
+  const int sc = (cols / 16 + 3) / 4 * 4;
+  return ((size_t)(r / 128) * (sc / 4) + c / 4) * 512 + (r % 32) * 16 + ((r / 32) % 4) * 4 + c % 4;
+}
+static size_t sc_bytes(bool swz, int ld, int rows, int cols) {
+  return swz ? (size_t)(rows + 127) / 128 * 128 * ((cols / 16 + 3) / 4 * 4) : (size_t)rows * ld;
+}
 static float e2(uint32_t n) {  // E2M1 nibble
   static const float t[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
   return (n & 8) ? -t[n & 7] : t[n & 7];
@@ -58,19 +72,32 @@ template <class T> static T *dev(const std::vector<T> &h) {
 }
 static float *devf(float v) { float *d; cudaMalloc(&d, 4); cudaMemcpy(d, &v, 4, cudaMemcpyHostToDevice); return d; }
 
-// A host NVFP4 matrix: rows x cols values, ld values per row, ldsc scale bytes per row
+// A host NVFP4 matrix: rows x cols values, ld values per row, ldsc scale bytes per row (linear layout);
+// flags / scale_max as nvfp4a_tensor; global: one value (g) or one per row, a decode factor or an amax
 struct HostFp4 {
   int rows, cols, ld, ldsc;
+  unsigned flags; int smax;
   std::vector<uint8_t> data, sc;
+  std::vector<float> gv;
   float g;
-  HostFp4(int r, int c, int ld_, int ldsc_, float g_) : rows(r), cols(c), ld(ld_), ldsc(ldsc_), data((size_t)r * ld_ / 2), sc((size_t)r * ldsc_), g(g_) {
+  HostFp4(int r, int c, int ld_, int ldsc_, float g_, unsigned fl = 0, int sm = 0)
+      : rows(r), cols(c), ld(ld_), ldsc(ldsc_), flags(fl), smax(sm), data((size_t)r * ld_ / 2),
+        sc(sc_bytes(fl & NVFP4A_SCALES_SWIZZLED, ldsc_, r, c)), g(g_) {
     for (auto &x : data) x = rnd();
-    // finite positive E4M3 scales over the whole range, some zero blocks
-    for (auto &x : sc) x = rnd() % 16 == 0 ? 0 : 1 + rnd() % 0x7E;
+    // finite positive scales over the whole range of the type, some zero blocks
+    for (auto &x : sc) x = rnd() % 16 == 0 ? 0 : (fl & NVFP4A_SCALES_UE5M3) ? 1 + rnd() % 0xFD : 1 + rnd() % 0x7E;
+    gv.assign((fl & NVFP4A_GLOBAL_PER_ROW) ? (r > 0 ? r : 1) : 1, g_);
+    if (fl & NVFP4A_GLOBAL_PER_ROW)
+      for (auto &x : gv) x = g_ * (0.5f + (rnd() & 255) / 256.f);
   }
+  bool swz() const { return flags & NVFP4A_SCALES_SWIZZLED; }
+  int ld_api() const { return swz() ? 0 : ldsc; }
   uint32_t nib(int r, int c) const { return (data[(size_t)r * ld / 2 + c / 2] >> (4 * (c & 1))) & 15; }
-  float scale(int r, int c) const { return e4(sc[(size_t)r * ldsc + c / 16]); }
+  uint8_t code(int r, int c) const { return sc[sc_pos(swz(), ldsc, cols, r, c / 16)]; }
+  float scale(int r, int c) const { return (flags & NVFP4A_SCALES_UE5M3) ? ue5(code(r, c)) : e4(code(r, c)); }
   float val(int r, int c) const { return e2(nib(r, c)) * scale(r, c); }  // exact
+  float M() const { return smax ? (float)smax : (flags & NVFP4A_SCALES_UE5M3) ? 114688.f : 448.f; }
+  float global(int r) const { return gv[(flags & NVFP4A_GLOBAL_PER_ROW) ? r : 0]; }
 };
 
 // A host INT8 activation matrix: int8 values, one FP32 scale per 16 values of a row
@@ -93,7 +120,31 @@ struct Case {
   nvfp4a_dtype bt, dt; int ct;  // ct: C dtype, -1 = accumulate into D (C = NULL)
   int bias;                     // -1 none, else bias dtype
   float alpha, beta;
+  unsigned fa = 0, fb = 0;      // NVFP4 flags of A / B (scale layout and type, global kind)
+  int ma = 0, mb = 0;           // their scale_max
 };
+
+// Every operand format: the block scale formats of the kernel instances (src/nvfp4effma.cuh kF_*, bits 0..3)
+// and the kinds of globals the epilogue handles (bits 4..6 here: amax, per-row A, per-row B) as NVFP4 flags of
+// A / B; the amax bit goes to A, B or both by v, scale_max 448 / 256 alternating for E4M3.  kTestFormats for
+// NVFP4 B; the other B dtypes have no B bits: test_format_a(i), i < kTestFormatsA.
+constexpr int kTF_AMAX = 16, kTF_AROW = 32, kTF_BROW = 64, kTestFormats = 128, kTestFormatsA = 16;
+inline int test_format_a(int i) { return (i & 3) | (i & 4 ? kTF_AMAX : 0) | (i & 8 ? kTF_AROW : 0); }
+static void set_formats(Case &c, int f, int v) {
+  using namespace nvfp4a;
+  const bool fp4b = c.bt == NVFP4A_NVFP4;
+  c.fa = (f & kF_ASWZ ? NVFP4A_SCALES_SWIZZLED : 0u) | (f & kF_AUE ? NVFP4A_SCALES_UE5M3 : 0u) |
+         (f & kTF_AROW ? NVFP4A_GLOBAL_PER_ROW : 0u);
+  c.fb = fp4b ? (f & kF_BSWZ ? NVFP4A_SCALES_SWIZZLED : 0u) | (f & kF_BUE ? NVFP4A_SCALES_UE5M3 : 0u) |
+                (f & kTF_BROW ? NVFP4A_GLOBAL_PER_ROW : 0u) : 0u;
+  if (f & kTF_AMAX) {
+    const int on = fp4b ? v % 3 : 0;  // 0: A, 1: B, 2: both
+    if (on != 1) c.fa |= NVFP4A_GLOBAL_AMAX;
+    if (on != 0) c.fb |= NVFP4A_GLOBAL_AMAX;
+  }
+  c.ma = (c.fa & NVFP4A_GLOBAL_AMAX) && !(f & kF_AUE) && v % 2 ? 256 : 0;
+  c.mb = (c.fb & NVFP4A_GLOBAL_AMAX) && !(f & kF_BUE) && v % 4 >= 2 ? 256 : 0;
+}
 
 // Runs nvfp4a_gemm on random data and compares D and amax bit for bit with the host emulation.
 static int run_case(const Case &c) {
@@ -101,7 +152,9 @@ static int run_case(const Case &c) {
   const bool gemv = c.n <= nvfp4a::kern::kGemvMaxN[c.bt];
   const int lda = c.k + 64, ldb = c.k + (fp4b ? 128 : 64), ldd = c.m + 3, ldc = c.ct >= 0 ? c.m + 1 : ldd;
   const nvfp4a_dtype ct = c.ct >= 0 ? (nvfp4a_dtype)c.ct : c.dt;
-  HostFp4 hA(c.m, c.k, lda, c.k / 16 + 4, 0.375f), hBq(fp4b ? c.n : 0, c.k, ldb, c.k / 16 + 8, 1.75f);
+  // globals: decode factors, or amaxes in the range a real tensor would have for its scale_max
+  HostFp4 hA(c.m, c.k, lda, c.k / 16 + 4, (c.fa & NVFP4A_GLOBAL_AMAX) ? 37.5f : 0.375f, c.fa, c.ma);
+  HostFp4 hBq(fp4b ? c.n : 0, c.k, ldb, c.k / 16 + 8, (c.fb & NVFP4A_GLOBAL_AMAX) ? 175.f : 1.75f, c.fb, c.mb);
   HostQ8 hB8(q8b ? c.n : 0, c.k, ldb, c.k / 16 + 8, 1.75f);
   std::vector<uint8_t> hB(blk ? 0 : (size_t)ldb * c.n * esize(c.bt));
   std::vector<uint8_t> hC((size_t)ldc * c.n * esize(ct)), hD((size_t)ldd * c.n * esize(c.dt)), hbias(c.m * 4);
@@ -114,9 +167,10 @@ static int run_case(const Case &c) {
   void *dB = fp4b ? (void *)dev(hBq.data) : q8b ? (void *)dev(hB8.data) : (void *)dev(hB);
   void *dSB = fp4b ? (void *)dev(hBq.sc) : q8b ? (void *)dev(hB8.sc) : nullptr;
   uint8_t *dC = dev(hC), *dD = dev(hD), *dbias = dev(hbias);
-  float *dga = devf(hA.g), *dgb = devf(hBq.g), *damax = devf(0.f);
-  nvfp4a_tensor A = {dA, NVFP4A_NVFP4, dSA, hA.ldsc, dga, nullptr};
-  nvfp4a_tensor B = {dB, c.bt, dSB, fp4b ? hBq.ldsc : q8b ? hB8.ldsc : 0, blk ? dgb : nullptr, nullptr};
+  float *dga = dev(hA.gv), *dgb = fp4b ? dev(hBq.gv) : devf(hB8.g), *damax = devf(0.f);
+  nvfp4a_tensor A = {dA, NVFP4A_NVFP4, dSA, hA.ld_api(), dga, nullptr, c.fa, c.ma};
+  nvfp4a_tensor B = {dB, c.bt, dSB, fp4b ? hBq.ld_api() : q8b ? hB8.ldsc : 0, blk ? dgb : nullptr, nullptr, fp4b ? c.fb : 0u,
+                     fp4b ? c.mb : 0};
   nvfp4a_tensor C = {dC, ct, nullptr, 0, nullptr, nullptr}, D = {dD, c.dt, nullptr, 0, nullptr, damax};
   nvfp4a_tensor bias = {dbias, c.bias >= 0 ? (nvfp4a_dtype)c.bias : NVFP4A_FP32, nullptr, 0, nullptr, nullptr};
   nvfp4a_status st = nvfp4a_gemm(c.m, c.n, c.k, c.alpha, &A, lda, &B, ldb, c.beta, c.ct >= 0 ? &C : nullptr, ldc, &D, ldd,
@@ -134,7 +188,12 @@ static int run_case(const Case &c) {
     return fmaf((float)p * hA.scale(i, kb), fp4b ? hBq.scale(j, kb) : hB8.scale(j, kb), acc);
   };
   const float kout = fp4b ? 0.25f : 0.5f;
-  const float s = (c.alpha * hA.g) * (fp4b ? hBq.g : q8b ? hB8.g : 1.f);
+  // output scale ((alpha * vA(i)) * vB(j)) * gf, gf from the amax globals in Transformer Engine's order
+  const bool aa = c.fa & NVFP4A_GLOBAL_AMAX, ab = fp4b && (c.fb & NVFP4A_GLOBAL_AMAX);
+  const float gf = aa && ab ? 1.0f / (6.f * 6.f * hA.M() * hBq.M()) : aa ? 1.0f / (6.f * hA.M()) : ab ? 1.0f / (6.f * hBq.M()) : 1.f;
+  auto scale_ij = [&](int i, int j) {
+    return ((c.alpha * hA.global(i)) * (fp4b ? hBq.global(j) : q8b ? hB8.g : 1.f)) * gf;
+  };
   std::vector<uint8_t> exp = hD;
   float eamax = 0.f;
   for (int j = 0; j < c.n; ++j)
@@ -165,7 +224,7 @@ static int run_case(const Case &c) {
       } else {
         for (int kk = 0; kk < c.k; ++kk) acc = fmaf(hA.val(i, kk), Bval(j, kk), acc);
       }
-      float v = acc * s;
+      float v = acc * scale_ij(i, j);
       if (c.bias >= 0) v = v + hload((nvfp4a_dtype)c.bias, hbias.data(), i);
       if (c.beta != 0.f) v = fmaf(c.beta, hload(ct, hC.data(), (size_t)j * ldc + i), v);
       eamax = fmaxf(eamax, fabsf(v));
@@ -175,9 +234,9 @@ static int run_case(const Case &c) {
   for (size_t i = 0; i < exp.size(); ++i) bad += exp[i] != got[i];
   const bool amax_ok = gamax == eamax;
   const int fail = st != NVFP4A_OK || ce != cudaSuccess || bad || !amax_ok;
-  printf("%s m=%4d n=%4d k=%5d B=%-5s D=%s C=%-5s bias=%-4s a=%.2f b=%5.2f : %s%s\n", gemv ? "gemv" : "gemm", c.m, c.n,
-         c.k, DN[c.bt], DN[c.dt], c.ct >= 0 ? DN[c.ct] : "accum", c.bias >= 0 ? DN[c.bias] : "-", c.alpha, c.beta,
-         fail ? "FAIL" : "ok", amax_ok ? "" : " (amax mismatch)");
+  printf("%s m=%4d n=%4d k=%5d B=%-5s D=%s C=%-5s bias=%-4s a=%.2f b=%5.2f fa=%x/%d fb=%x/%d : %s%s\n", gemv ? "gemv" : "gemm",
+         c.m, c.n, c.k, DN[c.bt], DN[c.dt], c.ct >= 0 ? DN[c.ct] : "accum", c.bias >= 0 ? DN[c.bias] : "-", c.alpha, c.beta,
+         c.fa, c.ma, c.fb, c.mb, fail ? "FAIL" : "ok", amax_ok ? "" : " (amax mismatch)");
   if (bad) printf("   %zu bytes differ\n", bad);
   if (st != NVFP4A_OK) printf("   status %s: %s\n", nvfp4a_status_string(st), nvfp4a_last_error());
   if (ce) printf("   cuda %s\n", cudaGetErrorString(ce));

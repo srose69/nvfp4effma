@@ -87,6 +87,42 @@ are about 8 issue slots per weight value.
   any n ≤ 64. Grouped GEMV wins up to n = 48 (NVFP4), 56 (INT8, BF16, FP16) and 32 (FP32) on a GTX 1080
   (`kGemvMaxN`).
 
+## Operand formats: one kernel instance per scale format
+
+The Transformer Engine / cuBLASLt variants of NVFP4 differ in the block scale layout (linear or
+GEMM-swizzled) and type (E4M3 or UE5M3) of each operand, and in the globals (decode factor or amax, per
+tensor or per row). The scale formats change the main loops, so they are a template parameter `F`
+(`kF_ASWZ`, `kF_AUE`, `kF_BSWZ`, `kF_BUE`): 16 instances for NVFP4 B, 4 for the other B dtypes, one object
+file each, dispatched on the host. Run-time format tests in the kernels were measured first and rejected:
+one per-element branch in the FFMA epilogue cost the dense-B GEMM 7 % (ptxas allocated the main loop's
+registers differently), and recomputing the swizzled scale address per iteration made the GEMV with NVFP4 /
+INT8 x up to 2× slower. In the instances the swizzled scales are stepped pointers like the linear ones
+(+1 per k-tile, 512 bytes every 4 k-tiles; the GEMV's x rows of a launch lie in one 32-row group, so their
+row parts are a base plus 16 bytes per row).
+
+The globals only enter the epilogue, and one code path handles all of them: per row of A and of B a
+pointer with stride 0 or 1 (NULL = 1), loaded once per output row / column of the thread, and
+`((α · vA) · vB) · gf` per output — the same bits as `(α · gA) · gB` for per-tensor decode factors
+(`gf = 1`). Keeping them in `F` as well (128 instances) made the library 8× larger for differences of
+under 1 % on the GTX 1080.
+
+## Quantization kernels
+
+- **Rowwise 1 × 16**: one thread per block, consecutive threads on consecutive blocks of a row — coalesced,
+  89 % of the DRAM peak.
+- **Rowwise 16 × 16**: the warp keeps a 16 × 16 tile per 4 lanes in registers (4 values per lane and row: a
+  warp reads 8 consecutive blocks of each of the 16 rows), the tile amax comes from registers and two
+  shuffles, the nibbles are stored coalesced. 4 values per lane, not a 16-byte word: with 8 BF16 values
+  per lane the per-lane work doubles at the same occupancy (2.9× slower). The E2M1 conversion there is the
+  branchless form (`f32_to_e2m1_sel`, exhaustively equal), since divergent branches per element cost the
+  instruction-level parallelism of a low-occupancy kernel.
+- **4over6 and columnwise**: a unit of 16 lanes owns 16 rows of one block column, a lane per row; 16 × 16
+  4over6 sums the rows' errors over the unit. 4over6 is bound by the division by `6 · M` in its error,
+  which runs as `x · r` plus one FMA correction (`div_by`, exact for these divisors, with a branch to IEEE
+  division only for subnormal quotients and infinities — zeros, frequent, take the exact fast path).
+- **The global amax** (current scaling): a separate pass with 128-bit loads, two independent loads per
+  thread; one atomic max per warp.
+
 ## Kernel configurations
 
 Kernels are templates; the candidates are those that can win on some target, chosen per architecture by

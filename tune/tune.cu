@@ -29,7 +29,7 @@ template <class F> static float best_ms(F f, int reps = 7) {
 
 static Epilogue epi(void *d, int ldd) {
   Epilogue e = {};
-  e.alpha = 1.f; e.d = d; e.ldd = ldd; e.d_dtype = NVFP4A_BF16; e.c_dtype = NVFP4A_FP32; e.bias_dtype = NVFP4A_FP32;
+  e.alpha = 1.f; e.gf = 1.f; e.d = d; e.ldd = ldd; e.d_dtype = NVFP4A_BF16; e.c_dtype = NVFP4A_FP32; e.bias_dtype = NVFP4A_FP32;
   return e;
 }
 
