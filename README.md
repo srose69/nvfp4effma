@@ -69,8 +69,9 @@ FP32 peak: 20 SMs × 128 FFMA × SM clock (1818–1837 MHz in the GEMM rows); DR
 bandwidth counts the values and the block scales. With both operands in NVFP4 the DP4A kernel does four
 exact products per instruction and exceeds the FP32 FFMA peak; with BF16 activations a MAC costs one FP32
 FFMA, so compute-bound GEMM tops out at SGEMM speed while reading 7× fewer weight bytes, and
-bandwidth-bound kernels (decoding) get the full benefit of the smaller weights. **On Pascal, use W4A8 for
-prefill speed** (`act="auto"` / `"int8"`): exact W4A16 is bound by the FP32 FFMA rate there (no fast FP16, no
+bandwidth-bound kernels (decoding) get the full benefit of the smaller weights. 
+
+**On Pascal, use W4A8 for prefill speed** (`act="auto"` / `"int8"`): exact W4A16 is bound by the FP32 FFMA rate there (no fast FP16, no
 int path for BF16 values) and runs at SGEMM speed. Against llama.cpp's NVFP4
 kernels on the same GPU (int8 activations, like W4A8 here), interleaved runs: 1.0–4.5× faster on every
 shape measured — 1.47× at 4096³, 3.9–4.5× for 8-token decoding, 1.45–1.66× at 512 tokens
