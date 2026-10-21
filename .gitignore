@@ -7,6 +7,8 @@ binds/python/nvfp4effma/*.so
 binds/python/LICENSE
 binds/python/LICENSE-EXCEPTION
 binds/python/NOTICE
+binds/python/nvfp4effma/include/
+binds/python/nvfp4effma/src/
 __pycache__/
 .pytest_cache/
 # release tooling and artifacts (dev/release.sh -> dist/vX.Y.Z)

@@ -67,7 +67,7 @@
 #ifndef NVFP4EFFMA_H
 #define NVFP4EFFMA_H
 
-#define NVFP4EFFMA_VERSION "0.3.0"
+#define NVFP4EFFMA_VERSION "0.4.0"
 
 #include <stddef.h>
 #include <cuda_runtime.h>

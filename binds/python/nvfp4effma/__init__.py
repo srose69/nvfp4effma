@@ -16,15 +16,17 @@ Every call checks its arguments and raises ``TypeError`` (dtype), ``ValueError``
 multiple of 64, overlapping output), ``NotImplementedError`` (GPU with native FP4, or older than sm_50)
 or ``RuntimeError`` (library / CUDA failure) instead of running on bad input.
 """
-from typing import Optional, Union
+import os
+from typing import List, Optional, Union
 
 import torch
 
 from . import _C
-from .tensor import NVFP4Linear, NVFP4Tensor, quantize_linear_
+from .tensor import Int8Tensor, NVFP4Linear, NVFP4Tensor, quantize_linear_
 
 __version__ = _C.__version__
-__all__ = ["quantize", "dequantize", "linear", "NVFP4Tensor", "NVFP4Linear", "quantize_linear_", "__version__"]
+__all__ = ["quantize", "quantize_int8", "dequantize", "linear", "NVFP4Tensor", "Int8Tensor", "NVFP4Linear",
+           "quantize_linear_", "get_include", "__version__"]
 
 # act="auto": up to this many rows of x the exact W4A16 path runs (bandwidth-bound: as fast as W4A8 there);
 # beyond it the activations are quantized to int8 first (W4A8, DP4A), which is about twice as fast.
@@ -108,6 +110,27 @@ def quantize(x: torch.Tensor, global_scale: Optional[torch.Tensor] = None, *, am
     return out
 
 
+def quantize_int8(x: torch.Tensor) -> Int8Tensor:
+    """Quantize ``x`` (bfloat16 / float16 / float32 CUDA tensor ``[..., K]``, K a multiple of 16) to int8 with an
+    FP32 scale per 16 values: ``scale = max |x| / 127`` over the block, ``data = round(x / scale)`` -- the
+    activations of ``linear(..., act="int8")``, which takes the result as ``x`` directly."""
+    if not isinstance(x, torch.Tensor):
+        raise TypeError("x must be a tensor")
+    if x.dim() < 1:
+        raise ValueError("x must have at least one dimension")
+    q, s = _C.quantize_int8(x.reshape(-1, x.shape[-1]) if x.dim() != 2 else x)
+    return Int8Tensor(q.reshape(x.shape), s.reshape(*x.shape[:-1], x.shape[-1] // 16), x.dtype)
+
+
+def get_include() -> List[str]:
+    """Directories with the C header ``nvfp4effma.h`` and the device-side codecs ``nvfp4effma.cuh`` (E2M1 / E4M3
+    decode and RNE encode, scale addressing), for CUDA extensions that build on this package:
+    ``-I`` both and ``#include <nvfp4effma.cuh>``.  The code compiled from them is only consistent with this
+    version of the package."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [os.path.join(here, "include"), os.path.join(here, "src")]
+
+
 def dequantize(x: NVFP4Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """The values of ``x`` rounded once to ``dtype`` (bfloat16, float16 or float32): ``(e2m1 * scale) *
     global_scale``, or Transformer Engine's ``e2m1 * ((scale * amax) / (6 * scale_max))``."""
@@ -117,7 +140,7 @@ def dequantize(x: NVFP4Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Ten
     return _C.dequantize(d, s.view(torch.uint8), g, flags, smax, cols, dtype).reshape(x.shape)
 
 
-def linear(x: Union[torch.Tensor, NVFP4Tensor], weight: NVFP4Tensor, bias: Optional[torch.Tensor] = None, *,
+def linear(x: Union[torch.Tensor, NVFP4Tensor, Int8Tensor], weight: NVFP4Tensor, bias: Optional[torch.Tensor] = None, *,
            act: str = "auto", out_dtype: Optional[torch.dtype] = None, out: Optional[torch.Tensor] = None,
            alpha: float = 1.0, beta: float = 0.0, amax_out: Optional[torch.Tensor] = None) -> torch.Tensor:
     """``alpha * x @ weight.T + bias + beta * out`` like ``torch.nn.functional.linear``.
@@ -127,15 +150,16 @@ def linear(x: Union[torch.Tensor, NVFP4Tensor], weight: NVFP4Tensor, bias: Optio
       ``dW = linear(dY_q.columnwise, X_q.columnwise)`` for NVFP4-quantized ``dY_q`` / ``X_q``.
     * ``x``: bfloat16 / float16 / float32 tensor ``[..., K]`` (W4A16: one FFMA per MAC on the exactly
       decoded weights), or a 2-D ``NVFP4Tensor`` ``[T, K]`` (W4A4: exact integer sums per block of 16, DP4A
-      from sm_61).  For few rows a bandwidth-bound GEMV kernel reads every weight byte once per 8 rows.
+      from sm_61), or an ``Int8Tensor`` from ``quantize_int8`` (W4A8, as ``act="int8"``).  For few rows a
+      bandwidth-bound GEMV kernel reads every weight byte once per 8 rows.
     * ``act`` (dense ``x``): ``"exact"`` keeps it as it is (W4A16, every product exact; on Pascal bound by
       the FP32 FFMA rate); ``"int8"`` quantizes it first to int8 with an FP32 scale per 16 values (W4A8:
       exact integer block sums on DP4A, about twice as fast, the accuracy class of llama.cpp's int8
       activations); ``"nvfp4"`` to NVFP4 (W4A4); ``"auto"`` (default) is ``"exact"`` up to
       ``AUTO_EXACT_MAX_ROWS`` (2) rows of ``x``, where both run at memory speed, and ``"int8"`` beyond.
-    * ``out_dtype``: bfloat16, float16 or float32 (default: the dtype of a dense ``x``, else bfloat16);
-      ``beta != 0`` accumulates into ``out``, which must then be given ``[T, N]``; ``amax_out`` (float32
-      ``[1]``) gets max |result|.
+    * ``out_dtype``: bfloat16, float16 or float32 (default: the dtype of a dense ``x``, the source dtype of an
+      ``Int8Tensor``, else bfloat16); ``beta != 0`` accumulates into ``out``, which must then be given
+      ``[T, N]``; ``amax_out`` (float32 ``[1]``) gets max |result|.
     """
     if not isinstance(weight, NVFP4Tensor):
         raise TypeError(f"weight must be an NVFP4Tensor, got {type(weight).__name__}")
@@ -150,8 +174,16 @@ def linear(x: Union[torch.Tensor, NVFP4Tensor], weight: NVFP4Tensor, bias: Optio
         xd, xs, xg, xf, xm, _ = x._flat()
         return _C.linear(xd, xs.view(torch.uint8), xg, xf, xm, wd, ws, wg, wf, wm, K, bias, out_dtype, out, alpha, beta,
                          amax_out)
+    if isinstance(x, Int8Tensor):
+        if x.shape[-1] != K:
+            raise ValueError(f"x must have shape [..., {K}], got {x.shape}")
+        o2 = out.reshape(-1, N) if out is not None else None
+        od = out_dtype if out_dtype is not None or out is not None else x.dtype
+        y = _C.linear(x.data.reshape(-1, K), x.scales.reshape(-1, K // 16), None, 0, 0, wd, ws, wg, wf, wm, K, bias, od,
+                      o2, alpha, beta, amax_out)
+        return out if out is not None else y.reshape(*x.shape[:-1], N)
     if not isinstance(x, torch.Tensor):
-        raise TypeError("x must be a tensor or an NVFP4Tensor")
+        raise TypeError("x must be a tensor, an NVFP4Tensor or an Int8Tensor")
     if x.dim() < 1 or x.shape[-1] != K:
         raise ValueError(f"x must have shape [..., {K}], got {tuple(x.shape)}")
     if act not in ("auto", "exact", "int8", "nvfp4"):
@@ -159,12 +191,13 @@ def linear(x: Union[torch.Tensor, NVFP4Tensor], weight: NVFP4Tensor, bias: Optio
     x2 = x.reshape(-1, K)
     if act == "auto":
         act = "exact" if x2.shape[0] <= AUTO_EXACT_MAX_ROWS else "int8"
+    if act == "int8":
+        y = linear(quantize_int8(x2), weight, bias, out_dtype=out_dtype, out=out, alpha=alpha, beta=beta,
+                   amax_out=amax_out)
+        return out if out is not None else y.reshape(*x.shape[:-1], N)
     o2 = out.reshape(-1, N) if out is not None else None
     od = out_dtype if out_dtype is not None or out is not None else x.dtype  # quantized x: output in x's dtype
-    if act == "int8":
-        q, s = _C.quantize_int8(x2)
-        y = _C.linear(q, s, None, 0, 0, wd, ws, wg, wf, wm, K, bias, od, o2, alpha, beta, amax_out)
-    elif act == "nvfp4":
+    if act == "nvfp4":
         qd, qs, qg, qf, qm, _ = quantize(x2)._flat()
         y = _C.linear(qd, qs.view(torch.uint8), qg, qf, qm, wd, ws, wg, wf, wm, K, bias, od, o2, alpha, beta, amax_out)
     else:

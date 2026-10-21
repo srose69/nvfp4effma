@@ -94,9 +94,10 @@ methodology and how to add your GPU: [docs/performance.md](docs/performance.md).
 - **Every NVIDIA NVFP4 variant** in GEMM, GEMV, quantization and dequantization, with Transformer Engine's
   arithmetic bit for bit (see [NVIDIA NVFP4 variants](#nvidia-nvfp4-variants)); scale layout conversion
   (linear ↔ GEMM-swizzled) and the transpose of 16 × 16-tiled tensors.
-- **PyTorch bindings**: functional API (`quantize`, `dequantize`, `linear` with `act="auto" / "exact" /
-  "int8" / "nvfp4"`), `NVFP4Tensor`, and `NVFP4Linear` with `quantize_linear_`, which swaps the
-  `nn.Linear` layers of a model.
+- **PyTorch bindings**: functional API (`quantize`, `quantize_int8`, `dequantize`, `linear` with
+  `act="auto" / "exact" / "int8" / "nvfp4"`), `NVFP4Tensor`, `Int8Tensor`, and `NVFP4Linear` with
+  `quantize_linear_`, which swaps the `nn.Linear` layers of a model; `get_include()` for CUDA extensions
+  that build on the device-side codecs.
 - **Strict input checking** with readable errors in C (`nvfp4a_last_error`) and Python (`TypeError` /
   `ValueError` / `NotImplementedError`).
 - **Per-architecture tuning** (`make tune`) and a parallel build (about 3 minutes for all 14 architectures
@@ -172,6 +173,7 @@ x = torch.randn(8, 4096, device="cuda", dtype=torch.bfloat16)
 y = nf.linear(x, q)                                 # act="auto": exact for <= 2 rows, int8 (W4A8) beyond
 y = nf.linear(x, q, act="exact")                    # W4A16, every product exact
 y = nf.linear(x, q, act="int8")                     # W4A8: x to int8 per 16 values, DP4A from sm_61
+y = nf.linear(nf.quantize_int8(x), q)               # the same, with the int8 activations (Int8Tensor) kept
 y = nf.linear(nf.quantize(x), q)                    # W4A4
 w2 = nf.dequantize(q, torch.float32)
 # t = nf.NVFP4Tensor.from_te(te_tensor)             # a Transformer Engine NVFP4 tensor, as it is

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """``NVFP4Tensor`` (the parts of an NVFP4 matrix, in any of the layouts of ModelOpt, Transformer Engine and
-cuBLASLt) and ``NVFP4Linear``, a drop-in replacement for ``nn.Linear`` with NVFP4 weights.  Inference only:
+cuBLASLt), ``Int8Tensor`` (int8 activations with a scale per 16 values) and ``NVFP4Linear``, a drop-in replacement for ``nn.Linear`` with NVFP4 weights.  Inference only:
 there is no autograd support."""
 import math
 from typing import Optional, Tuple
@@ -199,6 +199,59 @@ class NVFP4Tensor:
         if self.columnwise is not None:
             parts.append("+ columnwise")
         return f"NVFP4Tensor({', '.join(parts)})"
+
+
+class Int8Tensor:
+    """Activations quantized to int8 with one FP32 scale per 16 values along the last dimension, as
+    ``linear(..., act="int8")`` does internally (W4A8): ``value = data * scale``.  Produced by
+    ``nvfp4effma.quantize_int8``; ``linear`` takes it as ``x`` directly, so the quantized activations can be
+    kept (e.g. for a backward pass) and reused without quantizing twice.
+
+    * ``data``: int8 ``[..., cols]``, cols a multiple of 16.
+    * ``scales``: float32 ``[..., cols / 16]``.
+    * ``dtype``: the dtype of the values it was quantized from; ``linear`` returns this dtype by default.
+    """
+
+    def __init__(self, data: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype = torch.bfloat16):
+        if data.dtype != torch.int8:
+            raise TypeError(f"data must be torch.int8, got {data.dtype}")
+        if scales.dtype != torch.float32:
+            raise TypeError(f"scales must be torch.float32, got {scales.dtype}")
+        if dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            raise TypeError(f"dtype must be bfloat16, float16 or float32, got {dtype}")
+        if data.dim() < 1 or data.shape[-1] % 16:
+            raise ValueError(f"data must be [..., cols] with cols a multiple of 16, got {tuple(data.shape)}")
+        if tuple(scales.shape) != (*data.shape[:-1], data.shape[-1] // 16):
+            raise ValueError(f"scales of a {tuple(data.shape)} tensor are {(*data.shape[:-1], data.shape[-1] // 16)}, "
+                             f"got {tuple(scales.shape)}")
+        if data.device != scales.device:
+            raise ValueError("data and scales must be on one device")
+        self.data, self.scales, self.dtype = data, scales, dtype
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return tuple(self.data.shape)
+
+    def dim(self) -> int:
+        return self.data.dim()
+
+    @property
+    def device(self) -> torch.device:
+        return self.data.device
+
+    @classmethod
+    def from_float(cls, x: torch.Tensor) -> "Int8Tensor":
+        from . import quantize_int8
+        return quantize_int8(x)
+
+    def dequantize(self, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        """``data * scale`` in float32, rounded once to ``dtype`` (default: the source dtype)."""
+        k = self.data.shape[-1]
+        v = self.data.float().reshape(-1, k // 16, 16) * self.scales.reshape(-1, k // 16, 1)
+        return v.reshape(self.data.shape).to(dtype or self.dtype)
+
+    def __repr__(self):
+        return f"Int8Tensor(shape={self.shape}, device={self.device}, dtype={self.dtype})"
 
 
 class NVFP4Linear(torch.nn.Module):

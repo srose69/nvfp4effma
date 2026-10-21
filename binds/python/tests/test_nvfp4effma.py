@@ -314,6 +314,41 @@ def test_linear_int8_activations(T):
     assert m(x).shape == (T, N)
 
 
+@pytest.mark.parametrize("T", [1, 8, 200])
+def test_int8_tensor(T):
+    """quantize_int8 -> Int8Tensor -> linear: bit for bit act="int8"; batched shapes, out_dtype, dequantize."""
+    N, K = 130, 256
+    w = nf.quantize(rand((N, K), seed=10))
+    x = rand((2, T, K), torch.float16, seed=11)
+    xq = nf.quantize_int8(x)
+    assert isinstance(xq, nf.Int8Tensor) and xq.shape == (2, T, K) and xq.scales.shape == (2, T, K // 16)
+    assert xq.dtype == torch.float16 and nf.Int8Tensor.from_float(x).data.equal(xq.data)
+    q, s = nf._C.quantize_int8(x.reshape(-1, K))
+    assert torch.equal(xq.data.reshape(-1, K), q) and torch.equal(xq.scales.reshape(-1, K // 16), s)
+    y = nf.linear(xq, w)
+    assert y.dtype == torch.float16 and y.shape == (2, T, N)
+    assert torch.equal(y, nf.linear(x, w, act="int8"))
+    assert torch.equal(nf.linear(xq, w, out_dtype=torch.float32), nf.linear(x, w, act="int8", out_dtype=torch.float32))
+    xd = (q.float().reshape(-1, K // 16, 16) * s[..., None]).reshape(2, T, K)
+    assert torch.equal(xq.dequantize(torch.float32), xd) and xq.dequantize().dtype == torch.float16
+    with pytest.raises(ValueError):
+        nf.linear(nf.quantize_int8(rand((T, 128), seed=1)), w)  # K mismatch
+    with pytest.raises(TypeError):
+        nf.Int8Tensor(xq.data.float(), xq.scales)
+    with pytest.raises(ValueError):
+        nf.Int8Tensor(xq.data, xq.scales[..., :4])
+
+
+def test_get_include():
+    """The header and the device-side codecs ship with the package, at the version of the package."""
+    import os, re
+    inc, src = nf.get_include()
+    hdr = open(os.path.join(inc, "nvfp4effma.h")).read()
+    assert re.search(r'#define NVFP4EFFMA_VERSION "([^"]+)"', hdr).group(1) == nf.__version__.split("+")[0]
+    assert os.path.isfile(os.path.join(src, "nvfp4effma.cuh")) and os.path.isfile(os.path.join(src, "nvfp4effma_tuned.h"))
+    assert '#include "../include/nvfp4effma.h"' in open(os.path.join(src, "nvfp4effma.cuh")).read()
+
+
 def test_linear_auto_activations():
     """act="auto": the exact path for up to 2 rows, int8 activations beyond -- bit for bit."""
     w = nf.quantize(rand((96, 256), seed=12))
