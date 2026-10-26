@@ -115,7 +115,7 @@ out/tune: tune/tune.cu $(GEMM_H) $(GEMV_H) | out/native
 tune: out/tune                   ## writes src/nvfp4effma_tuned.h for this GPU; rebuild the library afterwards
 	$(RUN) ./out/tune src/nvfp4effma_tuned.h
 
-TESTS   = test_gemm test_gemv test_nvfp4effma
+TESTS   = test_gemm test_gemv test_nvfp4effma test_images
 BENCHES = bench_gemm bench_gemv bench_quant
 $(addprefix out/,$(TESTS)): out/%: tests/%.cu tests/test_util.h $(NATIVE)
 	$(NVCC) $(NATIVE_FLAGS) -o $@ $< $(NATIVE)
@@ -134,6 +134,7 @@ bench-bin: $(addprefix out/,$(BENCHES))
 test: test-bin                   ## API bit-exact, exhaustive encoders, negative controls
 	$(RUN) ./out/test_gemm
 	$(RUN) ./out/test_gemv
+	$(RUN) ./out/test_images
 	$(RUN) ./out/test_nvfp4effma
 	$(RUN) ./out/test_nvfp4effma_neg
 test-sm60: out/sm60/test_gemm out/sm60/test_gemv

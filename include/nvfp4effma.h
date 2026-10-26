@@ -187,9 +187,17 @@ nvfp4a_status nvfp4a_transpose(const nvfp4a_tensor *src, int lds, const nvfp4a_t
 size_t nvfp4a_tc_image_bytes(int operand, nvfp4a_dtype dtype, int rows, int k);
 
 /* src [rows][k] (data and block scales as for nvfp4a_gemm, ld values between rows, a multiple of 64) -> image
- * (16-byte aligned, nvfp4a_tc_image_bytes). */
+ * (16-byte aligned, nvfp4a_tc_image_bytes).  A16 / A8 images are built on any supported device (e.g. to be stored and
+ * loaded elsewhere); B images only where nvfp4a_gemm_tc runs. */
 nvfp4a_status nvfp4a_tc_image(int operand, const nvfp4a_tensor *src, int ld, int rows, int k, void *image,
                               cudaStream_t stream);
+
+/* A weight image (NVFP4A_TC_A16 / NVFP4A_TC_A8, from) of [rows][k] -> the image of the other kind (to), or back to the
+ * NVFP4 tensor: dst data [rows][k] (ld values between rows, a multiple of 64; 16-byte aligned) with linear block
+ * scales (dst->ld_scale, 0 = k / 16, a multiple of 4; 4-byte aligned); dst's flags and global are not touched (the image
+ * holds the scale bytes as they were).  Any supported device. */
+nvfp4a_status nvfp4a_tc_image_convert(int from, int to, const void *image, int rows, int k, void *dst, cudaStream_t stream);
+nvfp4a_status nvfp4a_tc_image_to_raw(int from, const void *image, int rows, int k, const nvfp4a_tensor *dst, int ld, cudaStream_t stream);
 
 /* Bytes of nvfp4a_gemm_tc's workspace on the current device.  The caller zeroes it once (cudaMemset) after
  * allocating it; every call leaves it zeroed.  A workspace serves one call at a time. */

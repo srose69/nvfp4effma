@@ -618,6 +618,9 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
 // Entry points (src/tensors/image.cu, gemm_tc_inst.cu): the images of A (h: A16, else A8) and B (image.cuh), and the
 // GEMM over them per B dtype TB (NVFP4, INT8, BF16) and scale formats F (kF_AUE / kF_BUE)
 cudaError_t tc_image_a(bool h, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, int m, int k, uint8_t *img, cudaStream_t s);
+// a weight image (h: A16, else A8) -> the other kind, or -> raw NVFP4 (data ldd bytes, scales lds bytes between rows)
+cudaError_t tc_image_a_convert(bool h, const uint8_t *src, int m, int k, uint8_t *dst, cudaStream_t s);
+cudaError_t tc_image_a_raw(bool h, const uint8_t *src, int m, int k, uint8_t *data, int ldd, uint8_t *scales, int lds, cudaStream_t s);
 cudaError_t tc_image_b(int tb, const uint8_t *B, int ldb, const uint8_t *SB, int ldsb, int n, int k, uint8_t *img, cudaStream_t s);
 template <int TB, int F>
 cudaError_t tc_entry(const uint8_t *ia, const uint8_t *ib, int m, int n, int k, const Epilogue &e, uint8_t *ws, cudaStream_t s);

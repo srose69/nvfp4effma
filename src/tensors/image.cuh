@@ -94,6 +94,70 @@ __global__ void __launch_bounds__(128) image_a_kernel(const uint8_t *__restrict_
   reinterpret_cast<uint4 *>(rec)[32 * T + l] = make_uint4(o[0], o[1], o[2], o[3]);
 }
 
+// An A16 / A8 record in shared memory, read by meaning: the 16 bits (bytes 2 t, 2 t + 1 of block j) of row g + 8 h of
+// k-tile T, and the scale of block b of that row.  A8 word j of lane (g, t) is A16 word t of lane (g, j).
+struct RecordA {
+  const uint32_t *w;  // [tile 4][lane 32][word 4]
+  const uint8_t *s;   // the scales (256 bytes)
+  bool h16;
+  __device__ uint32_t bits(int T, int g, int h, int j, int t) const {
+    const uint32_t v = h16 ? w[(32 * T + 4 * g + j) * 4 + t] : w[(32 * T + 4 * g + t) * 4 + j];
+    return h ? v >> 16 : v & 0xFFFFu;
+  }
+  __device__ uint32_t scale(int T, int g, int h, int b) const {
+    return h16 ? s[2 * (4 * (4 * g + b) + T) + h] : s[8 * (4 * g + T) + 4 * h + b];
+  }
+};
+
+// A weight image (H: A16, else A8) -> the other kind (ToRaw false) or raw NVFP4 (data [m][ldd bytes], scales [m][lds]).
+// Grid as image_a_kernel's, thread = (tile T, lane g, t); rows past m and k-tiles past the end are not written.
+template <bool H, bool ToRaw>
+__global__ void __launch_bounds__(128) image_a_convert_kernel(const uint8_t *__restrict__ src, uint8_t *__restrict__ dst, int m, int tiles,
+                                                              int ldd, int lds, uint8_t *__restrict__ scales) {
+  __shared__ uint4 rec[GV / 16];
+  const int tid = threadIdx.x, T = tid >> 5, l = tid & 31, g = l >> 2, t = l & 3;
+  const size_t at = ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * GV;
+  const uint4 *in = reinterpret_cast<const uint4 *>(src + at);
+  for (int i = tid; i < GV / 16; i += 128) rec[i] = in[i];
+  __syncthreads();
+  const RecordA r{reinterpret_cast<const uint32_t *>(rec), reinterpret_cast<const uint8_t *>(rec) + 2048, H};
+  if (!ToRaw) {
+    uint8_t *out = dst + at;
+    uint32_t o[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)  // the other kind's word j of this lane
+      o[j] = H ? r.bits(T, g, 0, j, t) | r.bits(T, g, 1, j, t) << 16 : r.bits(T, g, 0, t, j) | r.bits(T, g, 1, t, j) << 16;
+    reinterpret_cast<uint4 *>(out)[32 * T + l] = make_uint4(o[0], o[1], o[2], o[3]);
+    if (H) {  // -> A8: words [g][tile][row g, row g + 8]
+      if (t == 0) {
+        uint32_t s0 = 0, s1 = 0;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) { s0 |= r.scale(T, g, 0, b) << (8 * b); s1 |= r.scale(T, g, 1, b) << (8 * b); }
+        reinterpret_cast<uint2 *>(out + 2048)[4 * g + T] = make_uint2(s0, s1);
+      }
+    } else {  // -> A16: u16 [lane][tile] = (row g block t) | (row g + 8) << 8
+      reinterpret_cast<uint16_t *>(out + 2048)[4 * l + T] = (uint16_t)(r.scale(T, g, 0, t) | r.scale(T, g, 1, t) << 8);
+    }
+    return;
+  }
+  const int kt = blockIdx.x * 4 + T;
+  if (kt >= tiles) return;
+#pragma unroll
+  for (int h = 0; h < 2; ++h) {
+    const int row = blockIdx.y * 16 + g + 8 * h;
+    if (row >= m) continue;
+    uint8_t *d = dst + (size_t)row * ldd + 32 * (size_t)kt;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) reinterpret_cast<uint16_t *>(d + 8 * j)[t] = (uint16_t)r.bits(T, g, h, j, t);
+    if (t == 0) {
+      uint32_t s = 0;
+#pragma unroll
+      for (int b = 0; b < 4; ++b) s |= r.scale(T, g, h, b) << (8 * b);
+      *reinterpret_cast<uint32_t *>(scales + (size_t)row * lds + 4 * (size_t)kt) = s;
+    }
+  }
+}
+
 // B, NVFP4 [n][ldb / 2 bytes] -> image.  Thread = (record, n8 slice j, g): column g of slice j.
 __global__ void __launch_bounds__(kImgThreads) image_b4_kernel(const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb,
                                                       int n, int tiles, uint8_t *__restrict__ img) {

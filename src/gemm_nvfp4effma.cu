@@ -298,15 +298,56 @@ extern "C" nvfp4a_status nvfp4a_tc_image(int operand, const nvfp4a_tensor *src, 
                   "and >= k / 16 (ld_scale = %d)", sa, src->ld_scale);
     if (nvfp4a_status st = check_scales("nvfp4a_tc_image", "src", src, rows, k, &ldsc)) return st;
   }
-  // (an A16 image serves BF16 B: sm_80+)
-  if (nvfp4a_status st = tc_device("nvfp4a_tc_image", operand == NVFP4A_TC_B ? src->dtype : operand == NVFP4A_TC_A16 ? NVFP4A_BF16
-                                                                                                                   : NVFP4A_NVFP4))
-    return st;
+  // a weight's image is a rearrangement: any device builds it (e.g. to store it); B's serve the GEMM of this device
+  if (nvfp4a_status st = operand == NVFP4A_TC_B ? tc_device("nvfp4a_tc_image", src->dtype) : check_device()) return st;
   const uint8_t *data = (const uint8_t *)src->data, *sc = (const uint8_t *)src->block_scale;
   uint8_t *img = (uint8_t *)image;
   const cudaError_t err = operand == NVFP4A_TC_B ? tc_image_b(src->dtype, data, ld, sc, ldsc, rows, k, img, stream)
                                                  : tc_image_a(operand == NVFP4A_TC_A16, data, ld, sc, ldsc, rows, k, img, stream);
   return cuda_status(err, "nvfp4a_tc_image: kernel launch");
+}
+
+// the checks of a weight image argument
+static nvfp4a_status check_weight_image(const char *fn, int kind, const void *image, int rows, int k) {
+  using namespace nvfp4a;
+  if (kind != NVFP4A_TC_A16 && kind != NVFP4A_TC_A8) return fail(NVFP4A_INVALID_VALUE, "%s: image kind %d (NVFP4A_TC_A16 or NVFP4A_TC_A8)", fn, kind);
+  if (!image) return fail(NVFP4A_INVALID_VALUE, "%s: image is NULL", fn);
+  if (rows < 0 || k < 0 || k % 64) return fail(NVFP4A_INVALID_VALUE, "%s: rows = %d, k = %d (k a multiple of 64)", fn, rows, k);
+  if ((uintptr_t)image & 15) return fail(NVFP4A_INVALID_VALUE, "%s: the image must be 16-byte aligned", fn);
+  return NVFP4A_OK;
+}
+
+extern "C" nvfp4a_status nvfp4a_tc_image_convert(int from, int to, const void *image, int rows, int k, void *dst, cudaStream_t stream) {
+  using namespace nvfp4a;
+  clear_error();
+  const char *fn = "nvfp4a_tc_image_convert";
+  if (nvfp4a_status st = check_weight_image(fn, from, image, rows, k)) return st;
+  if (nvfp4a_status st = check_weight_image(fn, to, dst, rows, k)) return st;
+  if (from == to) return fail(NVFP4A_INVALID_VALUE, "%s: the same kind", fn);
+  if (rows == 0 || k == 0) return NVFP4A_OK;
+  if (nvfp4a_status st = check_device()) return st;
+  return cuda_status(kern::tc_image_a_convert(from == NVFP4A_TC_A16, (const uint8_t *)image, rows, k, (uint8_t *)dst, stream),
+                     "nvfp4a_tc_image_convert: kernel launch");
+}
+
+extern "C" nvfp4a_status nvfp4a_tc_image_to_raw(int from, const void *image, int rows, int k, const nvfp4a_tensor *dst, int ld,
+                                                cudaStream_t stream) {
+  using namespace nvfp4a;
+  clear_error();
+  const char *fn = "nvfp4a_tc_image_to_raw";
+  if (nvfp4a_status st = check_weight_image(fn, from, image, rows, k)) return st;
+  if (!dst || !dst->data || !dst->block_scale || dst->dtype != NVFP4A_NVFP4)
+    return fail(NVFP4A_INVALID_VALUE, "%s: dst must be an NVFP4 tensor with data and block scales", fn);
+  const int lds = dst->ld_scale ? dst->ld_scale : k / 16;
+  if (ld % 64 || ld < k || lds % 4 || lds < k / 16 || ((uintptr_t)dst->data & 15) || ((uintptr_t)dst->block_scale & 3))
+    return fail(NVFP4A_INVALID_VALUE, "%s: ld = %d (a multiple of 64, >= k), ld_scale = %d (a multiple of 4, >= k / 16), data 16-byte "
+                "and scales 4-byte aligned", fn, ld, dst->ld_scale);
+  if (dst->flags & NVFP4A_SCALES_SWIZZLED) return fail(NVFP4A_INVALID_VALUE, "%s: dst scales are linear", fn);
+  if (rows == 0 || k == 0) return NVFP4A_OK;
+  if (nvfp4a_status st = check_device()) return st;
+  return cuda_status(kern::tc_image_a_raw(from == NVFP4A_TC_A16, (const uint8_t *)image, rows, k, (uint8_t *)dst->data, ld / 2,
+                                          (uint8_t *)dst->block_scale, lds, stream),
+                     "nvfp4a_tc_image_to_raw: kernel launch");
 }
 
 extern "C" size_t nvfp4a_tc_workspace_bytes(void) { return nvfp4a::kern::tc_ws_bytes(nvfp4a::kern::device_info().sms); }

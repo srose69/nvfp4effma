@@ -14,6 +14,20 @@ cudaError_t tc_image_a(bool h, const uint8_t *A, int lda, const uint8_t *SA, int
   else tc::image_a_kernel<false><<<grid, 128, 0, s>>>(A, lda, SA, ldsa, m, tiles, img);
   return cudaGetLastError();
 }
+cudaError_t tc_image_a_convert(bool h, const uint8_t *src, int m, int k, uint8_t *dst, cudaStream_t s) {
+  const int tiles = k / 64;
+  const dim3 grid((tiles + 3) / 4, (m + 127) / 128 * 8);
+  if (h) tc::image_a_convert_kernel<true, false><<<grid, 128, 0, s>>>(src, dst, m, tiles, 0, 0, nullptr);
+  else tc::image_a_convert_kernel<false, false><<<grid, 128, 0, s>>>(src, dst, m, tiles, 0, 0, nullptr);
+  return cudaGetLastError();
+}
+cudaError_t tc_image_a_raw(bool h, const uint8_t *src, int m, int k, uint8_t *data, int ldd, uint8_t *scales, int lds, cudaStream_t s) {
+  const int tiles = k / 64;
+  const dim3 grid((tiles + 3) / 4, (m + 127) / 128 * 8);
+  if (h) tc::image_a_convert_kernel<true, true><<<grid, 128, 0, s>>>(src, data, m, tiles, ldd, lds, scales);
+  else tc::image_a_convert_kernel<false, true><<<grid, 128, 0, s>>>(src, data, m, tiles, ldd, lds, scales);
+  return cudaGetLastError();
+}
 cudaError_t tc_image_b(int tb, const uint8_t *B, int ldb, const uint8_t *SB, int ldsb, int n, int k, uint8_t *img, cudaStream_t s) {
   const int tiles = k / 64;
   const dim3 grid((tiles + 1) / 2, (n + 127) / 128);

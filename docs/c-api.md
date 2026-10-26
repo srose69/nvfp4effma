@@ -59,7 +59,9 @@ accumulation, not bit for bit. `NVFP4A_DP4A=1` in the environment turns the tens
 | Function | Description |
 |---|---|
 | `nvfp4a_tc_image_bytes` | Bytes of the image of kind `NVFP4A_TC_A16` / `NVFP4A_TC_A8` (NVFP4) or `NVFP4A_TC_B` (NVFP4, INT8, BF16) of `rows` rows of `k` values. |
-| `nvfp4a_tc_image` | `src [rows][k]` (data and block scales as for `nvfp4a_gemm`, any NVFP4 variant) → image (16-byte aligned). |
+| `nvfp4a_tc_image` | `src [rows][k]` (data and block scales as for `nvfp4a_gemm`, any NVFP4 variant) → image (16-byte aligned). Weight images (A16 / A8) are built on any supported GPU, e.g. to be stored. |
+| `nvfp4a_tc_image_convert` | A weight image → the image of the other kind (A16 ↔ A8), at memory speed: one stored image serves every GPU. |
+| `nvfp4a_tc_image_to_raw` | A weight image → the NVFP4 tensor again (data and linear block scales), for the DP4A / FFMA paths. |
 | `nvfp4a_tc_workspace_bytes` | Bytes of `nvfp4a_gemm_tc`'s workspace on the current device; zeroed once by the caller, every call leaves it zeroed; one call at a time. |
 | `nvfp4a_gemm_tc` | `nvfp4a_gemm` from the images of A and B (`flags`, globals and `scale_max` as for `nvfp4a_gemm`; the scales are in the images). |
 | `nvfp4a_gemv_tc` | The same for `1 ≤ n ≤ 8` from A's image and B as it is (`ldb` values between its rows): every byte of the image read once, no workspace. |
