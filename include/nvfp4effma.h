@@ -67,7 +67,7 @@
 #ifndef NVFP4EFFMA_H
 #define NVFP4EFFMA_H
 
-#define NVFP4EFFMA_VERSION "0.4.0"
+#define NVFP4EFFMA_VERSION "0.5.0"
 
 #include <stddef.h>
 #include <cuda_runtime.h>
@@ -168,6 +168,46 @@ nvfp4a_status nvfp4a_swizzle_scales(const void *src, void *dst, int ld_linear, i
  * source instead.  rows and cols multiples of 16. */
 nvfp4a_status nvfp4a_transpose(const nvfp4a_tensor *src, int lds, const nvfp4a_tensor *dst, int ldd, int rows,
                                int cols, cudaStream_t stream);
+
+/* ---- Tensor-core GEMM (sm_75 .. sm_89; BF16 B from sm_80) --------------------------------------------------------
+ * nvfp4a_gemm_tc computes what nvfp4a_gemm does, D = alpha * A * B^T + bias + beta * C, on tensor cores, from images
+ * of A and B: the operand's bytes and block scales rearranged in the order the kernel streams them, nothing added
+ * (rows padded to 128): built once for a weight, per call for activations.  B is NVFP4 (W4A4), INT8 with FP32
+ * block scales (W4A8) or BF16 (W4A16).  Sums are FP32 throughout (block sums exact integers, BF16 products of
+ * a * scale exact) in the tensor cores' order and with the work split along k between CTAs: the values of
+ * nvfp4a_gemm within the rounding of an FP32 accumulation, not bit for bit. */
+/* Image kinds.  A (the weight, NVFP4): one image serves nvfp4a_gemm_tc and nvfp4a_gemv_tc -- A16 for BF16 B (W4A16,
+ * sm_80+), A8 for INT8 and NVFP4 B (W4A8, W4A4).  B (the activations of nvfp4a_gemm_tc): NVFP4, INT8, BF16. */
+#define NVFP4A_TC_A16 0
+#define NVFP4A_TC_B 1
+#define NVFP4A_TC_A8 2
+
+/* Bytes of the image of kind `operand` (NVFP4A_TC_A16, NVFP4A_TC_A8: NVFP4; NVFP4A_TC_B: NVFP4, INT8, BF16) of `rows`
+ * rows of k values, k a multiple of 64. */
+size_t nvfp4a_tc_image_bytes(int operand, nvfp4a_dtype dtype, int rows, int k);
+
+/* src [rows][k] (data and block scales as for nvfp4a_gemm, ld values between rows, a multiple of 64) -> image
+ * (16-byte aligned, nvfp4a_tc_image_bytes). */
+nvfp4a_status nvfp4a_tc_image(int operand, const nvfp4a_tensor *src, int ld, int rows, int k, void *image,
+                              cudaStream_t stream);
+
+/* Bytes of nvfp4a_gemm_tc's workspace on the current device.  The caller zeroes it once (cudaMemset) after
+ * allocating it; every call leaves it zeroed.  A workspace serves one call at a time. */
+size_t nvfp4a_tc_workspace_bytes(void);
+
+/* A, B: their images (nvfp4a_tc_image; A's of the kind for B's dtype: A16 for BF16, A8 for INT8 / NVFP4) in data;
+ * dtype, flags (scale type, globals), global_scale and scale_max as for nvfp4a_gemm (block_scale and ld_scale unused:
+ * the images hold the scales).  C, D, bias as for nvfp4a_gemm. */
+nvfp4a_status nvfp4a_gemm_tc(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, float beta,
+                             const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias,
+                             void *workspace, cudaStream_t stream);
+
+/* GEMV on tensor cores: nvfp4a_gemm_tc for n <= 8 (1 <= n <= 8), A its image (the same as for nvfp4a_gemm_tc), B as
+ * for nvfp4a_gemm (NVFP4, INT8 with FP32 block scales, BF16 from sm_80; ldb values between its rows): every byte of
+ * A's image read once, no workspace.  Sums as nvfp4a_gemm_tc's. */
+nvfp4a_status nvfp4a_gemv_tc(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, int ldb, float beta,
+                             const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias,
+                             cudaStream_t stream);
 
 const char *nvfp4a_status_string(nvfp4a_status status);
 

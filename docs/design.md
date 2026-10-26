@@ -87,6 +87,30 @@ are about 8 issue slots per weight value.
   any n ≤ 64. Grouped GEMV wins up to n = 48 (NVFP4), 56 (INT8, BF16, FP16) and 32 (FP32) on a GTX 1080
   (`kGemvMaxN`).
 
+## Tensor cores (sm_75 … sm_89)
+
+`src/tensors`: `nvfp4a_gemm_tc` / `nvfp4a_gemv_tc` on images of the operands (`image.cuh`), built by transcoders
+that read every source byte once.
+
+- **The same exact sums.** One integer `mma.m16n8k16` covers exactly one block of 16 k (twice an E2M1 value is
+  an exact int8), its accumulator starting at the bits of 1.5 · 2²³: D read as FP32 is 1.5 · 2²³ + p, and the
+  DP4A kernel's scale steps apply unchanged (W4A4, W4A8; sm_75: two m8n8k16). W4A16 (sm_80+) decodes A to BF16
+  `a · sa` — exact, the scale has at most 5 significant bits — so a BF16 `mma` need not cover one block: the
+  k order within a k-tile is the images' choice, the same for A and B.
+- **One image of the weight** serves the GEMM and the GEMV: per m16 slice, groups of 4 k-tiles (2304 bytes:
+  each lane's 16-byte words of the four k-tiles, then their scales). The GEMV streams a slice's groups, every
+  load a warp's 512 contiguous bytes; the GEMM gathers a k-tile's 8 slices into a slot.
+- **GEMM**: persistent CTAs (one per SM) over (tile, k-tile) units, rastered in groups of 8 row blocks; full
+  waves of whole tiles and the last wave split stream-K (partials through the workspace). 128 × 128 tiles, 8
+  compute warps and producers: from sm_80 a copier (`cp.async` → mbarrier) and a publisher that converts the
+  scales into the slot; sm_75 four producer warps through registers and sequence flags. W4A16 runs the fragments
+  one block ahead across k-tiles (`ldmatrix` for B), the integer paths a k-tile as one straight block.
+- **GEMV**: one CTA per m16 slice, 8 warps splitting its groups along k; the groups in flight in registers,
+  every warp the same number of iterations (zero groups past its own: no divergent tail); A's loads skip L1
+  with an evict-first L2 policy; the warps' sums added in a fixed order at the end, one store per output.
+- Long-lived values are recomputed in cold code (`%ctaid` / `%tid` re-read) rather than kept through the hot
+  loop: within the register bound of one CTA per SM nothing of the stream-K split stays live there.
+
 ## Operand formats: one kernel instance per scale format
 
 The Transformer Engine / cuBLASLt variants of NVFP4 differ in the block scale layout (linear or

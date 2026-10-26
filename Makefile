@@ -8,6 +8,8 @@
 #   make test       bit-exact API tests + exhaustive core validation (GPU $(GPU))
 #   make test-sm60  the GEMM / GEMV tests against a library built for sm_60 only: on an sm_61+ GPU this
 #                   runs the paths of GPUs without DP4A (binary-compatible SASS) and the default tables
+#   make test-sm75  the same against a library of compute_75 PTX only: on an sm_80+ GPU the driver JIT-compiles
+#                   it, and the tensor-core kernels run their Turing variant (no cp.async, no mbarriers)
 #   make bench      GEMM / GEMV / quantization throughput vs cuBLAS and memory bandwidth
 #                   (bench/run_bench.sh: controlled run with board settings -> benches/<gpu>.md)
 #   make install    header, static library and pkg-config file under PREFIX (default /usr/local)
@@ -41,6 +43,7 @@ MAKEFLAGS += -j$(JOBS)
 
 CORE_H = include/nvfp4effma.h src/nvfp4effma.cuh src/nvfp4effma_tuned.h
 GEMM_H = $(CORE_H) src/gemm_nvfp4effma.cuh
+TC_H = $(GEMM_H) src/tensors/gemm_tc.cuh src/tensors/gemv_tc.cuh src/tensors/image.cuh src/tensors/mma.cuh
 GEMV_H = $(CORE_H) src/gemv_nvfp4effma.cuh
 QUANT_H = $(CORE_H) src/quant_nvfp4effma.cuh
 
@@ -58,8 +61,10 @@ F_A   = 0 1 2 3
 INST = $(foreach i,$(GEMV_IDS),$(foreach f,$(F_ALL),inst_gemv_$(i)_0_$(f)) $(foreach t,1 2 3 4,$(foreach f,$(F_A),inst_gemv_$(i)_$(t)_$(f)))) \
        $(foreach i,$(GEMM_IDS),$(foreach t,1 2 3,$(foreach f,$(F_A),inst_gemm_$(i)_$(t)_$(f)))) \
        $(foreach f,$(F_ALL),inst_gemm_0_0_$(f) inst_dp4a_0_$(f)) $(foreach f,$(F_A),inst_gemm_0_4_$(f) inst_dp4a_4_$(f)) \
+       $(foreach f,0 2 8 10,inst_tc_0_$(f)) $(foreach f,0 2,inst_tc_4_$(f) inst_tc_1_$(f)) \
+       $(foreach f,0 2 4 6 8 10 12 14 16 18 24 26,inst_gtc_0_$(f)) $(foreach f,0 2,inst_gtc_4_$(f) inst_gtc_1_$(f)) \
        $(foreach t,1 2 3,$(foreach c,0 1,inst_quant_$(t)_$(c)_1 inst_quant_$(t)_$(c)_16))
-OBJS = nvfp4effma gemm_nvfp4effma gemv_nvfp4effma $(INST)
+OBJS = nvfp4effma gemm_nvfp4effma gemv_nvfp4effma tc_image $(INST)
 NVCC_THREADS := $(shell t=$$(( $(JOBS) / $(words $(OBJS)) )); [ $$t -lt 1 ] && t=1; a=$(words $(ARCHS)); [ $$t -gt $$a ] && t=$$a; echo $$t)
 word_ = $(word $(1),$(subst _, ,$(2)))
 
@@ -69,13 +74,19 @@ all: lib test-bin bench-bin
 define LIBRARY  # $(1) = object dir, $(2) = arch flags
 $(1)/nvfp4effma.o: src/nvfp4effma.cu $(QUANT_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
-$(1)/gemm_nvfp4effma.o: src/gemm_nvfp4effma.cu $(GEMM_H) src/gemv_nvfp4effma.cuh | $(1)
+$(1)/gemm_nvfp4effma.o: src/gemm_nvfp4effma.cu $(TC_H) src/gemv_nvfp4effma.cuh | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
 $(1)/gemv_nvfp4effma.o: src/gemv_nvfp4effma.cu $(GEMV_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
 $(1)/inst_gemm_%.o: src/gemm_nvfp4effma_inst.cu $(GEMM_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TB=$$(call word_,2,$$*) -DNVFP4A_F=$$(call word_,3,$$*) -c -o $$@ $$<
 $(1)/inst_dp4a_%.o: src/gemm_dp4a_inst.cu $(GEMM_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_F=$$(call word_,2,$$*) -c -o $$@ $$<
+$(1)/tc_image.o: src/tensors/image.cu $(TC_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
+$(1)/inst_tc_%.o: src/tensors/gemm_tc_inst.cu $(TC_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_F=$$(call word_,2,$$*) -c -o $$@ $$<
+$(1)/inst_gtc_%.o: src/tensors/gemv_tc_inst.cu $(TC_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_F=$$(call word_,2,$$*) -c -o $$@ $$<
 $(1)/inst_quant_%.o: src/quant_nvfp4effma_inst.cu $(QUANT_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_QT=$$(call word_,1,$$*) -DNVFP4A_QCOL=$$(call word_,2,$$*) -DNVFP4A_QTILE=$$(call word_,3,$$*) -c -o $$@ $$<
@@ -91,6 +102,7 @@ OBJDIR ?= out/obj
 $(eval $(call LIBRARY,$(OBJDIR),$(GENCODE) --threads $(NVCC_THREADS)))
 $(eval $(call LIBRARY,out/native,-arch=sm_$(TEST_ARCH)))
 $(eval $(call LIBRARY,out/sm60,-arch=sm_60))
+$(eval $(call LIBRARY,out/sm75,-arch=compute_75 -code=compute_75))
 out/libnvfp4effma.a: $(OBJDIR)/libnvfp4effma.a
 	cp $< $@
 lib: out/libnvfp4effma.a
@@ -111,6 +123,8 @@ out/test_nvfp4effma_neg: tests/test_nvfp4effma.cu tests/test_util.h $(NATIVE)
 	$(NVCC) $(NATIVE_FLAGS) -DNVFP4A_NEGATIVE_CONTROLS -o $@ $< $(NATIVE)
 out/sm60/test_%: tests/test_%.cu tests/test_util.h out/sm60/libnvfp4effma.a
 	$(NVCC) $(FLAGS) -arch=sm_60 -o $@ $< out/sm60/libnvfp4effma.a
+out/sm75/test_%: tests/test_%.cu tests/test_util.h out/sm75/libnvfp4effma.a
+	$(NVCC) $(FLAGS) -arch=compute_75 -code=compute_75 -o $@ $< out/sm75/libnvfp4effma.a
 $(addprefix out/,$(BENCHES)): out/%: bench/%.cu bench/bench_util.h include/nvfp4effma.h $(NATIVE)
 	$(NVCC) $(NATIVE_FLAGS) -o $@ $< $(NATIVE) -lcublas -lnvidia-ml
 
@@ -125,6 +139,9 @@ test: test-bin                   ## API bit-exact, exhaustive encoders, negative
 test-sm60: out/sm60/test_gemm out/sm60/test_gemv
 	$(RUN) ./out/sm60/test_gemm
 	$(RUN) ./out/sm60/test_gemv
+test-sm75: out/sm75/test_gemm out/sm75/test_gemv
+	$(RUN) ./out/sm75/test_gemm
+	$(RUN) ./out/sm75/test_gemv
 bench: bench-bin
 	$(RUN) ./out/bench_gemm
 	$(RUN) ./out/bench_gemv
@@ -140,7 +157,7 @@ install: $(OBJDIR)/libnvfp4effma.a
 	       '$(PREFIX)' > $(DESTDIR)$(PREFIX)/lib/pkgconfig/nvfp4effma.pc
 
 clean:
-	rm -rf out/obj out/native out/sm60 out/libnvfp4effma.a out/tune \
+	rm -rf out/obj out/native out/sm60 out/sm75 out/libnvfp4effma.a out/tune \
 	       $(addprefix out/,$(TESTS) $(BENCHES)) out/test_nvfp4effma_neg
 
-.PHONY: all lib tune test-bin bench-bin test test-sm60 bench install clean
+.PHONY: all lib tune test-bin bench-bin test test-sm60 test-sm75 bench install clean

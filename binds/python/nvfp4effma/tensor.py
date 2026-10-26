@@ -254,6 +254,29 @@ class Int8Tensor:
         return f"Int8Tensor(shape={self.shape}, device={self.device}, dtype={self.dtype})"
 
 
+class TCWeight:
+    """An NVFP4 weight ``[N, K]`` with its tensor-core image (sm_75 .. sm_89), which serves both the GEMM and, up to 8
+    rows of ``x``, the GEMV.  ``act`` picks the image and so the activations it multiplies: ``"exact"`` bfloat16
+    (W4A16, sm_80+), ``"int8"`` / ``"nvfp4"`` (W4A8 / W4A4: one image for both).  The image is as large as the
+    weight; it is built once, here."""
+
+    def __init__(self, weight: NVFP4Tensor, act: str = "exact"):
+        if not isinstance(weight, NVFP4Tensor) or weight.dim() != 2:
+            raise TypeError("weight must be a 2-D NVFP4Tensor")
+        if act not in ("exact", "int8", "nvfp4"):
+            raise ValueError(f"act must be 'exact', 'int8' or 'nvfp4', got {act!r}")
+        d, s, _, f, _, k = weight._flat()
+        self.weight, self.act = weight, act
+        self.image = _C.tc_image(0 if act == "exact" else 2, d, s.view(torch.uint8), f, k)
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self.weight.shape
+
+    def dim(self) -> int:
+        return 2
+
+
 class NVFP4Linear(torch.nn.Module):
     """``y = x @ W.T + bias`` with an NVFP4 weight ``W`` ``[out_features, in_features]`` (in_features a
     multiple of 64).  The buffers carry the names of NVFP4 checkpoints: ``weight`` (uint8, packed),

@@ -46,6 +46,44 @@ scales finite (no E4M3 NaN code; not checked).
 **Constraints of the conversions:** `cols`, `lds`, `ldd` multiples of 16; dense data 16-byte aligned, NVFP4
 data 8-byte aligned; quantization input finite.
 
+## Tensor cores (sm_75 … sm_89)
+
+The tensor-core kernels read the operands as **images**: their bytes and block scales rearranged in the order
+the kernel streams them, nothing added (rows padded to 128). A weight's image is built once; it serves both the
+GEMM and the GEMV. The kind of A's image follows the activations it multiplies: `NVFP4A_TC_A16` for BF16 (W4A16,
+sm_80+), `NVFP4A_TC_A8` for INT8 and NVFP4 (W4A8, W4A4). The sums are FP32 like `nvfp4a_gemm`'s, in the tensor
+cores' order and with the GEMM's k split between CTAs: the same values within the rounding of an FP32
+accumulation, not bit for bit. `NVFP4A_DP4A=1` in the environment turns the tensor-core paths off
+(`NVFP4A_NOT_SUPPORTED`).
+
+| Function | Description |
+|---|---|
+| `nvfp4a_tc_image_bytes` | Bytes of the image of kind `NVFP4A_TC_A16` / `NVFP4A_TC_A8` (NVFP4) or `NVFP4A_TC_B` (NVFP4, INT8, BF16) of `rows` rows of `k` values. |
+| `nvfp4a_tc_image` | `src [rows][k]` (data and block scales as for `nvfp4a_gemm`, any NVFP4 variant) → image (16-byte aligned). |
+| `nvfp4a_tc_workspace_bytes` | Bytes of `nvfp4a_gemm_tc`'s workspace on the current device; zeroed once by the caller, every call leaves it zeroed; one call at a time. |
+| `nvfp4a_gemm_tc` | `nvfp4a_gemm` from the images of A and B (`flags`, globals and `scale_max` as for `nvfp4a_gemm`; the scales are in the images). |
+| `nvfp4a_gemv_tc` | The same for `1 ≤ n ≤ 8` from A's image and B as it is (`ldb` values between its rows): every byte of the image read once, no workspace. |
+
+```c
+// once per weight: its image for BF16 activations
+void *w_img; cudaMalloc(&w_img, nvfp4a_tc_image_bytes(NVFP4A_TC_A16, NVFP4A_NVFP4, out, in));
+nvfp4a_tc_image(NVFP4A_TC_A16, &W, in, out, in, w_img, stream);
+nvfp4a_tensor Wi = W; Wi.data = w_img;
+
+// decoding (tokens <= 8): x as it is
+nvfp4a_gemv_tc(out, tokens, in, 1.0f, &Wi, &X, in, 0.0f, NULL, 0, &Y, out, NULL, stream);
+
+// prefill: x's image per call, the workspace zeroed once
+void *x_img; cudaMalloc(&x_img, nvfp4a_tc_image_bytes(NVFP4A_TC_B, NVFP4A_BF16, tokens, in));
+void *ws; cudaMalloc(&ws, nvfp4a_tc_workspace_bytes()); cudaMemset(ws, 0, nvfp4a_tc_workspace_bytes());
+nvfp4a_tc_image(NVFP4A_TC_B, &X, in, tokens, in, x_img, stream);
+nvfp4a_tensor Xi = X; Xi.data = x_img;
+nvfp4a_gemm_tc(out, tokens, in, 1.0f, &Wi, &Xi, 0.0f, NULL, 0, &Y, out, NULL, ws, stream);
+```
+
+**Constraints of the tensor-core functions:** `k`, `ld`, `ldb` multiples of 64; images, the workspace and B
+16-byte aligned; A NVFP4; the image of A of the kind for B's dtype.
+
 ## NVIDIA NVFP4 formats
 
 `flags` of an NVFP4 tensor (any combination, A and B independently, in every function):

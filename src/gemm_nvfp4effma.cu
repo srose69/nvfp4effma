@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // NVFP4EffMA GEMM host side: nvfp4a_gemm (validation, epilogue setup, routing of small n to the GEMV
-// kernel), the NVFP4 x NVFP4 path (DP4A from sm_61, FFMA below) and the dense-B configuration choice.
+// kernel), the NVFP4 x NVFP4 path (DP4A from sm_61, FFMA below) and the dense-B configuration choice; the
+// tensor-core API (nvfp4a_tc_image, nvfp4a_gemm_tc, nvfp4a_gemv_tc; sm_75 .. sm_89).
 #include <utility>
 #include "gemm_nvfp4effma.cuh"
 #include "gemv_nvfp4effma.cuh"
+#include "tensors/gemm_tc.cuh"
+#include "tensors/gemv_tc.cuh"
 
 namespace nvfp4a {
 namespace kern {
@@ -24,6 +27,21 @@ static const Dp4aFn *dp4a_table(std::index_sequence<I...>) {
   static const Dp4aFn t[] = {&dp4a_entry<TB, TB == NVFP4A_NVFP4 ? (int)I : (int)I>...};
   return t;
 }
+// tensor-core entries by scale formats (kF_AUE / kF_BUE: index F >> 1 & 1 | F >> 2 & 2)
+using TcFn = cudaError_t (*)(const uint8_t *, const uint8_t *, int, int, int, const Epilogue &, uint8_t *, cudaStream_t);
+static const TcFn kTc4[] = {&tc_entry<NVFP4A_NVFP4, 0>, &tc_entry<NVFP4A_NVFP4, kF_AUE>, &tc_entry<NVFP4A_NVFP4, kF_BUE>,
+                            &tc_entry<NVFP4A_NVFP4, kF_AUE | kF_BUE>};
+static const TcFn kTc8[] = {&tc_entry<NVFP4A_INT8, 0>, &tc_entry<NVFP4A_INT8, kF_AUE>};
+static const TcFn kTcH[] = {&tc_entry<NVFP4A_BF16, 0>, &tc_entry<NVFP4A_BF16, kF_AUE>};
+// tensor-core GEMV entries by formats F: NVFP4 x [x scales: linear, swizzled, linear by 16 bytes][kF_BUE][kF_AUE]; the
+// others kF_AUE
+using GvFn = cudaError_t (*)(const uint8_t *, const uint8_t *, int, const uint8_t *, int, int, int, int, const Epilogue &, cudaStream_t);
+static const GvFn kGv4[] = {&gemv_tc_entry<NVFP4A_NVFP4, 0>,  &gemv_tc_entry<NVFP4A_NVFP4, 2>,  &gemv_tc_entry<NVFP4A_NVFP4, 8>,
+                            &gemv_tc_entry<NVFP4A_NVFP4, 10>, &gemv_tc_entry<NVFP4A_NVFP4, 4>,  &gemv_tc_entry<NVFP4A_NVFP4, 6>,
+                            &gemv_tc_entry<NVFP4A_NVFP4, 12>, &gemv_tc_entry<NVFP4A_NVFP4, 14>, &gemv_tc_entry<NVFP4A_NVFP4, 16>,
+                            &gemv_tc_entry<NVFP4A_NVFP4, 18>, &gemv_tc_entry<NVFP4A_NVFP4, 24>, &gemv_tc_entry<NVFP4A_NVFP4, 26>};
+static const GvFn kGv8[] = {&gemv_tc_entry<NVFP4A_INT8, 0>, &gemv_tc_entry<NVFP4A_INT8, kF_AUE>};
+static const GvFn kGvH[] = {&gemv_tc_entry<NVFP4A_BF16, 0>, &gemv_tc_entry<NVFP4A_BF16, kF_AUE>};
 
 // The 64-wide DP4A tile costs about 2/3 of the 128-wide one for half the work, so it only wins where the
 // last 128-wide tile would be at most half full and there are few of them: n = 57..64 and 129..192
@@ -130,6 +148,31 @@ float amax_factor(const nvfp4a_tensor *A, const nvfp4a_tensor *B) {
   return 1.0f;
 }
 
+// The epilogue of nvfp4a_gemm / nvfp4a_gemm_tc (arguments validated) and the kernel instance's block scale formats
+// f (B flags exist on NVFP4 B only: check_scales)
+static kern::Epilogue make_epilogue(float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, float beta, const nvfp4a_tensor *C,
+                                    int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias, int *f) {
+  using namespace kern;
+  const bool blocked = B->dtype == NVFP4A_NVFP4 || B->dtype == NVFP4A_INT8;
+  const bool c_is_d = beta != 0.f && (!C || !C->data);  // D += ...
+  Epilogue e;
+  e.ga = A->global_scale;
+  e.gb = blocked ? B->global_scale : nullptr;
+  e.gf = amax_factor(A, blocked ? B : nullptr);
+  e.sa = (A->flags & NVFP4A_GLOBAL_PER_ROW) ? 1 : 0;
+  e.sb = (B->flags & NVFP4A_GLOBAL_PER_ROW) ? 1 : 0;
+  const auto has = [](const nvfp4a_tensor *t, unsigned flag) { return (t->flags & flag) != 0; };
+  *f = (has(A, NVFP4A_SCALES_SWIZZLED) ? kF_ASWZ : 0) | (has(A, NVFP4A_SCALES_UE5M3) ? kF_AUE : 0) |
+       (has(B, NVFP4A_SCALES_SWIZZLED) ? kF_BSWZ : 0) | (has(B, NVFP4A_SCALES_UE5M3) ? kF_BUE : 0);
+  e.alpha = alpha; e.beta = beta;
+  const nvfp4a_tensor *Cx = c_is_d ? D : C;
+  e.c = beta != 0.f ? Cx->data : nullptr; e.ldc = beta != 0.f ? (c_is_d ? ldd : ldc) : 0;
+  e.c_dtype = beta != 0.f ? Cx->dtype : NVFP4A_FP32;
+  e.d = D->data; e.ldd = ldd; e.d_dtype = D->dtype; e.amax = D->amax;
+  e.bias = bias && bias->data ? bias->data : nullptr; e.bias_dtype = bias ? bias->dtype : NVFP4A_FP32;
+  return e;
+}
+
 }  // namespace nvfp4a
 
 extern "C" nvfp4a_status nvfp4a_gemm(int m, int n, int k, float alpha, const nvfp4a_tensor *A, int lda,
@@ -172,24 +215,8 @@ extern "C" nvfp4a_status nvfp4a_gemm(int m, int n, int k, float alpha, const nvf
   if (beta != 0.f && C && C->data && !dense(C)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm: invalid C dtype %d", (int)C->dtype);
   if (beta != 0.f && C && C->data && ldc < m) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm: ldc = %d < m = %d", ldc, m);
   if (nvfp4a_status st = nvfp4a::check_device()) return st;
-  const bool c_is_d = beta != 0.f && (!C || !C->data);  // D += ...
-
-  Epilogue e;
-  e.ga = A->global_scale;
-  e.gb = blocked(B) ? B->global_scale : nullptr;
-  e.gf = nvfp4a::amax_factor(A, blocked(B) ? B : nullptr);
-  e.sa = (A->flags & NVFP4A_GLOBAL_PER_ROW) ? 1 : 0;
-  e.sb = (B->flags & NVFP4A_GLOBAL_PER_ROW) ? 1 : 0;
-  // the kernel instance's block scale formats (B flags exist on NVFP4 B only: check_scales)
-  const auto has = [](const nvfp4a_tensor *t, unsigned flag) { return (t->flags & flag) != 0; };
-  const int f = (has(A, NVFP4A_SCALES_SWIZZLED) ? kF_ASWZ : 0) | (has(A, NVFP4A_SCALES_UE5M3) ? kF_AUE : 0) |
-                (has(B, NVFP4A_SCALES_SWIZZLED) ? kF_BSWZ : 0) | (has(B, NVFP4A_SCALES_UE5M3) ? kF_BUE : 0);
-  e.alpha = alpha; e.beta = beta;
-  const nvfp4a_tensor *Cx = c_is_d ? D : C;
-  e.c = beta != 0.f ? Cx->data : nullptr; e.ldc = beta != 0.f ? (c_is_d ? ldd : ldc) : 0;
-  e.c_dtype = beta != 0.f ? Cx->dtype : NVFP4A_FP32;
-  e.d = D->data; e.ldd = ldd; e.d_dtype = D->dtype; e.amax = D->amax;
-  e.bias = bias && bias->data ? bias->data : nullptr; e.bias_dtype = bias ? bias->dtype : NVFP4A_FP32;
+  int f;
+  const Epilogue e = nvfp4a::make_epilogue(alpha, A, B, beta, C, ldc, D, ldd, bias, &f);
 
   const uint8_t *a = (const uint8_t *)A->data, *b = (const uint8_t *)B->data;
   const uint8_t *sa = (const uint8_t *)A->block_scale, *sb = (const uint8_t *)B->block_scale;
@@ -220,4 +247,156 @@ extern "C" nvfp4a_status nvfp4a_gemm_dual(int m, int n, int k, float alpha, cons
   if (nvfp4a_status st = half(A, trans_a, "A", &a, &lda)) return st;
   if (nvfp4a_status st = half(B, trans_b, "B", &b, &ldb)) return st;
   return nvfp4a_gemm(m, n, k, alpha, a, lda, b, ldb, beta, C, ldc, D, ldd, bias, stream);
+}
+
+// ---- tensor-core GEMM (src/tensors) -----------------------------------------------------------------------------
+// the record bytes of an image kind of dtype (0: no such image; A's images: GV, a group of 4 k-tiles of a slice)
+static int tc_record(int operand, nvfp4a_dtype dtype) {
+  using namespace nvfp4a::kern;
+  if (operand == NVFP4A_TC_A16 || operand == NVFP4A_TC_A8) return dtype == NVFP4A_NVFP4 ? tc::GV : 0;
+  if (operand != NVFP4A_TC_B) return 0;
+  return dtype == NVFP4A_NVFP4 ? tc::RB4 : dtype == NVFP4A_INT8 ? tc::RB8 : dtype == NVFP4A_BF16 ? tc::RBH : 0;
+}
+// whether the current device runs the tensor-core GEMM with B of dtype tb
+static nvfp4a_status tc_device(const char *fn, nvfp4a_dtype tb) {
+  using namespace nvfp4a;
+  if (nvfp4a_status st = check_device()) return st;
+  const kern::DeviceInfo &d = kern::device_info();
+  if (!d.tc || (tb == NVFP4A_BF16 && d.ptx < 80))
+    return fail(NVFP4A_NOT_SUPPORTED, "%s: no tensor-core path on this device (sm_75 .. sm_89; BF16 B sm_80+; NVFP4A_DP4A unset)", fn);
+  return NVFP4A_OK;
+}
+
+extern "C" size_t nvfp4a_tc_image_bytes(int operand, nvfp4a_dtype dtype, int rows, int k) {
+  const int rec = tc_record(operand, dtype);
+  if (!rec || rows < 0 || k < 0 || k % 64) return 0;
+  return operand == NVFP4A_TC_B ? nvfp4a::kern::tc_image_bytes(rows, k, rec) : nvfp4a::kern::tc_a_image_bytes(rows, k);
+}
+
+extern "C" nvfp4a_status nvfp4a_tc_image(int operand, const nvfp4a_tensor *src, int ld, int rows, int k, void *image,
+                                         cudaStream_t stream) {
+  using namespace nvfp4a;
+  using namespace nvfp4a::kern;
+  clear_error();
+  const auto aligned = [](const void *p, unsigned a) { return ((uintptr_t)p & (a - 1)) == 0; };
+  if (!src || !src->data || !image) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_tc_image: src, its data or image is NULL");
+  if (!tc_record(operand, src->dtype))
+    return fail(NVFP4A_NOT_SUPPORTED, "nvfp4a_tc_image: no image of kind %d with dtype %d (A16, A8: NVFP4; B: NVFP4, INT8, BF16)",
+                operand, (int)src->dtype);
+  if (rows < 0 || k < 0 || k % 64) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_tc_image: rows = %d, k = %d (k a multiple of 64)", rows, k);
+  if (rows == 0 || k == 0) return NVFP4A_OK;
+  if (ld % 64 || ld < k) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_tc_image: ld = %d (a multiple of 64, >= k = %d)", ld, k);
+  if (!aligned(src->data, 16) || !aligned(image, 16)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_tc_image: src and image must be 16-byte aligned");
+  int ldsc = 0;
+  if (src->dtype == NVFP4A_BF16) {
+    if (src->flags) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_tc_image: flags are for NVFP4 tensors");
+  } else {
+    const unsigned sa = src->dtype == NVFP4A_INT8 ? 16 : 4;
+    if (!src->block_scale) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_tc_image: NVFP4 / INT8 src without block_scale");
+    if (!aligned(src->block_scale, sa) || src->ld_scale % 4 || (src->ld_scale && src->ld_scale < k / 16))
+      return fail(NVFP4A_INVALID_VALUE, "nvfp4a_tc_image: block scales must be %u-byte aligned with ld_scale a multiple of 4 "
+                  "and >= k / 16 (ld_scale = %d)", sa, src->ld_scale);
+    if (nvfp4a_status st = check_scales("nvfp4a_tc_image", "src", src, rows, k, &ldsc)) return st;
+  }
+  // (an A16 image serves BF16 B: sm_80+)
+  if (nvfp4a_status st = tc_device("nvfp4a_tc_image", operand == NVFP4A_TC_B ? src->dtype : operand == NVFP4A_TC_A16 ? NVFP4A_BF16
+                                                                                                                   : NVFP4A_NVFP4))
+    return st;
+  const uint8_t *data = (const uint8_t *)src->data, *sc = (const uint8_t *)src->block_scale;
+  uint8_t *img = (uint8_t *)image;
+  const cudaError_t err = operand == NVFP4A_TC_B ? tc_image_b(src->dtype, data, ld, sc, ldsc, rows, k, img, stream)
+                                                 : tc_image_a(operand == NVFP4A_TC_A16, data, ld, sc, ldsc, rows, k, img, stream);
+  return cuda_status(err, "nvfp4a_tc_image: kernel launch");
+}
+
+extern "C" size_t nvfp4a_tc_workspace_bytes(void) { return nvfp4a::kern::tc_ws_bytes(nvfp4a::kern::device_info().sms); }
+
+extern "C" nvfp4a_status nvfp4a_gemm_tc(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, float beta,
+                                        const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias,
+                                        void *workspace, cudaStream_t stream) {
+  using namespace nvfp4a;
+  using namespace nvfp4a::kern;
+  clear_error();
+  const auto dense = [](const nvfp4a_tensor *t) { return t->dtype >= NVFP4A_BF16 && t->dtype <= NVFP4A_FP32; };
+  const auto aligned = [](const void *p, unsigned a) { return ((uintptr_t)p & (a - 1)) == 0; };
+  if (!A || !B || !D || !A->data || !B->data || !D->data || !workspace)
+    return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: A, B, D, their data or the workspace is NULL");
+  if (m < 0 || n < 0 || k < 0) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: negative size (m=%d n=%d k=%d)", m, n, k);
+  if (A->dtype != NVFP4A_NVFP4) return fail(NVFP4A_NOT_SUPPORTED, "nvfp4a_gemm_tc: A must be NVFP4 (dtype %d)", (int)A->dtype);
+  if (!tc_record(NVFP4A_TC_B, B->dtype))
+    return fail(NVFP4A_NOT_SUPPORTED, "nvfp4a_gemm_tc: B must be NVFP4, INT8 or BF16 (dtype %d)", (int)B->dtype);
+  if (!dense(D)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: D must be BF16, FP16 or FP32 (dtype %d)", (int)D->dtype);
+  if (m == 0 || n == 0) return NVFP4A_OK;
+  if (k % 64) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: k = %d is not a multiple of 64", k);
+  if (!aligned(A->data, 16) || !aligned(B->data, 16) || !aligned(workspace, 16))
+    return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: the images and the workspace must be 16-byte aligned");
+  for (const nvfp4a_tensor *t : {A, B}) {  // the flags and globals (the scales themselves are in the images)
+    const unsigned known = NVFP4A_SCALES_SWIZZLED | NVFP4A_SCALES_UE5M3 | NVFP4A_GLOBAL_AMAX | NVFP4A_GLOBAL_PER_ROW;
+    if (t->dtype != NVFP4A_NVFP4 && t->flags) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: flags are for NVFP4 tensors");
+    if (t->flags & ~known) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: unknown flags 0x%x", t->flags & ~known);
+    if (t->dtype == NVFP4A_NVFP4 && scale_max_of(t) == 0.f) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: scale_max = %d", t->scale_max);
+    if ((t->flags & NVFP4A_GLOBAL_PER_ROW) && !t->global_scale)
+      return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: per-row globals but no global_scale");
+  }
+  if (ldd < m) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: ldd = %d < m = %d", ldd, m);
+  if (bias && bias->data && !dense(bias)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: invalid bias dtype %d", (int)bias->dtype);
+  if (beta != 0.f && C && C->data && !dense(C)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: invalid C dtype %d", (int)C->dtype);
+  if (beta != 0.f && C && C->data && ldc < m) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemm_tc: ldc = %d < m = %d", ldc, m);
+  if (nvfp4a_status st = tc_device("nvfp4a_gemm_tc", B->dtype)) return st;
+  int f;
+  const Epilogue e = make_epilogue(alpha, A, B, beta, C, ldc, D, ldd, bias, &f);
+  const int fi = (f >> 1 & 1) | (f >> 2 & 2);  // kF_AUE, kF_BUE
+  const TcFn fn = B->dtype == NVFP4A_INT8 ? kTc8[fi & 1] : B->dtype == NVFP4A_NVFP4 ? kTc4[fi] : kTcH[fi & 1];
+  const cudaError_t err = fn((const uint8_t *)A->data, (const uint8_t *)B->data, m, n, k, e, (uint8_t *)workspace, stream);
+  return cuda_status(err, "nvfp4a_gemm_tc: kernel launch");
+}
+
+extern "C" nvfp4a_status nvfp4a_gemv_tc(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, int ldb,
+                                        float beta, const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd,
+                                        const nvfp4a_tensor *bias, cudaStream_t stream) {
+  using namespace nvfp4a;
+  using namespace nvfp4a::kern;
+  clear_error();
+  const auto dense = [](const nvfp4a_tensor *t) { return t->dtype >= NVFP4A_BF16 && t->dtype <= NVFP4A_FP32; };
+  const auto aligned = [](const void *p, unsigned a) { return ((uintptr_t)p & (a - 1)) == 0; };
+  if (!A || !B || !D || !A->data || !B->data || !D->data) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: A, B, D or their data is NULL");
+  if (m < 0 || k < 0 || n < 1 || n > 8) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: m = %d, n = %d, k = %d (1 <= n <= 8)", m, n, k);
+  if (A->dtype != NVFP4A_NVFP4) return fail(NVFP4A_NOT_SUPPORTED, "nvfp4a_gemv_tc: A must be NVFP4 (dtype %d)", (int)A->dtype);
+  if (!tc_record(NVFP4A_TC_B, B->dtype))
+    return fail(NVFP4A_NOT_SUPPORTED, "nvfp4a_gemv_tc: B must be NVFP4, INT8 or BF16 (dtype %d)", (int)B->dtype);
+  if (!dense(D)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: D must be BF16, FP16 or FP32 (dtype %d)", (int)D->dtype);
+  if (m == 0) return NVFP4A_OK;
+  if (k % 64) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: k = %d is not a multiple of 64", k);
+  if (ldb % 64 || ldb < k) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: ldb = %d (a multiple of 64, >= k = %d)", ldb, k);
+  if (!aligned(A->data, 16) || !aligned(B->data, 16)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: A's image and B must be 16-byte aligned");
+  const unsigned known = NVFP4A_SCALES_SWIZZLED | NVFP4A_SCALES_UE5M3 | NVFP4A_GLOBAL_AMAX | NVFP4A_GLOBAL_PER_ROW;
+  if (A->flags & ~known) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: unknown A flags 0x%x", A->flags & ~known);
+  if (scale_max_of(A) == 0.f) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: A has scale_max = %d", A->scale_max);
+  if ((A->flags & NVFP4A_GLOBAL_PER_ROW) && !A->global_scale) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: per-row globals but no global_scale");
+  int ldsb = 0;
+  if (B->dtype == NVFP4A_BF16) {
+    if (B->flags) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: flags are for NVFP4 tensors");
+  } else {
+    const unsigned sa = B->dtype == NVFP4A_INT8 ? 16 : 4;
+    if (!B->block_scale) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: NVFP4 / INT8 B without block_scale");
+    if (!aligned(B->block_scale, sa) || B->ld_scale % 4 || (B->ld_scale && B->ld_scale < k / 16))
+      return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: B's block scales must be %u-byte aligned with ld_scale a multiple of 4 "
+                  "and >= k / 16 (ld_scale = %d)", sa, B->ld_scale);
+    if (nvfp4a_status st = check_scales("nvfp4a_gemv_tc", "B", B, n, k, &ldsb)) return st;
+  }
+  if (ldd < m) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: ldd = %d < m = %d", ldd, m);
+  if (bias && bias->data && !dense(bias)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: invalid bias dtype %d", (int)bias->dtype);
+  if (beta != 0.f && C && C->data && !dense(C)) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: invalid C dtype %d", (int)C->dtype);
+  if (beta != 0.f && C && C->data && ldc < m) return fail(NVFP4A_INVALID_VALUE, "nvfp4a_gemv_tc: ldc = %d < m = %d", ldc, m);
+  if (nvfp4a_status st = tc_device("nvfp4a_gemv_tc", B->dtype)) return st;
+  int f;
+  const Epilogue e = make_epilogue(alpha, A, B, beta, C, ldc, D, ldd, bias, &f);
+  // NVFP4 x scales: swizzled, or linear -- a group's 4 k-tiles in one 16-byte load where every row's start is 16-byte
+  // aligned and k a multiple of 256 (no partial group)
+  const int xs = (f & kF_BSWZ) ? 1 : (ldsb % 16 == 0 && aligned(B->block_scale, 16) && k % 256 == 0) ? 2 : 0;
+  const GvFn fn = B->dtype == NVFP4A_INT8    ? kGv8[(f >> 1) & 1]
+                  : B->dtype == NVFP4A_NVFP4 ? kGv4[4 * xs + ((f >> 2) & 2) + ((f >> 1) & 1)]
+                                             : kGvH[(f >> 1) & 1];
+  const cudaError_t err = fn((const uint8_t *)A->data, (const uint8_t *)B->data, ldb, (const uint8_t *)B->block_scale, ldsb, m, n, k, e, stream);
+  return cuda_status(err, "nvfp4a_gemv_tc: kernel launch");
 }

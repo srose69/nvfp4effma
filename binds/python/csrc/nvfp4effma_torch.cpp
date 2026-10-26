@@ -12,6 +12,7 @@
 #include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <map>
 #include <optional>
 #include <string>
 #include <tuple>
@@ -287,7 +288,7 @@ Tensor swizzle_scales(const Tensor &scales, int64_t rows, int64_t cols, bool to_
 Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global, int64_t x_flags, int64_t x_smax,
               const Tensor &w, const Tensor &w_scales, const OptT &w_global, int64_t w_flags, int64_t w_smax, int64_t k,
               const OptT &bias, std::optional<at::ScalarType> out_dtype, OptT out, double alpha, double beta,
-              const OptT &amax_out) {
+              const OptT &amax_out, const OptT &w_img) {
   TORCH_CHECK_VALUE(w.is_cuda(), "weight must be a CUDA tensor, got a tensor on ", w.device());
   const at::Device dev = w.device();
   check_device(x, dev, "x");
@@ -344,7 +345,7 @@ Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global, int64
   }
   if (T == 0 || N == 0) return *out;
   const c10::cuda::CUDAGuard guard(dev);
-  const nvfp4a_tensor A = as_tensor(W);
+  nvfp4a_tensor A = as_tensor(W);
   const nvfp4a_tensor B = x_fp4 ? as_tensor(X)
                           : x_q8 ? nvfp4a_tensor{xd.data_ptr(), NVFP4A_INT8, X.scales.data_ptr(), X.ld_scale, nullptr, nullptr}
                                  : nvfp4a_tensor{xd.data_ptr(), dense_dtype(x.scalar_type(), "x"), nullptr, 0, nullptr, nullptr};
@@ -353,10 +354,124 @@ Tensor linear(const Tensor &x, const OptT &x_scales, const OptT &x_global, int64
   nvfp4a_tensor BIAS = {};
   if (bias) BIAS = {bias->data_ptr(), dense_dtype(bias->scalar_type(), "bias"), nullptr, 0, nullptr, nullptr};
   const int64_t ldd = T <= 1 ? N : out->stride(0);
+  if (w_img) {  // the tensor-core GEMV on the weight's image (nvfp4a_tc_image A16 for a BF16 x, A8 for INT8 / NVFP4)
+    check_device(*w_img, dev, "the weight image");
+    TORCH_CHECK_VALUE(T <= 8 && w_img->scalar_type() == at::kByte &&
+                      (size_t)w_img->numel() == nvfp4a_tc_image_bytes(NVFP4A_TC_A16, NVFP4A_NVFP4, as_int(N, "N"), (int)K),
+                      "the weight image does not match N = ", N, ", K = ", K, " (or x has more than 8 rows)");
+    A.data = w_img->data_ptr();
+    check_status(nvfp4a_gemv_tc(as_int(N, "N"), as_int(T, "T"), as_int(K, "K"), (float)alpha, &A, &B, ldx, (float)beta, nullptr, 0,
+                                &D, as_int(ldd, "ld(out)"), bias ? &BIAS : nullptr, at::cuda::getCurrentCUDAStream().stream()),
+                 "nvfp4a_gemv_tc");
+    return *out;
+  }
   check_status(nvfp4a_gemm(as_int(N, "N"), as_int(T, "T"), as_int(K, "K"), (float)alpha, &A, W.ld, &B, ldx, (float)beta,
                            nullptr, 0, &D, as_int(ldd, "ld(out)"), bias ? &BIAS : nullptr,
                            at::cuda::getCurrentCUDAStream().stream()),
                "nvfp4a_gemm");
+  return *out;
+}
+
+// Tensor-core image (nvfp4a_tc_image) of kind `operand` [rows, K]: 0 / 2 (A16 / A8: the weight, NVFP4 data with its
+// scales, for BF16 / INT8 and NVFP4 activations); 1 (B, the activations) NVFP4, INT8 (int8 with float32 scales
+// [rows, K / 16]) or BF16.  uint8 [bytes].
+Tensor tc_image(int64_t operand, const Tensor &x, const OptT &scales, int64_t flags, int64_t k) {
+  TORCH_CHECK_VALUE(x.is_cuda(), "x must be a CUDA tensor, got a tensor on ", x.device());
+  const at::Device dev = x.device();
+  check_gpu(dev);
+  TORCH_CHECK_VALUE(operand == NVFP4A_TC_A16 || operand == NVFP4A_TC_B || operand == NVFP4A_TC_A8,
+                    "operand must be 0 (A16), 1 (B) or 2 (A8), got ", operand);
+  TORCH_CHECK_VALUE(x.dim() == 2, "x must be 2-D, got shape ", x.sizes());
+  TORCH_CHECK_VALUE(k % 64 == 0, "the number of input features (", k, ") must be a multiple of 64 (pad with zeros)");
+  const int64_t rows = x.size(0);
+  nvfp4a_tensor src{};
+  Fp4 f{};
+  Tensor xd, xs;
+  int ld = 0;
+  if (x.scalar_type() == at::kByte) {
+    TORCH_CHECK_VALUE(scales.has_value(), "an NVFP4 x needs its scales");
+    f = fp4_operand(x, *scales, std::nullopt, flags & (NVFP4A_SCALES_SWIZZLED | NVFP4A_SCALES_UE5M3), 0, rows, k, dev, "x", 64, 4);
+    src = as_tensor(f);
+    ld = f.ld;
+  } else if (x.scalar_type() == at::kChar) {
+    TORCH_CHECK_VALUE(operand == NVFP4A_TC_B, "an INT8 operand is B");
+    TORCH_CHECK_VALUE(scales.has_value() && scales->scalar_type() == at::kFloat && scales->dim() == 2 && scales->size(0) == rows &&
+                      scales->size(1) == k / 16, "the scales of an int8 x must be float32 [", rows, ", ", k / 16, "]");
+    check_device(*scales, dev, "x scales");
+    xd = dense_2d(x, 64);
+    xs = scales->contiguous();
+    ld = (int)(rows <= 1 ? k : xd.stride(0));
+    src = nvfp4a_tensor{xd.data_ptr(), NVFP4A_INT8, xs.data_ptr(), (int)(k / 16), nullptr, nullptr};
+  } else {
+    TORCH_CHECK_TYPE(x.scalar_type() == at::kBFloat16, "a dense x must be torch.bfloat16 (W4A16 image), got ", x.scalar_type());
+    TORCH_CHECK_VALUE(operand == NVFP4A_TC_B, "a BF16 operand is B");
+    xd = dense_2d(x, 64);
+    ld = (int)(rows <= 1 ? k : xd.stride(0));
+    src = nvfp4a_tensor{xd.data_ptr(), NVFP4A_BF16, nullptr, 0, nullptr, nullptr};
+  }
+  TORCH_CHECK_VALUE(x.scalar_type() == at::kByte || x.size(1) == k, "x has ", x.size(1), " columns, k = ", k);
+  const c10::cuda::CUDAGuard guard(dev);
+  Tensor img = at::empty({(int64_t)nvfp4a_tc_image_bytes((int)operand, src.dtype, as_int(rows, "rows"), as_int(k, "K"))},
+                         x.options().dtype(at::kByte));
+  check_status(nvfp4a_tc_image((int)operand, &src, ld, (int)rows, (int)k, img.data_ptr(), at::cuda::getCurrentCUDAStream().stream()),
+               "nvfp4a_tc_image");
+  return img;
+}
+
+// nvfp4a_gemm_tc's workspace of the device and stream (zeroed once; every call leaves it zeroed)
+const Tensor &tc_workspace(const at::Device &dev, cudaStream_t s) {
+  static std::map<std::pair<int, cudaStream_t>, Tensor> ws;
+  Tensor &w = ws[{dev.index(), s}];
+  if (!w.defined()) w = at::zeros({(int64_t)nvfp4a_tc_workspace_bytes()}, at::TensorOptions().dtype(at::kByte).device(dev));
+  return w;
+}
+
+// out [T, N] = alpha * x @ W^T + bias + beta * out from the images of W ([N, K], NVFP4) and x ([T, K]; x_dtype 0
+// NVFP4, 1 INT8, 2 BF16), on tensor cores.
+Tensor linear_tc(const Tensor &x_img, int64_t x_dtype, const OptT &x_global, int64_t x_flags, int64_t x_smax, int64_t T,
+                 const Tensor &w_img, const OptT &w_global, int64_t w_flags, int64_t w_smax, int64_t N, int64_t K,
+                 const OptT &bias, at::ScalarType out_dtype, OptT out, double alpha, double beta, const OptT &amax_out) {
+  TORCH_CHECK_VALUE(w_img.is_cuda(), "the weight image must be a CUDA tensor");
+  const at::Device dev = w_img.device();
+  check_device(x_img, dev, "the x image");
+  TORCH_CHECK_VALUE(x_dtype >= 0 && x_dtype <= 2, "x_dtype must be 0 (NVFP4), 1 (INT8) or 2 (BF16)");
+  const nvfp4a_dtype xt = x_dtype == 0 ? NVFP4A_NVFP4 : x_dtype == 1 ? NVFP4A_INT8 : NVFP4A_BF16;
+  TORCH_CHECK_VALUE(x_img.scalar_type() == at::kByte && w_img.scalar_type() == at::kByte &&
+                    (size_t)x_img.numel() == nvfp4a_tc_image_bytes(NVFP4A_TC_B, xt, as_int(T, "T"), as_int(K, "K")) &&
+                    (size_t)w_img.numel() == nvfp4a_tc_image_bytes(NVFP4A_TC_A16, NVFP4A_NVFP4, as_int(N, "N"), (int)K),
+                    "the images do not match T = ", T, ", N = ", N, ", K = ", K);
+  const auto global = [&](const OptT &g, int64_t flags, int64_t rows, const char *what) -> const float * {
+    if (!g) return nullptr;
+    check_device(*g, dev, what);
+    TORCH_CHECK_TYPE(g->scalar_type() == at::kFloat && g->is_contiguous(), what, " must be a contiguous torch.float32");
+    TORCH_CHECK_VALUE(g->numel() == ((flags & NVFP4A_GLOBAL_PER_ROW) ? rows : 1), what, " has ", g->numel(), " elements");
+    return g->data_ptr<float>();
+  };
+  if (beta != 0.0) TORCH_CHECK_VALUE(out.has_value(), "beta != 0 accumulates into out, so out must be given");
+  if (out) {
+    check_device(*out, dev, "out");
+    TORCH_CHECK_VALUE(out->dim() == 2 && out->size(0) == T && out->size(1) == N && out->stride(1) == 1 && (T <= 1 || out->stride(0) >= N),
+                      "out must be a row-contiguous [", T, ", ", N, "], got ", out->sizes());
+  } else {
+    out = at::empty({T, N}, w_img.options().dtype(out_dtype));
+  }
+  if (bias) {
+    check_device(*bias, dev, "bias");
+    TORCH_CHECK_VALUE(bias->dim() == 1 && bias->size(0) == N && bias->stride(0) == 1, "bias must be a contiguous vector of length ", N);
+  }
+  if (T == 0 || N == 0) return *out;
+  const c10::cuda::CUDAGuard guard(dev);
+  const cudaStream_t s = at::cuda::getCurrentCUDAStream().stream();
+  const nvfp4a_tensor A{w_img.data_ptr(), NVFP4A_NVFP4, nullptr, 0, global(w_global, w_flags, N, "weight.global"), nullptr,
+                        (unsigned)w_flags, (int)w_smax};
+  const nvfp4a_tensor B{x_img.data_ptr(), xt, nullptr, 0, global(x_global, x_flags, T, "x.global"), nullptr,
+                        (unsigned)(x_dtype == 0 ? x_flags : 0), (int)x_smax};
+  const nvfp4a_tensor D{out->data_ptr(), dense_dtype(out->scalar_type(), "out"), nullptr, 0, nullptr, scalar_ptr(amax_out, dev, "amax_out")};
+  nvfp4a_tensor BIAS = {};
+  if (bias) BIAS = {bias->data_ptr(), dense_dtype(bias->scalar_type(), "bias"), nullptr, 0, nullptr, nullptr};
+  check_status(nvfp4a_gemm_tc((int)N, (int)T, (int)K, (float)alpha, &A, &B, (float)beta, nullptr, 0, &D, (int)(T <= 1 ? N : out->stride(0)),
+                              bias ? &BIAS : nullptr, tc_workspace(dev, s).data_ptr(), s),
+               "nvfp4a_gemm_tc");
   return *out;
 }
 
@@ -378,5 +493,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("linear", &linear, py::arg("x"), py::arg("x_scales"), py::arg("x_global"), py::arg("x_flags"), py::arg("x_smax"),
         py::arg("w"), py::arg("w_scales"), py::arg("w_global"), py::arg("w_flags"), py::arg("w_smax"), py::arg("k"),
         py::arg("bias") = py::none(), py::arg("out_dtype") = py::none(), py::arg("out") = py::none(),
-        py::arg("alpha") = 1.0, py::arg("beta") = 0.0, py::arg("amax_out") = py::none());
+        py::arg("alpha") = 1.0, py::arg("beta") = 0.0, py::arg("amax_out") = py::none(), py::arg("w_img") = py::none());
+  m.def("tc_image", &tc_image, py::arg("operand"), py::arg("x"), py::arg("scales"), py::arg("flags"), py::arg("k"));
+  m.def("linear_tc", &linear_tc, py::arg("x_img"), py::arg("x_dtype"), py::arg("x_global"), py::arg("x_flags"), py::arg("x_smax"),
+        py::arg("T"), py::arg("w_img"), py::arg("w_global"), py::arg("w_flags"), py::arg("w_smax"), py::arg("N"), py::arg("K"),
+        py::arg("bias") = py::none(), py::arg("out_dtype") = at::kBFloat16, py::arg("out") = py::none(), py::arg("alpha") = 1.0,
+        py::arg("beta") = 0.0, py::arg("amax_out") = py::none());
 }

@@ -6,7 +6,7 @@
 
 ![CUDA](https://img.shields.io/badge/CUDA-12.0%2B-76B900?logo=nvidia)
 ![Targets](https://img.shields.io/badge/targets-sm__50%E2%80%93sm__90-blue)
-![Tested](https://img.shields.io/badge/tested%20on-GTX%201080-orange)
+![Tested](https://img.shields.io/badge/tested%20on-GTX%201080%20%7C%20L40S-orange)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-EE4C2C?logo=pytorch)
 ![API](https://img.shields.io/badge/API-C%20%2F%20cuBLAS--style-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0%20%2B%20linking%20exception-blue)
@@ -33,13 +33,11 @@ For FP8 on the same GPUs, see the sibling libraries [E4M3EffMA](https://github.c
 and [E5M2EffMA](https://github.com/srose69/e5m2effma); they can be used together with this one.
 
 > [!IMPORTANT]
-> **Tested and tuned by the author on a GTX 1080 only.** The author has no GPU newer than Pascal;
-> everything else is up to the community, or to time. The code path of GPUs without DP4A (Maxwell, Tesla
-> P100) is tested on the GTX 1080 by running SASS built for sm_60. The library compiles for every
-> architecture from sm_50 to sm_90, but it does **not** use Tensor Cores (Turing's INT8 / INT4 `mma` would
-> suit this format very well), `cp.async`, `ldmatrix`, or any other Volta/Turing/Ampere-specific feature,
-> although it could and should on those GPUs. Contributions are very welcome — and so is hardware, which
-> is honestly the better way to get those kernels written :)  See [Contributing](#contributing).
+> **Tested by the author on a GTX 1080 (DP4A / FFMA paths, tuned) and an L40S (tensor-core paths).** The code
+> path of GPUs without DP4A (Maxwell, Tesla P100) is tested on the GTX 1080 by running SASS built for sm_60;
+> the Turing variant of the tensor-core kernels (sm_75: no `cp.async`, no mbarriers) on the L40S from its
+> PTX. Other GPUs are up to the community. Contributions are very welcome — and so is hardware :)  See
+> [Contributing](#contributing).
 
 ## Performance at a glance
 
@@ -91,11 +89,15 @@ methodology and how to add your GPU: [docs/performance.md](docs/performance.md).
 - **Mixed operands.** NVFP4 weights × BF16, FP16, FP32 (W4A16), INT8 (W4A8) or NVFP4 (W4A4) activations.
 - **GEMV path for decoding and small batches**, picked automatically, reading each weight byte once per 8
   columns.
+- **Tensor-core GEMM and GEMV for sm_75 … sm_89** (`nvfp4a_gemm_tc`, `nvfp4a_gemv_tc`; Python `TCWeight`): the
+  same exact block sums on INT8 `mma` (W4A8, W4A4), BF16 `mma` with exactly scaled weights (W4A16, sm_80+),
+  `cp.async` / `ldmatrix` / mbarrier pipelines, persistent stream-K. The weight is rearranged once into an image
+  that serves both; the GEMV streams it from DRAM once, in 16-byte loads.
 - **Every NVIDIA NVFP4 variant** in GEMM, GEMV, quantization and dequantization, with Transformer Engine's
   arithmetic bit for bit (see [NVIDIA NVFP4 variants](#nvidia-nvfp4-variants)); scale layout conversion
   (linear ↔ GEMM-swizzled) and the transpose of 16 × 16-tiled tensors.
 - **PyTorch bindings**: functional API (`quantize`, `quantize_int8`, `dequantize`, `linear` with
-  `act="auto" / "exact" / "int8" / "nvfp4"`), `NVFP4Tensor`, `Int8Tensor`, and `NVFP4Linear` with
+  `act="auto" / "exact" / "int8" / "nvfp4"`), `NVFP4Tensor`, `Int8Tensor`, `TCWeight`, and `NVFP4Linear` with
   `quantize_linear_`, which swaps the `nn.Linear` layers of a model; `get_include()` for CUDA extensions
   that build on the device-side codecs.
 - **Strict input checking** with readable errors in C (`nvfp4a_last_error`) and Python (`TypeError` /
@@ -133,8 +135,11 @@ swizzled=True, ...)`, `NVFP4Tensor.from_te`).
 | Pascal (GTX 10xx, Tesla P4/P40) | sm_61, sm_62 | ✅ tested and tuned by the author (GTX 1080, sm_61) |
 | Pascal (Tesla P100) | sm_60 | ✅ its code path (no DP4A) tested on the GTX 1080 (`make test-sm60`) |
 | Maxwell | sm_50, sm_52, sm_53 | ⚙️ compiles, untested (same code path as sm_60) |
-| Volta / Turing | sm_70, sm_72, sm_75 | ⚙️ compiles, untested, no Tensor Core path yet |
-| Ampere / Orin, Ada, Hopper | sm_80, sm_86, sm_87, sm_89, sm_90 | ⚙️ compiles, untested, no Tensor Core / `cp.async` path yet |
+| Volta | sm_70, sm_72 | ⚙️ compiles, untested |
+| Turing | sm_75 | ⚙️ compiles; its tensor-core path (W4A8, W4A4) tested from PTX on the L40S |
+| Ampere / Orin | sm_80, sm_86, sm_87 | ⚙️ compiles, untested; tensor-core paths as on Ada |
+| Ada | sm_89 | ✅ tensor-core paths tested (L40S) |
+| Hopper | sm_90 | ⚙️ compiles, untested, no tensor-core path (DP4A / FFMA) |
 | Blackwell | sm_100+ | ❌ excluded on purpose — native FP4, use cuBLASLt / TE |
 
 ## Installation
@@ -178,6 +183,9 @@ y = nf.linear(nf.quantize(x), q)                    # W4A4
 w2 = nf.dequantize(q, torch.float32)
 # t = nf.NVFP4Tensor.from_te(te_tensor)             # a Transformer Engine NVFP4 tensor, as it is
 
+tw = nf.TCWeight(q, "exact")                        # tensor cores (sm_75 .. sm_89): the weight's image, built once
+y = nf.linear(x, tw)                                # GEMV up to 8 rows, GEMM beyond; W4A16 ("int8" / "nvfp4": W4A8 / W4A4)
+
 mlp = torch.nn.Sequential(torch.nn.Linear(4096, 11008), torch.nn.SiLU(),
                           torch.nn.Linear(11008, 4096)).cuda().bfloat16()
 nf.quantize_linear_(mlp)                            # nn.Linear -> NVFP4Linear (act="auto")
@@ -202,7 +210,8 @@ nvfp4a_status st = nvfp4a_gemm(out, batch, in, 1.0f, &W, in, &X, in,
 if (st != NVFP4A_OK) fprintf(stderr, "%s\n", nvfp4a_last_error());   // e.g. "k = 96 is not a multiple of 64"
 ```
 
-Full API, constraints and more examples: [docs/c-api.md](docs/c-api.md).
+On tensor cores (sm_75 … sm_89) the weight goes through `nvfp4a_tc_image` once and `nvfp4a_gemm_tc` /
+`nvfp4a_gemv_tc` read its image. Full API, constraints and more examples: [docs/c-api.md](docs/c-api.md).
 
 **Together with E4M3EffMA / E5M2EffMA**
 
@@ -266,9 +275,10 @@ cc app.c $(pkg-config --cflags --libs nvfp4effma e4m3effma)    # both static lib
 Things that would make the library much faster on newer GPUs, none of which can be tested here, and the
 next steps:
 
-- [ ] **Tensor Core path for sm_75+.** Twice an E2M1 value is an exact int8, so INT8 `mma.sync` with int32
-      accumulation computes the same exact block sums as DP4A (W4A4, W4A8), on Tensor Cores.
-- [ ] **`cp.async` + multi-stage pipelines for sm_80+**, and `ldmatrix` for operand fetch.
+- [x] **Tensor Core path for sm_75 … sm_89** (W4A4, W4A8 on INT8 `mma`; W4A16 on BF16 `mma`), GEMM and GEMV.
+- [x] **`cp.async` + multi-stage pipelines for sm_80+**, and `ldmatrix` for operand fetch.
+- [ ] **Tensor-core paths in `nvfp4a_gemm` / `nf.linear` on a plain `NVFP4Tensor`** (today: through the images,
+      `nvfp4a_gemm_tc` / `TCWeight`), and Hopper (sm_90).
 - [ ] **A direct Hugging Face / ModelOpt checkpoint loader into `NVFP4Linear`.** The formats are supported
       (`NVFP4Tensor` takes `weight`, `weight_scale`, `weight_scale_2` as they are, `from_te` wraps
       Transformer Engine tensors); what is missing is the loader plumbing.

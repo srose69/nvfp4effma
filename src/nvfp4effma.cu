@@ -46,7 +46,10 @@ const DeviceInfo &device_info() {
     const bool loads = cudaFuncGetAttributes(&fa, probe_kernel) == cudaSuccess;
     if (!loads) cudaGetLastError();  // "no kernel image" is reported by check_device, not left sticky
     d.sass = loads ? fa.binaryVersion : 0;
+    d.ptx = loads ? fa.ptxVersion : 0;
     d.supported = loads && d.cc >= 50 && d.cc < 100;
+    const char *dp4a = getenv("NVFP4A_DP4A");
+    d.tc = loads && d.ptx >= 75 && d.ptx <= 89 && !(dp4a && dp4a[0] == '1');
     d.table = &kTables[loads && d.sass == d.cc ? table_index(d.cc) : 0];
   }
   return d;

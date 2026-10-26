@@ -357,10 +357,12 @@ constexpr bool gemv_selected(int cc, int id, int xt, int nb) {
 #define NVFP4A_ARCH_CC 0
 #endif
 
-// Host: the current device's SM count and table (src/nvfp4effma.cu).  sass = the SASS version the device
-// runs (it decides the NVFP4 x NVFP4 path: DP4A from 61).  supported = false when the device has native
-// FP4 (sm_100+), predates sm_50, or the library carries no SASS that runs on it.
-struct DeviceInfo { int cc, sass, sms; bool supported; const ArchTable *table; };
+// Host: the current device's SM count and table (src/nvfp4effma.cu).  sass = the SASS version the device runs
+// (DP4A from 61), ptx = the PTX version its code was built from: it decides the tensor-core paths, from 75 to 89 (tc;
+// W4A16 from 80; NVFP4A_DP4A=1 in the environment turns them off) -- the same as sass for SASS builds, and right for
+// PTX JIT-compiled for a newer GPU.  supported = false when the device has native FP4 (sm_100+), predates sm_50, or
+// the library carries no SASS that runs on it.
+struct DeviceInfo { int cc, sass, ptx, sms; bool supported, tc; const ArchTable *table; };
 const DeviceInfo &device_info();
 
 }  // namespace kern

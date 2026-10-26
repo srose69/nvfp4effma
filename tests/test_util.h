@@ -147,6 +147,15 @@ static void set_formats(Case &c, int f, int v) {
 }
 
 // Runs nvfp4a_gemm on random data and compares D and amax bit for bit with the host emulation.
+// nvfp4a_gemm_tc (B NVFP4, INT8, BF16) is tried on every case; NVFP4A_NOT_SUPPORTED from the library (no tensor-core
+// path for this B on this device or build) is reported, not failed.  Its FP32 sums are the tensor cores' (order and
+// rounding inside the mma) and stream-K's (a tile's parts summed), so its outputs are checked against a float64
+// reference within the bound of an FP32 accumulation over k plus the output's rounding instead of bit for bit.
+static bool tc_dtype(nvfp4a_dtype bt) { return bt == NVFP4A_NVFP4 || bt == NVFP4A_INT8 || bt == NVFP4A_BF16; }
+// relative half-ulp of an output dtype (and its smallest normal step, as an absolute floor)
+static double out_rel(nvfp4a_dtype t) { return t == NVFP4A_BF16 ? 0x1p-8 : t == NVFP4A_FP16 ? 0x1p-11 : 0x1p-24; }
+static double out_abs(nvfp4a_dtype t) { return t == NVFP4A_FP16 ? 0x1p-24 : t == NVFP4A_BF16 ? 0x1p-133 : 0x1p-149; }
+
 static int run_case(const Case &c) {
   const bool fp4b = c.bt == NVFP4A_NVFP4, q8b = c.bt == NVFP4A_INT8, blk = fp4b || q8b;
   const bool gemv = c.n <= nvfp4a::kern::kGemvMaxN[c.bt];
@@ -179,6 +188,42 @@ static int run_case(const Case &c) {
   std::vector<uint8_t> got(hD.size()); float gamax;
   cudaMemcpy(got.data(), dD, got.size(), cudaMemcpyDeviceToHost); cudaMemcpy(&gamax, damax, 4, cudaMemcpyDeviceToHost);
 
+  // the same product through nvfp4a_gemm_tc: images of A and B, the (once zeroed) workspace, D from its initial values
+  bool tc = tc_dtype(c.bt);
+  nvfp4a_status st2 = NVFP4A_OK;
+  std::vector<uint8_t> got2, got3;  // nvfp4a_gemm_tc, nvfp4a_gemv_tc (n <= 8: A's image, B as it is)
+  float gamax2 = 0.f, gamax3 = 0.f;
+  const bool gv = c.n <= 8;
+  if (tc) {
+    static void *ws = nullptr;
+    if (!ws) { cudaMalloc(&ws, nvfp4a_tc_workspace_bytes()); cudaMemset(ws, 0, nvfp4a_tc_workspace_bytes()); }
+    void *ia, *ib;
+    const int ka = c.bt == NVFP4A_BF16 ? NVFP4A_TC_A16 : NVFP4A_TC_A8;  // A's image kind for B's dtype (GEMM and GEMV)
+    cudaMalloc(&ia, nvfp4a_tc_image_bytes(ka, NVFP4A_NVFP4, c.m, c.k) + 16);
+    cudaMalloc(&ib, nvfp4a_tc_image_bytes(NVFP4A_TC_B, c.bt, c.n, c.k) + 16);
+    uint8_t *dD2 = dev(hD); float *damax2 = devf(0.f);
+    st2 = nvfp4a_tc_image(ka, &A, lda, c.m, c.k, ia, 0);
+    if (st2 == NVFP4A_OK) st2 = nvfp4a_tc_image(NVFP4A_TC_B, &B, ldb, c.n, c.k, ib, 0);
+    nvfp4a_tensor Ai = A, Bi = B, D2 = {dD2, c.dt, nullptr, 0, nullptr, damax2};
+    Ai.data = ia; Bi.data = ib;
+    if (st2 == NVFP4A_OK)
+      st2 = nvfp4a_gemm_tc(c.m, c.n, c.k, c.alpha, &Ai, &Bi, c.beta, c.ct >= 0 ? &C : nullptr, ldc, &D2, ldd, c.bias >= 0 ? &bias : nullptr,
+                           ws, 0);
+    if (cudaError_t e2 = cudaDeviceSynchronize()) ce = e2;
+    got2.resize(hD.size());
+    cudaMemcpy(got2.data(), dD2, got2.size(), cudaMemcpyDeviceToHost); cudaMemcpy(&gamax2, damax2, 4, cudaMemcpyDeviceToHost);
+    if (gv && st2 == NVFP4A_OK) {  // the GEMV on the same image of A, B as it is
+      cudaMemcpy(dD2, hD.data(), hD.size(), cudaMemcpyHostToDevice); cudaMemset(damax2, 0, 4);
+      st2 = nvfp4a_gemv_tc(c.m, c.n, c.k, c.alpha, &Ai, &B, ldb, c.beta, c.ct >= 0 ? &C : nullptr, ldc, &D2, ldd,
+                           c.bias >= 0 ? &bias : nullptr, 0);
+      if (cudaError_t e2 = cudaDeviceSynchronize()) ce = e2;
+      got3.resize(hD.size());
+      cudaMemcpy(got3.data(), dD2, got3.size(), cudaMemcpyDeviceToHost); cudaMemcpy(&gamax3, damax2, 4, cudaMemcpyDeviceToHost);
+    }
+    for (void *q : {ia, ib, (void *)dD2, (void *)damax2}) cudaFree(q);
+    if (st2 == NVFP4A_NOT_SUPPORTED) { printf("   nvfp4a_gemm_tc: %s\n", nvfp4a_last_error()); tc = false; st2 = NVFP4A_OK; }
+  }
+
   auto Bval = [&](int j, int kk) { return fp4b ? hBq.val(j, kk) : hload(c.bt, hB.data(), (size_t)j * ldb + kk); };
   // NVFP4 / INT8 B: the exact integer block sum and the two scale steps
   auto block = [&](int i, int j, int kb, float acc) {
@@ -194,8 +239,9 @@ static int run_case(const Case &c) {
   auto scale_ij = [&](int i, int j) {
     return ((c.alpha * hA.global(i)) * (fp4b ? hBq.global(j) : q8b ? hB8.g : 1.f)) * gf;
   };
-  std::vector<uint8_t> exp = hD;
+  std::vector<uint8_t> exp = hD, exp2, exp3;
   float eamax = 0.f;
+  double worst = 0., worst3 = 0.;  // tc: the largest |got2 / got3 - reference| / bound
   for (int j = 0; j < c.n; ++j)
     for (int i = 0; i < c.m; ++i) {
       float acc = 0.f;
@@ -229,16 +275,45 @@ static int run_case(const Case &c) {
       if (c.beta != 0.f) v = fmaf(c.beta, hload(ct, hC.data(), (size_t)j * ldc + i), v);
       eamax = fmaxf(eamax, fabsf(v));
       hstore(c.dt, exp.data(), (size_t)j * ldd + i, v);
+      if (tc) {  // float64 reference; bound: FP32 accumulation of k terms, the epilogue's FP32 steps, the output rounding
+        double r = 0., a = 0.;
+        for (int kk = 0; kk < c.k; ++kk) {
+          const double t = (double)hA.val(i, kk) * (q8b ? hB8.q(j, kk) * (double)hB8.scale(j, kk) : (double)Bval(j, kk));
+          r += t; a += fabs(t);
+        }
+        const double s = scale_ij(i, j), bias = c.bias >= 0 ? hload((nvfp4a_dtype)c.bias, hbias.data(), i) : 0.;
+        const double cv = c.beta != 0.f ? c.beta * (double)hload(ct, hC.data(), (size_t)j * ldc + i) : 0.;
+        const double v64 = r * s + bias + cv;
+        const double bound = (c.k + 2) * 0x1p-24 * a * fabs(s) + 4 * 0x1p-24 * (fabs(r * s) + fabs(bias) + fabs(cv)) +
+                             out_rel(c.dt) * fabs(v64) + out_abs(c.dt);
+        if (exp2.empty()) exp2 = hD;  // (the padding stays as it was)
+        const float g = hload(c.dt, got2.data(), (size_t)j * ldd + i);
+        worst = fmax(worst, fabs(g - v64) / bound);
+        hstore(c.dt, exp2.data(), (size_t)j * ldd + i, fabs(g - v64) <= bound ? g : (float)v64);
+        if (!got3.empty()) {
+          if (exp3.empty()) exp3 = hD;
+          const float g3 = hload(c.dt, got3.data(), (size_t)j * ldd + i);
+          worst3 = fmax(worst3, fabs(g3 - v64) / bound);
+          hstore(c.dt, exp3.data(), (size_t)j * ldd + i, fabs(g3 - v64) <= bound ? g3 : (float)v64);
+        }
+      }
     }
-  size_t bad = 0;
+  size_t bad = 0, bad2 = 0, bad3 = 0;
   for (size_t i = 0; i < exp.size(); ++i) bad += exp[i] != got[i];
-  const bool amax_ok = gamax == eamax;
-  const int fail = st != NVFP4A_OK || ce != cudaSuccess || bad || !amax_ok;
+  if (tc && !exp2.empty()) for (size_t i = 0; i < exp2.size(); ++i) bad2 += exp2[i] != got2[i];
+  if (tc && !exp3.empty()) for (size_t i = 0; i < exp3.size(); ++i) bad3 += exp3[i] != got3[i];
+  const bool amax_ok = gamax == eamax, amax2_ok = !tc || fabs(gamax2 - eamax) <= 0x1p-7 * eamax;
+  const bool amax3_ok = !tc || got3.empty() || fabs(gamax3 - eamax) <= 0x1p-7 * eamax;
+  const int fail = st != NVFP4A_OK || st2 != NVFP4A_OK || ce != cudaSuccess || bad || bad2 || bad3 || !amax_ok || !amax2_ok || !amax3_ok;
   printf("%s m=%4d n=%4d k=%5d B=%-5s D=%s C=%-5s bias=%-4s a=%.2f b=%5.2f fa=%x/%d fb=%x/%d : %s%s\n", gemv ? "gemv" : "gemm",
          c.m, c.n, c.k, DN[c.bt], DN[c.dt], c.ct >= 0 ? DN[c.ct] : "accum", c.bias >= 0 ? DN[c.bias] : "-", c.alpha, c.beta,
          c.fa, c.ma, c.fb, c.mb, fail ? "FAIL" : "ok", amax_ok ? "" : " (amax mismatch)");
   if (bad) printf("   %zu bytes differ\n", bad);
+  if (tc) printf("   nvfp4a_gemm_tc: max |error| / bound = %.3f%s%s\n", worst, bad2 ? " (out of bound)" : "", amax2_ok ? "" : " (amax mismatch)");
+  if (tc && !got3.empty())
+    printf("   nvfp4a_gemv_tc: max |error| / bound = %.3f%s%s\n", worst3, bad3 ? " (out of bound)" : "", amax3_ok ? "" : " (amax mismatch)");
   if (st != NVFP4A_OK) printf("   status %s: %s\n", nvfp4a_status_string(st), nvfp4a_last_error());
+  if (st2 != NVFP4A_OK) printf("   nvfp4a_gemm_tc status %s: %s\n", nvfp4a_status_string(st2), nvfp4a_last_error());
   if (ce) printf("   cuda %s\n", cudaGetErrorString(ce));
   for (void *p : {(void *)dA, (void *)dSA, (void *)dB, (void *)dSB, (void *)dC, (void *)dD, (void *)dbias, (void *)dga,
                   (void *)dgb, (void *)damax})

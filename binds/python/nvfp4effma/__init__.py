@@ -16,16 +16,17 @@ Every call checks its arguments and raises ``TypeError`` (dtype), ``ValueError``
 multiple of 64, overlapping output), ``NotImplementedError`` (GPU with native FP4, or older than sm_50)
 or ``RuntimeError`` (library / CUDA failure) instead of running on bad input.
 """
+import math
 import os
 from typing import List, Optional, Union
 
 import torch
 
 from . import _C
-from .tensor import Int8Tensor, NVFP4Linear, NVFP4Tensor, quantize_linear_
+from .tensor import Int8Tensor, NVFP4Linear, NVFP4Tensor, TCWeight, quantize_linear_
 
 __version__ = _C.__version__
-__all__ = ["quantize", "quantize_int8", "dequantize", "linear", "NVFP4Tensor", "Int8Tensor", "NVFP4Linear",
+__all__ = ["quantize", "quantize_int8", "dequantize", "linear", "NVFP4Tensor", "Int8Tensor", "NVFP4Linear", "TCWeight",
            "quantize_linear_", "get_include", "__version__"]
 
 # act="auto": up to this many rows of x the exact W4A16 path runs (bandwidth-bound: as fast as W4A8 there);
@@ -161,6 +162,8 @@ def linear(x: Union[torch.Tensor, NVFP4Tensor, Int8Tensor], weight: NVFP4Tensor,
       ``Int8Tensor``, else bfloat16); ``beta != 0`` accumulates into ``out``, which must then be given
       ``[T, N]``; ``amax_out`` (float32 ``[1]``) gets max |result|.
     """
+    if isinstance(weight, TCWeight):
+        return _linear_tc(x, weight, bias, act, out_dtype, out, alpha, beta, amax_out)
     if not isinstance(weight, NVFP4Tensor):
         raise TypeError(f"weight must be an NVFP4Tensor, got {type(weight).__name__}")
     if weight.dim() != 2:
@@ -203,3 +206,53 @@ def linear(x: Union[torch.Tensor, NVFP4Tensor, Int8Tensor], weight: NVFP4Tensor,
     else:
         y = _C.linear(x2, None, None, 0, 0, wd, ws, wg, wf, wm, K, bias, out_dtype, o2, alpha, beta, amax_out)
     return out if out is not None else y.reshape(*x.shape[:-1], N)
+
+
+def _linear_tc(x, weight, bias, act, out_dtype, out, alpha, beta, amax_out):
+    """``linear`` with a ``TCWeight``: from its image the tensor-core GEMV up to 8 rows of ``x``, the GEMM beyond.
+    The image fixes the activations: bfloat16 ``x`` (``weight.act`` ``"exact"``, W4A16), or int8 / NVFP4 (``"int8"``
+    / ``"nvfp4"``: a dense ``x`` quantized by ``act``, ``"auto"`` taking the weight's; an ``Int8Tensor`` / ``NVFP4Tensor``
+    as it is)."""
+    N, K = weight.shape
+    if act == "auto":
+        act = weight.act
+    if act not in ("exact", "int8", "nvfp4"):
+        raise ValueError(f"act must be 'auto', 'exact', 'int8' or 'nvfp4', got {act!r}")
+    if isinstance(x, torch.Tensor):
+        if (act == "exact") != (weight.act == "exact"):
+            raise ValueError(f"act {act!r} does not match the weight's image ({weight.act!r})")
+        if act == "exact" and x.dtype != torch.bfloat16:
+            raise TypeError(f"the exact tensor-core path (W4A16) takes a bfloat16 x, got {x.dtype}")
+        od = out_dtype or (out.dtype if out is not None else x.dtype)
+        lead = tuple(x.shape[:-1])
+        x2 = x.reshape(-1, K)
+        x = quantize_int8(x2) if act == "int8" else quantize(x2) if act == "nvfp4" else x2
+    else:
+        if weight.act == "exact":
+            raise ValueError("an Int8Tensor / NVFP4Tensor x needs a weight image for int8 / nvfp4")
+        od = out_dtype or (out.dtype if out is not None else x.dtype if isinstance(x, Int8Tensor) else torch.bfloat16)
+        lead = tuple(x.shape[:-1])
+    rows = x.rows if isinstance(x, NVFP4Tensor) else math.prod(x.shape[:-1])
+    wd, ws, wg, wf, wm, _ = weight.weight._flat()
+    o2 = out.reshape(-1, N) if out is not None else None
+    if rows <= 8:  # the GEMV: x as it is
+        if isinstance(x, NVFP4Tensor):
+            xd, xs, xg, xf, xm, _ = x._flat()
+            y = _C.linear(xd, xs.view(torch.uint8), xg, xf, xm, wd, ws, wg, wf, wm, K, bias, od, o2, alpha, beta, amax_out,
+                          weight.image)
+        elif isinstance(x, Int8Tensor):
+            y = _C.linear(x.data.reshape(-1, K), x.scales.reshape(-1, K // 16), None, 0, 0, wd, ws, wg, wf, wm, K, bias, od,
+                          o2, alpha, beta, amax_out, weight.image)
+        else:
+            y = _C.linear(x, None, None, 0, 0, wd, ws, wg, wf, wm, K, bias, od, o2, alpha, beta, amax_out, weight.image)
+    elif isinstance(x, NVFP4Tensor):
+        xd, xs, xg, xf, xm, _ = x._flat()
+        img = _C.tc_image(1, xd, xs.view(torch.uint8), xf, K)
+        y = _C.linear_tc(img, 0, xg, xf, xm, rows, weight.image, wg, wf, wm, N, K, bias, od, o2, alpha, beta, amax_out)
+    elif isinstance(x, Int8Tensor):
+        img = _C.tc_image(1, x.data.reshape(-1, K), x.scales.reshape(-1, K // 16), 0, K)
+        y = _C.linear_tc(img, 1, None, 0, 0, rows, weight.image, wg, wf, wm, N, K, bias, od, o2, alpha, beta, amax_out)
+    else:
+        img = _C.tc_image(1, x, None, 0, K)
+        y = _C.linear_tc(img, 2, None, 0, 0, rows, weight.image, wg, wf, wm, N, K, bias, od, o2, alpha, beta, amax_out)
+    return out if out is not None else y.reshape(*lead, N)

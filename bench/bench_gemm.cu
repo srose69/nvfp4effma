@@ -60,6 +60,42 @@ int main(int argc, char **argv) {
     gemm(name, X, D, 0.f);
   }
   gemm("nvfp4a_gemm NVFP4 x NVFP4, FP32 D += (accumulate)", B, F, 1.f);
+
+  // nvfp4a_gemm_tc (tensor cores, sm_75 .. sm_89): the images built once (an activation image's cost on its own row),
+  // the GEMM timed alone; B NVFP4 (W4A4), INT8 (W4A8), BF16 (W4A16)
+  {
+    void *ws = nullptr, *ia16 = nullptr, *ia8 = nullptr, *ib = nullptr, *q8 = nullptr, *s8 = nullptr;
+    cudaMalloc(&ws, nvfp4a_tc_workspace_bytes()); cudaMemset(ws, 0, nvfp4a_tc_workspace_bytes());
+    cudaMalloc(&ia16, nvfp4a_tc_image_bytes(NVFP4A_TC_A16, NVFP4A_NVFP4, M, K));
+    cudaMalloc(&ia8, nvfp4a_tc_image_bytes(NVFP4A_TC_A8, NVFP4A_NVFP4, M, K));
+    cudaMalloc(&ib, nvfp4a_tc_image_bytes(NVFP4A_TC_B, NVFP4A_BF16, N, K));  // (the largest B image)
+    cudaMalloc(&q8, (size_t)N * K); cudaMalloc(&s8, (size_t)N * K / 16 * 4);
+    std::vector<signed char> hq((size_t)N * K); for (auto &x : hq) x = (signed char)(rnd() % 255 - 127);
+    std::vector<float> hsq((size_t)N * K / 16, 0.01f);
+    cudaMemcpy(q8, hq.data(), hq.size(), cudaMemcpyHostToDevice); cudaMemcpy(s8, hsq.data(), hsq.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemset(dX, 0x3c, (size_t)K * N * 2);
+    if (nvfp4a_tc_image(NVFP4A_TC_A16, &A, K, M, K, ia16, 0) == NVFP4A_OK && nvfp4a_tc_image(NVFP4A_TC_A8, &A, K, M, K, ia8, 0) == NVFP4A_OK) {
+      const nvfp4a_tensor B8 = {q8, NVFP4A_INT8, s8, 0, nullptr, nullptr}, X = {dX, NVFP4A_BF16, nullptr, 0, nullptr, nullptr};
+      const struct { const char *name, *image; const nvfp4a_tensor *b; } kinds[] = {
+          {"nvfp4a_gemm_tc NVFP4 x NVFP4 -> BF16 (W4A4)", "nvfp4a_tc_image B NVFP4", &B},
+          {"nvfp4a_gemm_tc NVFP4 x INT8 -> BF16 (W4A8)", "nvfp4a_tc_image B INT8", &B8},
+          {"nvfp4a_gemm_tc NVFP4 x BF16 -> BF16 (W4A16)", "nvfp4a_tc_image B BF16", &X}};
+      for (const auto &kd : kinds) {
+        nvfp4a_tensor Ai = A;
+        Ai.data = kd.b->dtype == NVFP4A_BF16 ? ia16 : ia8;  // A's image of the B dtype's kind
+        nvfp4a_tensor Bi = *kd.b;
+        Bi.data = ib;
+        nvfp4a_status st = nvfp4a_tc_image(NVFP4A_TC_B, kd.b, K, N, K, ib, 0);
+        if (st == NVFP4A_OK)
+          row(kd.name, bench.run([&] { st = nvfp4a_gemm_tc(M, N, K, 1.f, &Ai, &Bi, 0.f, nullptr, 0, &D, M, nullptr, ws, 0); }, 20));
+        const BenchRow x = bench.run([&] { nvfp4a_tc_image(NVFP4A_TC_B, kd.b, K, N, K, ib, 0); }, 20);
+        printf("%-50s %6.3f ms%s\n", kd.image, x.ms, st == NVFP4A_OK ? "" : " (FAILED)");
+      }
+    } else {
+      printf("nvfp4a_gemm_tc: %s\n", nvfp4a_last_error());
+    }
+    for (void *p : {ws, ia16, ia8, ib, q8, s8}) cudaFree(p);
+  }
   float *fA, *fB, *fC; cudaMalloc(&fA, (size_t)M * K * 4); cudaMalloc(&fB, (size_t)K * N * 4); cudaMalloc(&fC, (size_t)M * N * 4);
   cudaMemset(fA, 0, (size_t)M * K * 4); cudaMemset(fB, 0, (size_t)K * N * 4);
   cublasHandle_t hb; cublasCreate(&hb);

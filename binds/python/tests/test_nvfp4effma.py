@@ -339,6 +339,46 @@ def test_int8_tensor(T):
         nf.Int8Tensor(xq.data, xq.scales[..., :4])
 
 
+def _tc_or_skip(w, act):
+    try:
+        return nf.TCWeight(w, act)
+    except (RuntimeError, NotImplementedError) as e:  # no tensor-core path: sm_75 .. sm_89 (W4A16 sm_80+)
+        pytest.skip(f"no tensor-core path: {e}")
+
+
+@pytest.mark.parametrize("T", [1, 3, 8, 9, 200])
+@pytest.mark.parametrize("act", ["exact", "int8", "nvfp4"])
+def test_tc_weight(T, act):
+    """TCWeight: the tensor-core GEMV (up to 8 rows) and GEMM from one image, against the float64 reference of the
+    same activations; bias, out_dtype, accumulation; activations of the other image kind are refused."""
+    N, K = 192, 320
+    w = nf.quantize(rand((N, K), seed=30))
+    tw = _tc_or_skip(w, act)
+    assert tw.shape == (N, K)
+    x = rand((T, K), torch.bfloat16, seed=31)
+    bias = rand((N,), torch.float32, seed=32)
+    if act == "exact":
+        xv = x.double()
+    elif act == "int8":
+        q, s = nf._C.quantize_int8(x)
+        xv = q.double() * s.double().repeat_interleave(16, -1)
+    else:
+        xv = ref_value(nf.quantize(x))
+    wv = ref_value(w)
+    y = nf.linear(x, tw, bias, out_dtype=torch.float32)
+    assert y.shape == (T, N) and y.dtype == torch.float32
+    check_close(y, xv @ wv.t() + bias.double(), xv.abs() @ wv.abs().t(), K, torch.float32)
+    assert nf.linear(x, tw).dtype == torch.bfloat16
+    acc = torch.ones(T, N, device=DEV)
+    nf.linear(x, tw, out=acc, beta=1.0)
+    check_close(acc, xv @ wv.t() + 1.0, xv.abs() @ wv.abs().t() + 1.0, K, torch.float32)
+    if act != "exact":  # activations quantized beforehand: the same bits
+        xq = nf.quantize_int8(x) if act == "int8" else nf.quantize(x)
+        assert torch.equal(nf.linear(xq, tw, out_dtype=torch.float32), nf.linear(x, tw, out_dtype=torch.float32))
+    with pytest.raises(ValueError):
+        nf.linear(x, tw, act="int8" if act == "exact" else "exact")
+
+
 def test_get_include():
     """The header and the device-side codecs ship with the package, at the version of the package."""
     import os, re
