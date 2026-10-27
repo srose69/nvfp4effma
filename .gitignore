@@ -16,3 +16,4 @@ dev/
 dist/
 # prototypes and measurements (local only)
 proto/
+marks.md
