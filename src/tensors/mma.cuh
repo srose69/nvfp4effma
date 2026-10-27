@@ -14,7 +14,9 @@
 // 1.5 * 2^23 + p exactly.  m16n8k16 runs at the full int8 rate (an m16n8k32 sums two blocks and cannot be split);
 // sm_75: two m8n8k16 (rows 0 - 7 with a0, 8 - 15 with a1) on the same registers.
 #pragma once
+#ifndef __CUDACC_RTC__  // (NVRTC: nvfp4effma.cuh's libcu++)
 #include <stdint.h>
+#endif
 
 #if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900)
 #define NVFP4A_TC 1

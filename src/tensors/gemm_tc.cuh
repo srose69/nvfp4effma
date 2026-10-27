@@ -64,11 +64,14 @@ template <int TB> __host__ __device__ constexpr int tc_smem_bytes(bool v75) {
   return v75 ? TcSlot<TB, true>::NS * (TcSlot<TB, true>::BYTES + 16) : TcSlot<TB, false>::NS * (TcSlot<TB, false>::BYTES + 16);
 }
 
-// F: the scale formats kF_AUE / kF_BUE (the images hold every layout linear)
-template <int TB, int F>
-__global__ void __launch_bounds__(kTcThreads, 1)
-gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, int m, int n, int kt, Epilogue e, float *ws,
-               unsigned *flags) {
+// F: the scale formats kF_AUE / kF_BUE (the images hold every layout linear); EX: the extended epilogue's additions (xd its
+// descriptor).  IT: a work item, tile `item` over all of k on this CTA (no workspace; the CTA's threads are kTcThreads,
+// smem tc_smem_bytes); else the launch's persistent CTAs over the units.
+// CG (default IT): B's image/global and C read through L2 for an intra-launch consumer.
+template <int TB, int F, int EX, bool IT, bool CG = IT>
+__device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, int m, int n, int kt,
+                                             const Epilogue &e, float *ws, unsigned *flags, const EpilogueEx &xd, int item,
+                                             uint8_t *smem) {
 #if !defined(NVFP4A_TC) || (!defined(NVFP4A_TC80) && TB != NVFP4A_NVFP4 && TB != NVFP4A_INT8)  // (W4A16: sm_80+)
   __trap();
 #else
@@ -85,7 +88,6 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
   constexpr int BM = 128, BN = 128, WM = N4 ? 2 : 4, WN = 8 / WM, TM = BM / WM, TN = BN / WN, MT = TM / 16, NJ = TN / 8;
   constexpr float kOut = H ? 1.f : Q8 ? 0.5f : 0.25f;  // integer paths: the A values are doubled, NVFP4 B values too
   constexpr bool UEA = F & kF_AUE, UEB = F & kF_BUE;
-  extern __shared__ __align__(16) uint8_t smem[];
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3;
   const int wm = warp / WN, wn = warp % WN;
   // Persistent CTAs over units = (output tile, k-tile), tiles rastered in groups of GM row blocks (tile_of: a wave's A
@@ -97,7 +99,7 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
   struct Split { int c, G, W, beg; long long usk; };  // usk: stream-K units
   const auto split = [&] {
     Split s;
-    s.c = (int)ctaid_x(); s.G = (int)nctaid_x();
+    s.c = IT ? item : (int)ctaid_x(); s.G = IT ? ((n + BN - 1) / BN) * ((m + BM - 1) / BM) : (int)nctaid_x();
     const int ntiles = ((n + BN - 1) / BN) * ((m + BM - 1) / BM);
     s.W = ws ? ntiles / s.G : (s.c < ntiles ? (ntiles - 1 - s.c) / s.G + 1 : 0);
     s.usk = ws ? (long long)(ntiles - s.W * s.G) * kt : 0;
@@ -229,7 +231,10 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
 #pragma unroll
     for (int x = 0; x < PER; ++x) {
       const int i = q + 32 * NP * x;
-      if (i < CH) v[x] = __ldg(reinterpret_cast<const uint4 *>(i < RA / 16 ? a + (i >> 5) * sstride + 16 * (i & 31) : b + 16 * (i - RA / 16)));
+      if (i < CH) {
+        const uint4 *src = reinterpret_cast<const uint4 *>(i < RA / 16 ? a + (i >> 5) * sstride + 16 * (i & 31) : b + 16 * (i - RA / 16));
+        v[x] = CG && i >= RA / 16 ? __ldcg(src) : __ldg(src);
+      }
     }
 #pragma unroll
     for (int x = 0; x < PER; ++x) {
@@ -383,8 +388,11 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
   // n8 slice x two m16 slices (8 columns x 32 rows) a pass, then lane l writes rows 8 (l % 4) .. + 7 of column l / 4
   // (one 16-byte store for BF16 / FP16 output).  Cold code: lane and warp re-read (tid_x), nothing it derives is hoisted
   // into the hot loop; C (beta != 0) element by element.
+  // The extended epilogue: s_j of the tile's columns behind the staging (a warp per column), the column parts times s_j;
+  // a pass's values (two whole m16 slices) to ex_finish, the warp's lanes sharing it.
   constexpr int EPI = 15, SLD = 36;  // EPI: the compute warps' named barrier; SLD: staged column, 32 rows + 4 (banks)
-  static_assert(NC / 32 * 8 * SLD * 4 <= SLOT && MT % 2 == 0, "the warps' staging fits in a slot");
+  static_assert((NC / 32 * 8 * SLD + BN) * 4 <= SLOT && MT % 2 == 0, "the warps' staging fits in a slot");
+  static_assert(!EX || !N4, "the extended epilogue's warp tile: 32 rows");
   const auto epilogue = [&](int m0, int n0, uint8_t *p, auto dc) {
     constexpr int DT = decltype(dc)::value;
     const int tx = (int)tid_x(), ln = tx & 31, wp = tx >> 5, gg = ln >> 2, tt = ln & 3;
@@ -393,6 +401,19 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
     const bool use_c = e.beta != 0.f, vd = ((uintptr_t)e.d % (8 * Elem<DT>::bytes)) == 0 && e.ldd % 8 == 0;
     EpiState st = epi_begin(e);
     bar_sync<NC>(EPI);  // the compute warps are done with the slot
+    float *scs = reinterpret_cast<float *>(p) + NC / 32 * 8 * SLD;
+    if (EX & kEX_NORM) {
+      static_assert(BN == 8 * (NC / 32) * 2, "two groups of 8 columns a warp");
+#pragma unroll 1
+      for (int c = 8 * wp; c < BN; c += 8 * (NC / 32)) {
+        float v[8];
+        ex_norm_scales<8>(xd, n0 + c, n, ln, v);
+#pragma unroll
+        for (int q = 0; q < 8; ++q)
+          if (ln == q) scs[c + q] = v[q];
+      }
+      bar_sync<NC>(EPI);
+    }
 #pragma unroll  // (constant indices into acc throughout)
     for (int i0 = 0; i0 < MT; i0 += 2) {
       float rowp[2][2];  // row parts of the output scales (rows past the end: row 0's)
@@ -409,7 +430,8 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
 #pragma unroll
         for (int x = 0; x < 2; ++x) {
           const int gj = cb + 8 * j + 2 * tt + x;
-          colp[x] = epi_col_part(e, gj < n ? gj : 0);
+          colp[x] = epi_col_part<CG>(e, gj < n ? gj : 0);
+          if (EX & kEX_NORM) colp[x] = __fmul_rn(colp[x], scs[gj - n0]);
         }
 #pragma unroll
         for (int ii = 0; ii < 2; ++ii)
@@ -428,21 +450,37 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
           for (int u = 0; u < cnt; ++u) {
             float x = sv[u];
             if (e.bias) x = __fadd_rn(x, load_any(e.bias_dtype, e.bias, gi + u));
-            if (use_c) x = __fmaf_rn(e.beta, load_any(e.c_dtype, e.c, (size_t)gj * e.ldc + gi + u), x);
+            if (use_c) x = __fmaf_rn(e.beta, load_any<CG>(e.c_dtype, e.c, (size_t)gj * e.ldc + gi + u), x);
             sv[u] = x;
           }
+        }
+        if (EX & kEX_SWIGLU) {  // lane: column gg, slice tt / 2, rows 4 (tt % 2) .. + 3 of its halves -> 4 rows of D
+          warp_sync();
+          const int sr = 16 * (tt >> 1), r = 4 * (tt & 1), dr = (rb + 16 * i0 + sr) / 2 + r;
+          if (gj < n && rb + 16 * i0 + sr < m) {
+            const float *q = &stage[gg * SLD + sr + r];
+            float h[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) { h[u] = silu_mul(q[u], q[8 + u]); st.amax = fmaxf(st.amax, fabsf(h[u])); }
+            store4_any<DT>(e.d, (size_t)gj * e.ldd + dr, vd, h);
+          }
+        } else if (EX & kEX_OUT2) {
+          warp_sync();
+          ex_finish<EX>(e, xd, stage, SLD, rb + 16 * i0, 2, cb + 8 * j, 1, 8, m, n, ln, 32, st);
         }
         float v[8];
         *reinterpret_cast<float4 *>(v) = *reinterpret_cast<const float4 *>(sv);
         *reinterpret_cast<float4 *>(v + 4) = *reinterpret_cast<const float4 *>(sv + 4);
+        if (!(EX & kEX_SWIGLU)) {  // (SwiGLU: D from ex_finish)
 #pragma unroll
-        for (int u = 0; u < 8; ++u) st.amax = fmaxf(st.amax, u < cnt ? fabsf(v[u]) : 0.f);
-        if (cnt == 8 && vd) {
-          store4_any<DT>(e.d, (size_t)gj * e.ldd + gi, true, v);
-          store4_any<DT>(e.d, (size_t)gj * e.ldd + gi + 4, true, v + 4);
-        } else {
+          for (int u = 0; u < 8; ++u) st.amax = fmaxf(st.amax, u < cnt ? fabsf(v[u]) : 0.f);
+          if (cnt == 8 && vd) {
+            store4_any<DT>(e.d, (size_t)gj * e.ldd + gi, true, v);
+            store4_any<DT>(e.d, (size_t)gj * e.ldd + gi + 4, true, v + 4);
+          } else {
 #pragma unroll 1
-          for (int u = 0; u < cnt; ++u) store_any(DT, e.d, (size_t)gj * e.ldd + gi + u, sv[u]);
+            for (int u = 0; u < cnt; ++u) store_any(DT, e.d, (size_t)gj * e.ldd + gi + u, sv[u]);
+          }
         }
         warp_sync();  // the lanes are done with the stage
       }
@@ -457,6 +495,7 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
 
   // ---- the stream ---------------------------------------------------------------------------------------------
   if (warp >= NC / 32) {
+    if (IT && kt == 0) return;
     const Split s = split();  // (the producers hold theirs)
 #ifdef NVFP4A_TC80
     // the copier and the publisher walk the units: k stepped, the tile located anew at its end (their divisions)
@@ -545,7 +584,7 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
   };
 
   if (kt == 0) {  // no k: every tile its epilogue alone (no units)
-    for (int lin = blockIdx.x; lin < ((n + BN - 1) / BN) * ((m + BM - 1) / BM); lin += gridDim.x) {
+    for (int lin = IT ? item : blockIdx.x; lin < (IT ? item + 1 : ((n + BN - 1) / BN) * ((m + BM - 1) / BM)); lin += IT ? 1 : gridDim.x) {
       int mb, nb;
       tile_of(lin, mb, nb);
       finish(mb * BM, nb * BN, smem);
@@ -615,6 +654,26 @@ gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, i
 #endif
 }
 
+template <int TB, int F, int EX = 0, class... X>
+__global__ void __launch_bounds__(kTcThreads, 1)
+gemm_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, int m, int n, int kt, Epilogue e, float *ws,
+               unsigned *flags, X... xs) {
+  extern __shared__ __align__(16) uint8_t smem[];
+  gemm_tc_body<TB, F, EX, false>(ia, ib, m, n, kt, e, ws, flags, ex_arg(xs...), 0, smem);
+}
+
+// the work item's arguments (a 128 x 128 tile over all of k: item = the tile in the kernel's order)
+struct GemmTcItemArgs {
+  const uint8_t *ia, *ib;
+  int m, n, kt;
+  Epilogue e;
+  EpilogueEx xd;
+};
+template <int TB, int EX, bool CG = true>
+__device__ __forceinline__ void gemm_tc_item(const GemmTcItemArgs &a, int item, unsigned, void *smem) {
+  gemm_tc_body<TB, 0, EX, true, CG>(a.ia, a.ib, a.m, a.n, a.kt, a.e, nullptr, nullptr, a.xd, item, (uint8_t *)smem);
+}
+
 // Entry points (src/tensors/image.cu, gemm_tc_inst.cu): the images of A (h: A16, else A8) and B (image.cuh), and the
 // GEMM over them per B dtype TB (NVFP4, INT8, BF16) and scale formats F (kF_AUE / kF_BUE)
 cudaError_t tc_image_a(bool h, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, int m, int k, uint8_t *img, cudaStream_t s);
@@ -624,6 +683,12 @@ cudaError_t tc_image_a_raw(bool h, const uint8_t *src, int m, int k, uint8_t *da
 cudaError_t tc_image_b(int tb, const uint8_t *B, int ldb, const uint8_t *SB, int ldsb, int n, int k, uint8_t *img, cudaStream_t s);
 template <int TB, int F>
 cudaError_t tc_entry(const uint8_t *ia, const uint8_t *ib, int m, int n, int k, const Epilogue &e, uint8_t *ws, cudaStream_t s);
+// the extended epilogue's (gemm_tc_inst.cu with -DNVFP4A_EX): B INT8 or BF16, A's scales E4M3, additions EX
+template <int TB, int F> const void *tc_kernel_ptr();
+template <int TB, int EX> const void *tc_kernel_ex_ptr();
+template <int TB, int EX>
+cudaError_t tc_entry_ex(const uint8_t *ia, const uint8_t *ib, int m, int n, int k, const Epilogue &e, const EpilogueEx &x, uint8_t *ws,
+                        cudaStream_t s);
 // the workspace of a launch on `sms` SMs: FP32 partials (one per CTA), then the CTAs' flags
 inline size_t tc_ws_bytes(int sms) { return (size_t)sms * 256 * 64 * 4 + (size_t)sms * 4; }
 // bytes of A's image: m16 slices of whole 128-row blocks x groups of 4 k-tiles x GV

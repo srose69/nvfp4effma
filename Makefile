@@ -58,7 +58,11 @@ GEMV_IDS  = 0 $(call TUNED_IDS,GEMV)
 # tile rows (dtype codes: NVFP4 0, BF16 1, FP16 2, FP32 3, INT8 4)
 F_ALL = $(shell seq 0 15)
 F_A   = 0 1 2 3
-INST = $(foreach i,$(GEMV_IDS),$(foreach f,$(F_ALL),inst_gemv_$(i)_0_$(f)) $(foreach t,1 2 3 4,$(foreach f,$(F_A),inst_gemv_$(i)_$(t)_$(f)))) \
+EX_ALL = 1 2 3 4 5
+INST = $(foreach i,$(GEMV_IDS),$(foreach t,1 4,$(foreach x,$(EX_ALL),inst_gemvx_$(i)_$(t)_$(x)))) \
+       $(foreach x,$(EX_ALL),$(foreach i,$(GEMM_IDS),inst_gemmx_$(i)_1_$(x)) inst_gemmx_0_4_$(x) inst_dp4ax_$(x)) \
+       $(foreach x,$(EX_ALL),inst_gtcx_4_$(x) inst_gtcx_1_$(x) inst_tcx_4_$(x) inst_tcx_1_$(x)) \
+       $(foreach i,$(GEMV_IDS),$(foreach f,$(F_ALL),inst_gemv_$(i)_0_$(f)) $(foreach t,1 2 3 4,$(foreach f,$(F_A),inst_gemv_$(i)_$(t)_$(f)))) \
        $(foreach i,$(GEMM_IDS),$(foreach t,1 2 3,$(foreach f,$(F_A),inst_gemm_$(i)_$(t)_$(f)))) \
        $(foreach f,$(F_ALL),inst_gemm_0_0_$(f) inst_dp4a_0_$(f)) $(foreach f,$(F_A),inst_gemm_0_4_$(f) inst_dp4a_4_$(f)) \
        $(foreach f,0 2 8 10,inst_tc_0_$(f)) $(foreach f,0 2,inst_tc_4_$(f) inst_tc_1_$(f)) \
@@ -74,22 +78,32 @@ all: lib test-bin bench-bin
 define LIBRARY  # $(1) = object dir, $(2) = arch flags
 $(1)/nvfp4effma.o: src/nvfp4effma.cu $(QUANT_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
-$(1)/gemm_nvfp4effma.o: src/gemm_nvfp4effma.cu $(TC_H) src/gemv_nvfp4effma.cuh | $(1)
+$(1)/gemm_nvfp4effma.o: src/gemm_nvfp4effma.cu $(TC_H) src/gemv_nvfp4effma.cuh include/nvfp4effma_items.h | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
 $(1)/gemv_nvfp4effma.o: src/gemv_nvfp4effma.cu $(GEMV_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
+$(1)/inst_gemmx_%.o: src/gemm_nvfp4effma_inst.cu $(GEMM_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TB=$$(call word_,2,$$*) -DNVFP4A_EX=$$(call word_,3,$$*) -c -o $$@ $$<
+$(1)/inst_dp4ax_%.o: src/gemm_dp4a_inst.cu $(GEMM_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_EX=$$* -c -o $$@ $$<
 $(1)/inst_gemm_%.o: src/gemm_nvfp4effma_inst.cu $(GEMM_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TB=$$(call word_,2,$$*) -DNVFP4A_F=$$(call word_,3,$$*) -c -o $$@ $$<
 $(1)/inst_dp4a_%.o: src/gemm_dp4a_inst.cu $(GEMM_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_F=$$(call word_,2,$$*) -c -o $$@ $$<
 $(1)/tc_image.o: src/tensors/image.cu $(TC_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -c -o $$@ $$<
+$(1)/inst_tcx_%.o: src/tensors/gemm_tc_inst.cu $(TC_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_EX=$$(call word_,2,$$*) -c -o $$@ $$<
 $(1)/inst_tc_%.o: src/tensors/gemm_tc_inst.cu $(TC_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_F=$$(call word_,2,$$*) -c -o $$@ $$<
+$(1)/inst_gtcx_%.o: src/tensors/gemv_tc_inst.cu $(TC_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_EX=$$(call word_,2,$$*) -c -o $$@ $$<
 $(1)/inst_gtc_%.o: src/tensors/gemv_tc_inst.cu $(TC_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_TB=$$(call word_,1,$$*) -DNVFP4A_F=$$(call word_,2,$$*) -c -o $$@ $$<
 $(1)/inst_quant_%.o: src/quant_nvfp4effma_inst.cu $(QUANT_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_QT=$$(call word_,1,$$*) -DNVFP4A_QCOL=$$(call word_,2,$$*) -DNVFP4A_QTILE=$$(call word_,3,$$*) -c -o $$@ $$<
+$(1)/inst_gemvx_%.o: src/gemv_nvfp4effma_inst.cu $(GEMV_H) | $(1)
+	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TX=$$(call word_,2,$$*) -DNVFP4A_F=0 -DNVFP4A_EX=$$(call word_,3,$$*) -c -o $$@ $$<
 $(1)/inst_gemv_%.o: src/gemv_nvfp4effma_inst.cu $(GEMV_H) | $(1)
 	$(NVCC) $(FLAGS) $(2) -DNVFP4A_ID=$$(call word_,1,$$*) -DNVFP4A_TX=$$(call word_,2,$$*) -DNVFP4A_F=$$(call word_,3,$$*) -c -o $$@ $$<
 $(1)/libnvfp4effma.a: $(foreach o,$(OBJS),$(1)/$(o).o)
@@ -99,7 +113,9 @@ $(1):
 endef
 # multi-architecture objects (binds/python builds its own copy for the architectures it targets)
 OBJDIR ?= out/obj
+ifneq ($(OBJDIR),out/native)
 $(eval $(call LIBRARY,$(OBJDIR),$(GENCODE) --threads $(NVCC_THREADS)))
+endif
 $(eval $(call LIBRARY,out/native,-arch=sm_$(TEST_ARCH)))
 $(eval $(call LIBRARY,out/sm60,-arch=sm_60))
 $(eval $(call LIBRARY,out/sm75,-arch=compute_75 -code=compute_75))
@@ -115,10 +131,19 @@ out/tune: tune/tune.cu $(GEMM_H) $(GEMV_H) | out/native
 tune: out/tune                   ## writes src/nvfp4effma_tuned.h for this GPU; rebuild the library afterwards
 	$(RUN) ./out/tune src/nvfp4effma_tuned.h
 
-TESTS   = test_gemm test_gemv test_nvfp4effma test_images
-BENCHES = bench_gemm bench_gemv bench_quant
+TESTS   = test_gemm test_gemv test_gemv_rows test_epilogue test_nvfp4effma test_images
+BENCHES = bench_gemm bench_gemv bench_quant bench_epilogue
 $(addprefix out/,$(TESTS)): out/%: tests/%.cu tests/test_util.h $(NATIVE)
 	$(NVCC) $(NATIVE_FLAGS) -o $@ $< $(NATIVE)
+# the work items through an NVRTC-compiled executor (the library's headers from this tree)
+ITEM_TEST_H = tests/test_util.h include/nvfp4effma_items.h include/nvfp4effma_items.cuh $(TC_H) $(GEMV_H)
+ITEM_TEST_FLAGS = -DNVFP4A_ROOT='"$(CURDIR)"' -DNVFP4A_CUDA_INCLUDE='"$(CUDA_HOME)/include"'
+out/test_items: tests/test_items.cu $(ITEM_TEST_H) $(NATIVE)
+	$(NVCC) $(NATIVE_FLAGS) $(ITEM_TEST_FLAGS) -o $@ $< $(NATIVE) -lnvrtc -lcuda
+out/sm60/test_items: tests/test_items.cu $(ITEM_TEST_H) out/sm60/libnvfp4effma.a
+	$(NVCC) $(FLAGS) -arch=sm_60 $(ITEM_TEST_FLAGS) -o $@ $< out/sm60/libnvfp4effma.a -lnvrtc -lcuda
+out/sm75/test_items: tests/test_items.cu $(ITEM_TEST_H) out/sm75/libnvfp4effma.a
+	$(NVCC) $(FLAGS) -arch=compute_75 -code=compute_75 $(ITEM_TEST_FLAGS) -o $@ $< out/sm75/libnvfp4effma.a -lnvrtc -lcuda
 out/test_nvfp4effma_neg: tests/test_nvfp4effma.cu tests/test_util.h $(NATIVE)
 	$(NVCC) $(NATIVE_FLAGS) -DNVFP4A_NEGATIVE_CONTROLS -o $@ $< $(NATIVE)
 out/sm60/test_%: tests/test_%.cu tests/test_util.h out/sm60/libnvfp4effma.a
@@ -128,21 +153,28 @@ out/sm75/test_%: tests/test_%.cu tests/test_util.h out/sm75/libnvfp4effma.a
 $(addprefix out/,$(BENCHES)): out/%: bench/%.cu bench/bench_util.h include/nvfp4effma.h $(NATIVE)
 	$(NVCC) $(NATIVE_FLAGS) -o $@ $< $(NATIVE) -lcublas -lnvidia-ml
 
-test-bin: $(addprefix out/,$(TESTS)) out/test_nvfp4effma_neg
+test-bin: $(addprefix out/,$(TESTS)) out/test_nvfp4effma_neg out/test_items
 bench-bin: $(addprefix out/,$(BENCHES))
 
 test: test-bin                   ## API bit-exact, exhaustive encoders, negative controls
 	$(RUN) ./out/test_gemm
 	$(RUN) ./out/test_gemv
+	$(RUN) ./out/test_gemv_rows
+	$(RUN) ./out/test_epilogue
+	$(RUN) ./out/test_items
 	$(RUN) ./out/test_images
 	$(RUN) ./out/test_nvfp4effma
 	$(RUN) ./out/test_nvfp4effma_neg
-test-sm60: out/sm60/test_gemm out/sm60/test_gemv
+test-sm60: out/sm60/test_gemm out/sm60/test_gemv out/sm60/test_epilogue out/sm60/test_items
 	$(RUN) ./out/sm60/test_gemm
 	$(RUN) ./out/sm60/test_gemv
-test-sm75: out/sm75/test_gemm out/sm75/test_gemv
+	$(RUN) ./out/sm60/test_epilogue
+	$(RUN) ./out/sm60/test_items
+test-sm75: out/sm75/test_gemm out/sm75/test_gemv out/sm75/test_epilogue out/sm75/test_items
 	$(RUN) ./out/sm75/test_gemm
 	$(RUN) ./out/sm75/test_gemv
+	$(RUN) ./out/sm75/test_epilogue
+	$(RUN) ./out/sm75/test_items
 bench: bench-bin
 	$(RUN) ./out/bench_gemm
 	$(RUN) ./out/bench_gemv
@@ -151,14 +183,27 @@ bench: bench-bin
 # ---- install (C / C++ projects: pkg-config --cflags --libs nvfp4effma) -------------------------
 PREFIX ?= /usr/local
 install: $(OBJDIR)/libnvfp4effma.a
-	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig
-	install -m 644 include/nvfp4effma.h $(DESTDIR)$(PREFIX)/include/
-	install -m 644 $(OBJDIR)/libnvfp4effma.a $(DESTDIR)$(PREFIX)/lib/
+	install -d "$(DESTDIR)$(PREFIX)/include" "$(DESTDIR)$(PREFIX)/lib/pkgconfig" \
+	           "$(DESTDIR)$(PREFIX)/include/nvfp4effma/include" "$(DESTDIR)$(PREFIX)/include/nvfp4effma/src/tensors"
+	install -m 644 include/nvfp4effma.h include/nvfp4effma_items.h "$(DESTDIR)$(PREFIX)/include/"
+	install -m 644 include/nvfp4effma.h include/nvfp4effma_items.cuh "$(DESTDIR)$(PREFIX)/include/nvfp4effma/include/"
+	install -m 644 $(sort $(filter src/%,$(CORE_H) $(GEMV_H) $(GEMM_H))) "$(DESTDIR)$(PREFIX)/include/nvfp4effma/src/"
+	install -m 644 $(filter src/tensors/%,$(TC_H)) "$(DESTDIR)$(PREFIX)/include/nvfp4effma/src/tensors/"
+	{ sed -n '1,2p' include/nvfp4effma_items.cuh; printf '#include "nvfp4effma/include/nvfp4effma_items.cuh"\n'; } \
+	    > "$(DESTDIR)$(PREFIX)/include/nvfp4effma_items.cuh"
+	chmod 644 "$(DESTDIR)$(PREFIX)/include/nvfp4effma_items.cuh"
+	install -m 644 $(OBJDIR)/libnvfp4effma.a "$(DESTDIR)$(PREFIX)/lib/"
 	printf 'prefix=%s\nincludedir=$${prefix}/include\nlibdir=$${prefix}/lib\n\nName: nvfp4effma\nDescription: NVFP4 GEMM / GEMV / quantization for GPUs without native FP4\nVersion: $(VERSION)\nCflags: -I$${includedir} -I$(CUDA_HOME)/include\nLibs: -L$${libdir} -lnvfp4effma -L$(CUDA_HOME)/lib64 -lcudart -lstdc++\n' \
-	       '$(PREFIX)' > $(DESTDIR)$(PREFIX)/lib/pkgconfig/nvfp4effma.pc
+	       '$(PREFIX)' > "$(DESTDIR)$(PREFIX)/lib/pkgconfig/nvfp4effma.pc"
+
+test-install: $(NATIVE)
+	$(MAKE) install OBJDIR=out/native PREFIX="$(CURDIR)/out/install-test"
+	$(NVCC) $(NATIVE_FLAGS) -DNVFP4A_ROOT='"$(CURDIR)/out/install-test"' -DNVFP4A_CUDA_INCLUDE='"$(CUDA_HOME)/include"' \
+	    -o out/test_items_installed tests/test_items.cu out/install-test/lib/libnvfp4effma.a -lnvrtc -lcuda
+	$(RUN) ./out/test_items_installed --coherence-only
 
 clean:
 	rm -rf out/obj out/native out/sm60 out/sm75 out/libnvfp4effma.a out/tune \
-	       $(addprefix out/,$(TESTS) $(BENCHES)) out/test_nvfp4effma_neg
+	       $(addprefix out/,$(TESTS) $(BENCHES)) out/test_nvfp4effma_neg out/test_items out/test_items_installed
 
-.PHONY: all lib tune test-bin bench-bin test test-sm60 test-sm75 bench install clean
+.PHONY: all lib tune test-bin bench-bin test test-sm60 test-sm75 test-install bench install clean

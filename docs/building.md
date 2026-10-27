@@ -14,8 +14,9 @@ make lib                    # out/libnvfp4effma.a for sm_50 52 53 60 61 62 70 72
 make lib ARCHS=native       # only the architecture of GPU $(GPU), detected with nvidia-smi
 make lib ARCHS="61 75 86"   # any subset
 make test                   # bit-exact and exhaustive tests on GPU $(GPU) (default 0)
-make test-sm60              # GEMM / GEMV tests against an sm_60-only build: on an sm_61+ GPU this runs
+make test-sm60              # GEMM / GEMV / work-item tests against an sm_60-only build: on an sm_61+ GPU this runs
                             # the code of GPUs without DP4A and the default tables
+make test-sm75              # compute_75 PTX under JIT: the Turing tensor-core layout, including work items
 make bench                  # GEMM / GEMV / quantization vs cuBLAS and memory bandwidth
 bench/run_bench.sh          # controlled run (board settings, cool-downs) -> benches/<gpu>.md
 make tune                   # tune the kernels for GPU $(GPU) -> src/nvfp4effma_tuned.h

@@ -22,6 +22,7 @@
 #include <nvml.h>
 
 struct BenchRow { float ms; double mhz; };  // median time, mean SM clock (0 = unknown)
+struct BenchPair { BenchRow plain, extended; };
 
 // the warm-up's plain matrix product: C = A B, n x n FP32, 16 x 16 shared-memory tiles
 __global__ void bench_warmup_mm(const float *a, const float *b, float *c, int n) {
@@ -67,7 +68,7 @@ class Bench {
     cudaEventCreate(&a_); cudaEventCreate(&b_);
     warmup();
   }
-  ~Bench() { if (ok_) nvmlShutdown(); }
+  ~Bench() { cudaEventDestroy(a_); cudaEventDestroy(b_); if (ok_) nvmlShutdown(); }
 
   // NVFP4A_BENCH_WARMUP products of 2048 x 2048, 0.5 s apart (the GPU raises its clocks under load)
   static void warmup() {
@@ -88,6 +89,52 @@ class Bench {
     const int reps = std::max(1, env("NVFP4A_BENCH_REPS", reps_default));
     f(); cudaDeviceSynchronize();
     std::this_thread::sleep_for(std::chrono::seconds(env("NVFP4A_BENCH_COOL", 2)));
+    std::vector<float> t(reps);
+    const double mhz = clocked([&] {
+      for (int r = 0; r < reps; ++r) {
+        cudaEventRecord(a_); f(); cudaEventRecord(b_); cudaEventSynchronize(b_);
+        cudaEventElapsedTime(&t[r], a_, b_);
+      }
+    });
+    std::nth_element(t.begin(), t.begin() + reps / 2, t.end());
+    return {t[reps / 2], mhz};
+  }
+
+  // Warm both variants after the idle pause, then alternate AB/BA under the same clock/thermal conditions.
+  template <class A, class B> BenchPair paired(A plain, B extended, int reps_default) {
+    plain(); extended(); check(cudaDeviceSynchronize(), "paired setup");
+    std::this_thread::sleep_for(std::chrono::seconds(env("NVFP4A_BENCH_COOL", 2)));
+    const auto until = std::chrono::steady_clock::now() +
+                       std::chrono::milliseconds(env("NVFP4A_BENCH_PAIR_WARM_MS", 100));
+    do { plain(); extended(); check(cudaDeviceSynchronize(), "paired warmup"); }
+    while (std::chrono::steady_clock::now() < until);
+    cudaEvent_t c, d;
+    check(cudaEventCreate(&c), "paired event"); check(cudaEventCreate(&d), "paired event");
+    const int reps = std::max(1, env("NVFP4A_BENCH_REPS", reps_default));
+    std::vector<float> a(reps), b(reps);
+    const double mhz = clocked([&] {
+      const auto measure = [&](auto f, cudaEvent_t first, cudaEvent_t last) {
+        check(cudaEventRecord(first), "paired start"); f(); check(cudaEventRecord(last), "paired end");
+      };
+      for (int r = 0; r < reps; ++r) {
+        if (r & 1) { measure(extended, c, d); measure(plain, a_, b_); }
+        else { measure(plain, a_, b_); measure(extended, c, d); }
+        check(cudaEventSynchronize((r & 1) ? b_ : d), "paired synchronize");
+        check(cudaEventElapsedTime(&a[r], a_, b_), "paired plain time");
+        check(cudaEventElapsedTime(&b[r], c, d), "paired extended time");
+      }
+    });
+    check(cudaEventDestroy(c), "paired event destroy"); check(cudaEventDestroy(d), "paired event destroy");
+    std::nth_element(a.begin(), a.begin() + reps / 2, a.end());
+    std::nth_element(b.begin(), b.begin() + reps / 2, b.end());
+    return {{a[reps / 2], mhz}, {b[reps / 2], mhz}};
+  }
+
+ private:
+  static void check(cudaError_t e, const char *what) {
+    if (e != cudaSuccess) { fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e)); exit(1); }
+  }
+  template <class F> double clocked(F f) {
     std::atomic<bool> running{true};
     double sum = 0; long n = 0;
     std::thread sampler([&] {
@@ -97,20 +144,13 @@ class Bench {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
     });
-    std::vector<float> t(reps);
-    for (int r = 0; r < reps; ++r) {
-      cudaEventRecord(a_); f(); cudaEventRecord(b_); cudaEventSynchronize(b_);
-      cudaEventElapsedTime(&t[r], a_, b_);
-    }
+    f();
     running = false;
     sampler.join();
-    unsigned int mhz;  // a row shorter than one sampling period: take the clock right after it
+    unsigned int mhz;
     if (!n && ok_ && nvmlDeviceGetClockInfo(nvml_, NVML_CLOCK_SM, &mhz) == NVML_SUCCESS) { sum = mhz; n = 1; }
-    std::nth_element(t.begin(), t.begin() + reps / 2, t.end());
-    return {t[reps / 2], n ? sum / n : 0.0};
+    return n ? sum / n : 0.0;
   }
-
- private:
   nvmlDevice_t nvml_{};
   bool ok_ = false;
   cudaEvent_t a_, b_;
@@ -148,4 +188,3 @@ static float *te_globals(int rows) {
   return d;
 }
 #endif
-

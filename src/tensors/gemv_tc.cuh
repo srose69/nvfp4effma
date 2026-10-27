@@ -15,6 +15,8 @@
 //            (words of INT8 x, halfwords of NVFP4 x; SHFL) gives each lane its part of every block
 // x's columns past n read column n - 1 (computed, not stored).  The k sums stay in registers to the end: the warps'
 // partial sums of an output added in warp order through shared memory (deterministic), one store per output.
+// The extended epilogue (EX, its descriptor the trailing parameter): warp w forms s_w after its k range; the slice's
+// values go through shared memory to ex_finish.
 #pragma once
 #include "gemm_tc.cuh"  // dec4o, the images
 
@@ -26,10 +28,16 @@ constexpr int kGvWarps = 8;  // KS: warps of a CTA (the k split)
 // group (4 k-tiles) in one 16-byte load (else a word a k-tile; the swizzled layout: always)
 constexpr int kF_XS16 = 16;
 
-template <int XT, int F>
-__global__ void __launch_bounds__(kGvWarps * 32)
-gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, int ldx, const uint8_t *__restrict__ sx, int ldsx,
-               int m, int n, int kt, Epilogue e) {
+// shared memory of a slice (floats): the warps' partial sums; the extended epilogue's s_j and staged values
+__host__ __device__ constexpr int gemv_tc_smem_floats(int ex) { return kGvWarps * 4 * 32 + (ex ? kGvWarps + 8 * 16 : 0); }
+
+// The work item: m16 slice sl of A (all of k) on the CTA's kGvWarps warps (thread: the thread in the CTA), its shared
+// memory smem (gemv_tc_smem_floats(EX) floats).  gemv_tc_kernel runs one a CTA; an executor may run it from its own kernel.
+// CG: x, its block/global scales and C through L2; the immutable weight image retains its read-only loads.
+template <int XT, int F, int EX, bool CG = false>
+__device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, int ldx,
+                                              const uint8_t *__restrict__ sx, int ldsx, int m, int n, int kt, const Epilogue &e,
+                                              const EpilogueEx &xd, int sl, unsigned thread, float *smem) {
 #if !defined(NVFP4A_TC) || (!defined(NVFP4A_TC80) && XT != NVFP4A_NVFP4 && XT != NVFP4A_INT8)  // (W4A16: sm_80+)
   __trap();
 #else
@@ -43,9 +51,9 @@ gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, in
   constexpr float kOut = H ? 1.f : Q8 ? 0.5f : 0.25f;  // integer paths: the A values are doubled, NVFP4 x values too
   // per group: x bytes of a lane's column, x scale bytes of a column; NVFP4 x scales per k-tile (no S16): a word ST apart
   constexpr int XG = H ? 512 : Q8 ? 256 : 128, SG = Q8 ? 64 : SWB ? 2048 : 16, ST = SWB ? 512 : 4;
-  __shared__ float red[KS][4][32];
-  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, g = lane >> 2, t4 = lane & 3;
-  const int sl = blockIdx.x, ng = (kt + 3) >> 2, q = ng / KS, r = ng - q * KS;
+  float (*red)[4][32] = reinterpret_cast<float (*)[4][32]>(smem);
+  const int lane = thread & 31, w = thread >> 5, g = lane >> 2, t4 = lane & 3;
+  const int ng = (kt + 3) >> 2, q = ng / KS, r = ng - q * KS;
   const int N = q + (w < r), g0 = w * q + (w < r ? w : r);  // the warp's groups g0 .. g0 + N - 1
   const int nlast = kt - 4 * (ng - 1);                     // k-tiles of the slice's last group (1 .. 4)
   const uint8_t *pa = ia + ((size_t)sl * ng + g0) * GV + 16 * lane;
@@ -71,6 +79,7 @@ gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, in
   // group loads; vt: the group's k-tiles (4 but in the slice's last group; 0 past the warp's groups: a zero stage, whose
   // consumption adds exact zeros), x and its scales only for those
   const auto load = [&](Stage &st, int vt) {
+    const auto input = [](const auto *p) { return CG ? __ldcg(p) : __ldg(p); };
     const uint4 z = make_uint4(0, 0, 0, 0);
 #pragma unroll
     for (int T = 0; T < 4; ++T) st.a[T] = ldg_stream(pa + 512 * T, vt > 0, pol);
@@ -85,24 +94,24 @@ gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, in
     for (int T = 0; T < 4; ++T) {
       const bool in = T < vt;
       if (H) {
-        st.x[2 * T] = in ? __ldg(reinterpret_cast<const uint4 *>(px + 128 * T)) : z;
-        st.x[2 * T + 1] = in ? __ldg(reinterpret_cast<const uint4 *>(px + 128 * T + 16)) : z;
+        st.x[2 * T] = in ? input(reinterpret_cast<const uint4 *>(px + 128 * T)) : z;
+        st.x[2 * T + 1] = in ? input(reinterpret_cast<const uint4 *>(px + 128 * T + 16)) : z;
       } else if (Q8) {
-        st.x[T] = in ? __ldg(reinterpret_cast<const uint4 *>(px + 64 * T)) : z;
-        st.q[T] = in ? __ldg(reinterpret_cast<const uint4 *>(pb0 + 16 * T)) : z;
-        st.q[4 + T] = in ? __ldg(reinterpret_cast<const uint4 *>(pb1 + 16 * T)) : z;
+        st.x[T] = in ? input(reinterpret_cast<const uint4 *>(px + 64 * T)) : z;
+        st.q[T] = in ? input(reinterpret_cast<const uint4 *>(pb0 + 16 * T)) : z;
+        st.q[4 + T] = in ? input(reinterpret_cast<const uint4 *>(pb1 + 16 * T)) : z;
       } else {
-        const uint2 v = in ? __ldg(reinterpret_cast<const uint2 *>(px + 32 * T)) : make_uint2(0, 0);
+        const uint2 v = in ? input(reinterpret_cast<const uint2 *>(px + 32 * T)) : make_uint2(0, 0);
         st.x[T].x = v.x; st.x[T].y = v.y;
         if (!S16) {
-          (&st.q[0].x)[T] = in ? __ldg(reinterpret_cast<const uint32_t *>(pb0 + ST * T)) : 0u;
-          (&st.q[1].x)[T] = in ? __ldg(reinterpret_cast<const uint32_t *>(pb1 + ST * T)) : 0u;
+          (&st.q[0].x)[T] = in ? input(reinterpret_cast<const uint32_t *>(pb0 + ST * T)) : 0u;
+          (&st.q[1].x)[T] = in ? input(reinterpret_cast<const uint32_t *>(pb1 + ST * T)) : 0u;
         }
       }
     }
     if (S16) {  // (no partial groups: k a multiple of 256)
-      st.q[0] = vt > 0 ? __ldg(reinterpret_cast<const uint4 *>(pb0)) : z;
-      st.q[1] = vt > 0 ? __ldg(reinterpret_cast<const uint4 *>(pb1)) : z;
+      st.q[0] = vt > 0 ? input(reinterpret_cast<const uint4 *>(pb0)) : z;
+      st.q[1] = vt > 0 ? input(reinterpret_cast<const uint4 *>(pb1)) : z;
     }
     pa += GV; ps += GV; px += XG; pb0 += SG; pb1 += SG;
   };
@@ -195,6 +204,34 @@ gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, in
   // the warps' partial sums -> one per output, added in warp order; lanes of warps 0 - 3 store output (lane, w)
 #pragma unroll
   for (int u = 0; u < 4; ++u) red[w][u][lane] = acc[u];
+  if (EX) {
+    float *scs = smem + KS * 4 * 32, *stage = scs + KS;  // s_j; values [col][row in the slice]
+    // s_w after the warp's own k range (before it, its dependent loads would hold back the stream of A)
+    const float csw = (EX & kEX_NORM) ? ex_norm_scale(xd, w < n ? w : n - 1, lane) : 1.f;
+    if (lane == 0) scs[w] = csw;
+    __syncthreads();
+    EpiState es = epi_begin(e);
+    if (w < 4) {
+      float v = red[0][w][lane];
+#pragma unroll
+      for (int u = 1; u < KS; ++u) v += red[u][w][lane];
+      const int r = g + 8 * (w >> 1), row = sl * 16 + r, col = 2 * t4 + (w & 1);
+      if (row < m && col < n) {
+        v = ex_value<CG>(e, row, col, v * kOut, scs[col]);
+        if (!(EX & kEX_SWIGLU)) {
+          store_any(e.d_dtype, e.d, (size_t)col * e.ldd + row, v);
+          es.amax = fmaxf(es.amax, fabsf(v));
+        }
+        if (EX & (kEX_SWIGLU | kEX_OUT2)) stage[col * 16 + r] = v;
+      }
+    }
+    if (EX & (kEX_SWIGLU | kEX_OUT2)) {
+      __syncthreads();
+      ex_finish<EX>(e, xd, stage, 16, sl * 16, 1, 0, 1, 8, m, n, thread, KS * 32, es);
+    }
+    epi_end(e, es);
+    return;
+  }
   __syncthreads();
   if (w < 4) {
     float v = red[0][w][lane];
@@ -202,10 +239,30 @@ gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, in
     for (int u = 1; u < KS; ++u) v += red[u][w][lane];
     const int row = sl * 16 + g + 8 * (w >> 1), col = 2 * t4 + (w & 1);
     EpiState es = epi_begin(e);
-    if (row < m && col < n) epi_store(e, es, row, col, v * kOut);
+    if (row < m && col < n) epi_store<CG>(e, es, row, col, v * kOut);
     epi_end(e, es);
   }
 #endif
+}
+
+template <int XT, int F, int EX = 0, class... X>
+__global__ void __launch_bounds__(kGvWarps * 32)
+gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, int ldx, const uint8_t *__restrict__ sx, int ldsx,
+               int m, int n, int kt, Epilogue e, X... xs) {
+  __shared__ __align__(16) float smem[gemv_tc_smem_floats(EX)];
+  gemv_tc_slice<XT, F, EX>(ia, x, ldx, sx, ldsx, m, n, kt, e, ex_arg(xs...), blockIdx.x, threadIdx.x, smem);
+}
+
+// the work item's arguments (one slice: item = sl)
+struct GemvTcItemArgs {
+  const uint8_t *ia, *x, *sx;
+  int ldx, ldsx, m, n, kt;
+  Epilogue e;
+  EpilogueEx xd;
+};
+template <int XT, int F, int EX, bool CG = true>
+__device__ __forceinline__ void gemv_tc_item(const GemvTcItemArgs &a, int item, unsigned thread, void *smem) {
+  gemv_tc_slice<XT, F, EX, CG>(a.ia, a.x, a.ldx, a.sx, a.ldsx, a.m, a.n, a.kt, a.e, a.xd, item, thread, (float *)smem);
 }
 
 // Entry point (src/tensors/gemv_tc_inst.cu): x dtype XT (NVFP4, INT8, BF16), formats F (kF_AUE; NVFP4 x kF_BUE, kF_BSWZ,
@@ -213,6 +270,12 @@ gemv_tc_kernel(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, in
 template <int XT, int F>
 cudaError_t gemv_tc_entry(const uint8_t *ia, const uint8_t *x, int ldx, const uint8_t *sx, int ldsx, int m, int n, int k,
                           const Epilogue &e, cudaStream_t s);
+// the extended epilogue's (src/tensors/gemv_tc_inst.cu with -DNVFP4A_EX): x INT8 or BF16, A's scales E4M3, additions EX
+template <int XT, int F> const void *gemv_tc_kernel_ptr();
+template <int XT, int EX> const void *gemv_tc_kernel_ex_ptr();
+template <int XT, int EX>
+cudaError_t gemv_tc_entry_ex(const uint8_t *ia, const uint8_t *x, int ldx, const uint8_t *sx, int ldsx, int m, int n, int k,
+                             const Epilogue &e, const EpilogueEx &xd, cudaStream_t s);
 
 }  // namespace kern
 }  // namespace nvfp4a

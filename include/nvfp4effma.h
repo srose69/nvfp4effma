@@ -69,8 +69,12 @@
 
 #define NVFP4EFFMA_VERSION "0.5.0"
 
+#ifdef __CUDACC_RTC__  /* NVRTC (the work items' device entries): the types only */
+typedef struct CUstream_st *cudaStream_t;
+#else
 #include <stddef.h>
 #include <cuda_runtime.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -216,6 +220,52 @@ nvfp4a_status nvfp4a_gemm_tc(int m, int n, int k, float alpha, const nvfp4a_tens
 nvfp4a_status nvfp4a_gemv_tc(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, int ldb, float beta,
                              const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias,
                              cudaStream_t stream);
+
+/* ---- Extended epilogue (the GEMM / GEMV of a transformer layer in one call) ------------------------------------------
+ * nvfp4a_gemm_ex, nvfp4a_gemv_tc_ex and nvfp4a_gemm_tc_ex compute what nvfp4a_gemm, nvfp4a_gemv_tc and nvfp4a_gemm_tc do,
+ * with these additions to the epilogue (each off when its pointer is NULL / its flag 0):
+ *
+ * Column scale of an RMSNorm (the deferred scalar: W (x w s) = s (W (x w))): column j of B (a token) is scaled by
+ *     s_j = RN(1 / sqrt(sum_j * norm_inv_n + norm_eps)),  sum_j = the norm_nparts values at norm_parts + j * norm_ld,
+ * summed by 32 lanes (lane l: values l, l + 32, ... in ascending order) and then an xor butterfly (16, 8, 4, 2, 1);
+ * it enters the output's scale with B's global: ((alpha * vA(i)) * (vB(j) * s_j)) * f.  The values are read through L2
+ * (they may come from another kernel of the same program).
+ *
+ * SwiGLU: the rows of A come in slices of 16, the gate of outputs 8q .. 8q + 7 and then their up; D has m / 2 rows,
+ * D[8q + r] = silu(g) * u (FP32, silu(g) = g / (1 + exp(-g)) with the GPU's fast exp and division), g and u the
+ * values the plain epilogue gives rows 16q + r and 16q + 8 + r (scale and bias); the amax statistic over D.  m a
+ * multiple of 16; not with C (beta 0) or a second output.
+ *
+ * Second output and the parts of its sum of squares (the input of the next RMSNorm): with v a value of D as stored
+ * (before its rounding), d2[i + j * ldd2] = RN(v * w2[i]) and, per m16 slice s of the rows and column j, sq[j * ld_sq
+ * + s] = sum of RN(v * v) over the slice's 16 rows in ascending order (each part written by one thread: no atomics).
+ * m a multiple of 16.  The parts are the norm_parts of the next call (norm_nparts = m / 16 there).
+ *
+ * With any addition: A's block scales linear E4M3 (nvfp4a_gemm_ex) or E4M3 (the tensor-core entries), B BF16 or INT8.
+ * The work of these calls as items for an executor of one's own: include/nvfp4effma_items.h. */
+typedef struct {
+  const float *norm_parts;       /* column scale: the parts of each column's sum of squares (device), NULL = none */
+  int norm_nparts, norm_ld;
+  float norm_inv_n, norm_eps;
+  int swiglu;                    /* 1: SwiGLU of interleaved gate / up rows */
+  void *d2;                      /* second output (device), NULL = none */
+  nvfp4a_dtype d2_dtype;         /* BF16, FP16 or FP32 */
+  int ldd2;
+  const void *w2;                /* its row weights (device, m values) */
+  nvfp4a_dtype w2_dtype;         /* BF16, FP16 or FP32 */
+  float *sq;                     /* the parts of its sum of squares (device, m / 16 per column) */
+  int ld_sq;
+} nvfp4a_epilogue;
+
+nvfp4a_status nvfp4a_gemm_ex(int m, int n, int k, float alpha, const nvfp4a_tensor *A, int lda, const nvfp4a_tensor *B, int ldb,
+                             float beta, const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias,
+                             const nvfp4a_epilogue *ex, cudaStream_t stream);
+nvfp4a_status nvfp4a_gemv_tc_ex(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, int ldb, float beta,
+                                const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias,
+                                const nvfp4a_epilogue *ex, cudaStream_t stream);
+nvfp4a_status nvfp4a_gemm_tc_ex(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B, float beta,
+                                const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias,
+                                const nvfp4a_epilogue *ex, void *workspace, cudaStream_t stream);
 
 const char *nvfp4a_status_string(nvfp4a_status status);
 

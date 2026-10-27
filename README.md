@@ -93,6 +93,11 @@ methodology and how to add your GPU: [docs/performance.md](docs/performance.md).
   same exact block sums on INT8 `mma` (W4A8, W4A4), BF16 `mma` with exactly scaled weights (W4A16, sm_80+),
   `cp.async` / `ldmatrix` / mbarrier pipelines, persistent stream-K. The weight is rearranged once into an image
   that serves both; the GEMV streams it from DRAM once, in 16-byte loads.
+- **A transformer layer's epilogue in the call** (`nvfp4a_gemm_ex` and the tensor-core `_ex` entries): the
+  deferred RMSNorm column scale, SwiGLU of interleaved gate / up rows, and a second weighted output with the parts of
+  its sum of squares — fixed summation orders, no atomics, on every path. The same work as **work items**
+  (`nvfp4effma_items.h`: count, CTA shape, shared memory, per-item read / write ranges, device entries) for
+  executors that fuse many layers into one persistent program.
 - **Every NVIDIA NVFP4 variant** in GEMM, GEMV, quantization and dequantization, with Transformer Engine's
   arithmetic bit for bit (see [NVIDIA NVFP4 variants](#nvidia-nvfp4-variants)); scale layout conversion
   (linear ↔ GEMM-swizzled) and the transpose of 16 × 16-tiled tensors.

@@ -11,8 +11,21 @@
 //   rounding   : accumulate in FP32 over the whole reduction, round once when storing
 //   contract   : block scales are finite (no E4M3 NaN code); not checked
 #pragma once
+#ifdef __CUDACC_RTC__  // NVRTC (an executor's kernels: include/nvfp4effma_items.cuh): libcu++ for the C / C++ library
+#include <cuda/std/cstdint>
+#include <cuda/std/cstddef>
+#include <cuda/std/type_traits>
+#include <cuda/std/utility>
+namespace std { using namespace cuda::std; }
+using cuda::std::int8_t; using cuda::std::int16_t; using cuda::std::int32_t; using cuda::std::int64_t;
+using cuda::std::uint8_t; using cuda::std::uint16_t; using cuda::std::uint32_t; using cuda::std::uint64_t;
+using cuda::std::size_t; using cuda::std::uintptr_t;
+#include <sm_61_intrinsics.h>  // __dp4a (nvcc: implicit; NVRTC declares it, the bodies are in the .hpp)
+#include <sm_61_intrinsics.hpp>
+#else
 #include <stdint.h>
 #include <string.h>
+#endif
 #include <cuda_fp16.h>
 #include "../include/nvfp4effma.h"
 
@@ -212,11 +225,16 @@ template <int T> struct Elem { static constexpr int bytes = T == NVFP4A_FP32 ? 4
 
 __device__ __forceinline__ float scale_or_one(const float *p) { return p ? *p : 1.0f; }
 
+// CG: mutable work-item inputs (include/nvfp4effma_items.h) bypass L1 and the non-coherent read-only cache.
+template <bool CG, class T>
+__device__ __forceinline__ T load_global(const T *p) { return CG ? __ldcg(p) : *p; }
+
+template <bool CG = false>
 __device__ __forceinline__ float load_any(int t, const void *p, size_t i) {
   switch (t) {
-    case NVFP4A_BF16: return __uint_as_float((uint32_t)((const uint16_t *)p)[i] << 16);
-    case NVFP4A_FP16: return __half2float(((const __half *)p)[i]);
-    default: return ((const float *)p)[i];
+    case NVFP4A_BF16: return __uint_as_float((uint32_t)load_global<CG>((const uint16_t *)p + i) << 16);
+    case NVFP4A_FP16: return __half2float(CG ? __ushort_as_half(__ldcg((const uint16_t *)p + i)) : ((const __half *)p)[i]);
+    default: return load_global<CG>((const float *)p + i);
   }
 }
 __device__ __forceinline__ void store_any(int t, void *p, size_t i, float v) {
@@ -233,13 +251,13 @@ __device__ __forceinline__ void unpack2(uint32_t w, float &v0, float &v1) {
   else { const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(&w)); v0 = f.x; v1 = f.y; }
 }
 // 8 consecutive dense values of type T (address aligned to 8 * bytes) -> 8 exact FP32 values
-template <int T>
+template <int T, bool CG = false>
 __device__ __forceinline__ void load8(const uint8_t *p, float v[8]) {
   if (T == NVFP4A_FP32) {
-    const float4 a = *(const float4 *)p, b = *(const float4 *)(p + 16);
+    const float4 a = load_global<CG>((const float4 *)p), b = load_global<CG>((const float4 *)(p + 16));
     v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
   } else {
-    const uint4 w = *(const uint4 *)p;
+    const uint4 w = load_global<CG>((const uint4 *)p);
     unpack2<T>(w.x, v[0], v[1]); unpack2<T>(w.y, v[2], v[3]); unpack2<T>(w.z, v[4], v[5]); unpack2<T>(w.w, v[6], v[7]);
   }
 }
@@ -274,22 +292,110 @@ __device__ __forceinline__ EpiState epi_begin(const Epilogue &) { return {0.f}; 
 __device__ __forceinline__ float epi_row_part(const Epilogue &e, int i) {
   return __fmul_rn(e.alpha, e.ga ? e.ga[(size_t)i * e.sa] : 1.f);
 }
-__device__ __forceinline__ float epi_col_part(const Epilogue &e, int j) { return e.gb ? e.gb[(size_t)j * e.sb] : 1.f; }
+template <bool CG = false>
+__device__ __forceinline__ float epi_col_part(const Epilogue &e, int j) {
+  return e.gb ? load_global<CG>(e.gb + (size_t)j * e.sb) : 1.f;
+}
 __device__ __forceinline__ float epi_scale_ab(const Epilogue &e, float a, float b) { return __fmul_rn(__fmul_rn(a, b), e.gf); }
+template <bool CG = false>
 __device__ __forceinline__ float epi_scale(const Epilogue &e, int i, int j) {
-  return epi_scale_ab(e, epi_row_part(e, i), epi_col_part(e, j));
+  return epi_scale_ab(e, epi_row_part(e, i), epi_col_part<CG>(e, j));
 }
 // D[i + j*ldd] = RNE(acc * s + bias[i] + beta * C[i + j*ldc]), max-reducing |value| into the amax
 // statistic.  C may alias D: each element is read and then written by the same thread.
+template <bool CG = false>
 __device__ __forceinline__ void epi_store(const Epilogue &e, EpiState &st, int i, int j, float acc) {
-  float v = __fmul_rn(acc, epi_scale(e, i, j));
+  float v = __fmul_rn(acc, epi_scale<CG>(e, i, j));
   if (e.bias) v = __fadd_rn(v, load_any(e.bias_dtype, e.bias, i));
-  if (e.beta != 0.f) v = __fmaf_rn(e.beta, load_any(e.c_dtype, e.c, (size_t)j * e.ldc + i), v);
+  if (e.beta != 0.f) v = __fmaf_rn(e.beta, load_any<CG>(e.c_dtype, e.c, (size_t)j * e.ldc + i), v);
   store_any(e.d_dtype, e.d, (size_t)j * e.ldd + i, v);
   st.amax = fmaxf(st.amax, fabsf(v));
 }
 __device__ __forceinline__ void epi_end(const Epilogue &e, EpiState &st) {
   if (e.amax) amax_commit(e.amax, st.amax);
+}
+
+// ---- extended epilogue (nvfp4a_gemm_ex & co.; include/nvfp4effma.h) -------------------------------------------------
+// EX: which additions an instance carries (compile time: an instance without them is the plain kernel)
+constexpr int kEX_NORM = 1, kEX_SWIGLU = 2, kEX_OUT2 = 4;
+constexpr int kEX_MASKS = 5;  // the masks 1 .. 5: kEX_SWIGLU with kEX_OUT2 is not a combination
+struct EpilogueEx {
+  const float *norm_parts; int norm_nparts, norm_ld; float norm_inv_n, norm_eps;
+  void *d2; int d2_dtype, ldd2; const void *w2; int w2_dtype;
+  float *sq; int ld_sq;
+};
+// a kernel's descriptor: its trailing parameter, none in the plain kernel (EX = 0)
+__device__ __forceinline__ EpilogueEx ex_arg() { return EpilogueEx{}; }
+__device__ __forceinline__ EpilogueEx ex_arg(const EpilogueEx &x) { return x; }
+// s_j of the NB columns j0 + c (columns at or past n: column 0), in every lane of the calling warp: lane l adds the parts
+// l, l + 32, ... in order, then the butterfly.  The columns' loads, 4 parts deep, are in flight together.
+template <int NB>
+__device__ __forceinline__ void ex_norm_scales(const EpilogueEx &x, int j0, int n, int lane, float (&cs)[NB]) {
+  const float *p[NB];
+  float s[NB];
+#pragma unroll
+  for (int c = 0; c < NB; ++c) { p[c] = x.norm_parts + (size_t)(j0 + c < n ? j0 + c : 0) * x.norm_ld; s[c] = 0.f; }
+#pragma unroll 4
+  for (int i = lane; i < x.norm_nparts; i += 32) {
+    float v[NB];
+#pragma unroll
+    for (int c = 0; c < NB; ++c) v[c] = __ldcg(p[c] + i);
+#pragma unroll
+    for (int c = 0; c < NB; ++c) s[c] = __fadd_rn(s[c], v[c]);
+  }
+#pragma unroll
+  for (int c = 0; c < NB; ++c) {
+#pragma unroll
+    for (int o = 16; o; o >>= 1) s[c] = __fadd_rn(s[c], __shfl_xor_sync(0xFFFFFFFFu, s[c], o));
+    cs[c] = __frsqrt_rn(__fadd_rn(__fmul_rn(s[c], x.norm_inv_n), x.norm_eps));
+  }
+}
+__device__ __forceinline__ float ex_norm_scale(const EpilogueEx &x, int j, int lane) {
+  float c[1];
+  ex_norm_scales<1>(x, j, j + 1, lane, c);
+  return c[0];
+}
+// the value epi_store stores (before its rounding), column part times cs (s_j, or 1)
+template <bool CG = false>
+__device__ __forceinline__ float ex_value(const Epilogue &e, int i, int j, float acc, float cs) {
+  float v = __fmul_rn(acc, epi_scale_ab(e, epi_row_part(e, i), __fmul_rn(epi_col_part<CG>(e, j), cs)));
+  if (e.bias) v = __fadd_rn(v, load_any(e.bias_dtype, e.bias, i));
+  if (e.beta != 0.f) v = __fmaf_rn(e.beta, load_any<CG>(e.c_dtype, e.c, (size_t)j * e.ldc + i), v);
+  return v;
+}
+__device__ __forceinline__ float silu_mul(float g, float u) { return __fmul_rn(__fdividef(g, __fadd_rn(1.f, __expf(-g))), u); }
+// The CTA's whole m16 slices, their values staged as v[c * ldv + r] (rows r0 + r, columns c0 + c cst, r < 16 S, c < NC):
+// SwiGLU writes D (m / 2 rows); OUT2 writes the second output and the parts of its sum of squares (D written by the
+// caller).  Threads t of T share the work; the caller synchronizes before (the values) and after (the stage's reuse).
+template <int EX>
+__device__ __forceinline__ void ex_finish(const Epilogue &e, const EpilogueEx &x, const float *v, int ldv, int r0, int S, int c0,
+                                          int cst, int NC, int m, int n, int t, int T, EpiState &st) {
+  if (EX & kEX_SWIGLU) {
+    for (int w = t; w < 8 * S * NC; w += T) {
+      const int c = w / (8 * S), q = w - c * 8 * S, s = q >> 3, r = q & 7, row = r0 + 16 * s + r, col = c0 + c * cst;
+      if (row < m && col < n) {
+        const float h = silu_mul(v[c * ldv + 16 * s + r], v[c * ldv + 16 * s + 8 + r]);
+        store_any(e.d_dtype, e.d, (size_t)col * e.ldd + r0 / 2 + 8 * s + r, h);
+        st.amax = fmaxf(st.amax, fabsf(h));
+      }
+    }
+  }
+  if (EX & kEX_OUT2) {
+    for (int w = t; w < 16 * S * NC; w += T) {
+      const int c = w / (16 * S), r = w - c * 16 * S, row = r0 + r, col = c0 + c * cst;
+      if (row < m && col < n)
+        store_any(x.d2_dtype, x.d2, (size_t)col * x.ldd2 + row, __fmul_rn(v[c * ldv + r], load_any(x.w2_dtype, x.w2, row)));
+    }
+    for (int w = t; w < S * NC; w += T) {
+      const int c = w / S, s = w - c * S, col = c0 + c * cst;
+      if (r0 + 16 * s < m && col < n) {
+        float q = 0.f;
+#pragma unroll
+        for (int r = 0; r < 16; ++r) q = __fadd_rn(q, __fmul_rn(v[c * ldv + 16 * s + r], v[c * ldv + 16 * s + r]));
+        x.sq[(size_t)col * x.ld_sq + (r0 >> 4) + s] = q;
+      }
+    }
+  }
 }
 
 // ---- per-architecture kernel tables ----------------------------------------------------------

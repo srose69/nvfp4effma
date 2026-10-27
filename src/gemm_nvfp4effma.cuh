@@ -7,7 +7,9 @@
 //   gemm_dp4a_kernel  NVFP4 x NVFP4 / INT8 from sm_61: int8 tiles, 4 DP4A + 2 FFMA per output and block
 // Both kernels compute the same NVFP4 x NVFP4 / INT8 values bit for bit.
 #pragma once
+#ifndef __CUDACC_RTC__  // (NVRTC: nvfp4effma.cuh's libcu++)
 #include <type_traits>
+#endif
 #include "nvfp4effma.cuh"
 
 namespace nvfp4a {
@@ -42,7 +44,7 @@ struct GemmCfg {
 //   NVFP4, INT = false: values a * sa (exact)        NVFP4, INT = true: integers 2a, sa to ss[row]
 //   INT8 (INT = true): the int8 values, their FP32 block scale to ss[row]
 // NVFP4 scales: SWZ = swizzled layout (lds = -padded columns), UE = UE5M3.
-template <class C, int R, int T, bool INT, bool SWZ = false, bool UE = false>
+template <class C, int R, int T, bool INT, bool SWZ = false, bool UE = false, bool CG = false>
 struct TileLoader {
   static constexpr bool FP4 = T == NVFP4A_NVFP4, Q8 = T == NVFP4A_INT8;
   static constexpr int E = R * C::BK / C::NT < 8 ? R * C::BK / C::NT : 8;
@@ -74,15 +76,15 @@ struct TileLoader {
   __device__ __forceinline__ void fetch() {
 #pragma unroll
     for (int j = 0; j < CH; ++j) {
-      if (FP4) { raw[j][0] = *(const uint32_t *)p[j]; sc[j] = *ps[j]; }
+      if (FP4) { raw[j][0] = load_global<CG>((const uint32_t *)p[j]); sc[j] = load_global<CG>(ps[j]); }
       else if (RW == 2) {
-        const uint2 w = *(const uint2 *)p[j]; raw[j][0] = w.x; raw[j][1] = w.y;
-        if (Q8) sc[j] = *(const uint32_t *)ps[j];
+        const uint2 w = load_global<CG>((const uint2 *)p[j]); raw[j][0] = w.x; raw[j][1] = w.y;
+        if (Q8) sc[j] = load_global<CG>((const uint32_t *)ps[j]);
       }
       else {
 #pragma unroll
         for (int q = 0; q < RW; q += 4) {
-          const uint4 w = *(const uint4 *)(p[j] + 4 * q);
+          const uint4 w = load_global<CG>((const uint4 *)(p[j] + 4 * q));
           raw[j][q] = w.x; raw[j][q + 1] = w.y; raw[j][q + 2] = w.z; raw[j][q + 3] = w.w;
         }
       }
@@ -128,33 +130,70 @@ struct TileLoader {
 // in shared memory s[c * BM + r], then each thread stores BM * NC / NT of them, consecutive threads on
 // consecutive rows.  One inlined epilogue in a loop instead of a call per output: no call frame, no
 // stack, and the stores coalesce along m.  col(j, c) maps a staged column to its column in D.
-template <int BM, int NC, int NT, class Col>
+template <int BM, int NC, int NT, bool CG = false, class Col>
 __device__ __forceinline__ void epi_staged_pass(const Epilogue &e, EpiState &st, const float *s, int m0, int m, int n,
                                                 int j, Col col) {
 #pragma unroll 1
   for (int q = 0; q < BM * NC / NT; ++q) {
     const int el = q * NT + threadIdx.x, r = el % BM, c = el / BM;
     const int gi = m0 + r, gj = col(j, c);
-    if (gi < m && gj < n) epi_store(e, st, gi, gj, s[c * BM + r]);
+    if (gi < m && gj < n) epi_store<CG>(e, st, gi, gj, s[c * BM + r]);
   }
 }
 
-template <class C, int TB, int F>
-__global__ void __launch_bounds__(C::NT, TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8 ? 1 : C::MINB)
-gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
-            const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n, int k,
-            Epilogue e) {
+// The extended epilogue of a tile (nvfp4a_gemm_ex): s_j of the tile's columns n0 .. n0 + BN - 1 to scs (a warp per
+// column; columns past n take column 0), and the pass over a staged block -- BM rows x NC columns c0 + c cst, accumulators
+// s[c * BM + r] -- that turns them into the values, stores D (unless SwiGLU) and runs ex_finish on whole m16 slices.
+// (a warp per 8 consecutive columns at a time)
+template <int BN, int NT>
+__device__ __forceinline__ void ex_tile_scales(const EpilogueEx &x, float *scs, int n0, int n) {
+  static_assert(BN % 8 == 0, "groups of 8 columns");
+#pragma unroll 1
+  for (int c = 8 * (threadIdx.x / 32); c < BN; c += 8 * (NT / 32)) {
+    float v[8];
+    ex_norm_scales<8>(x, n0 + c, n, threadIdx.x & 31, v);
+#pragma unroll
+    for (int q = 0; q < 8; ++q)
+      if ((threadIdx.x & 31) == q) scs[c + q] = v[q];
+  }
+}
+template <int BM, int NC, int NT, int EX, bool CG = false>
+__device__ __forceinline__ void ex_staged_pass(const Epilogue &e, const EpilogueEx &x, EpiState &st, float *s, const float *scs,
+                                               int m0, int n0, int m, int n, int c0, int cst) {
+#pragma unroll 1
+  for (int q = 0; q < BM * NC / NT; ++q) {
+    const int el = q * NT + threadIdx.x, r = el % BM, c = el / BM;
+    const int gi = m0 + r, gj = c0 + c * cst;
+    if (gi < m && gj < n) {
+      const float v = ex_value<CG>(e, gi, gj, s[c * BM + r], (EX & kEX_NORM) ? scs[gj - n0] : 1.f);
+      if (!(EX & kEX_SWIGLU)) {
+        store_any(e.d_dtype, e.d, (size_t)gj * e.ldd + gi, v);
+        st.amax = fmaxf(st.amax, fabsf(v));
+      }
+      s[c * BM + r] = v;
+    }
+  }
+  if (EX & (kEX_SWIGLU | kEX_OUT2)) {
+    __syncthreads();
+    ex_finish<EX>(e, x, s, BM, m0, BM / 16, c0, cst, NC, m, n, threadIdx.x, NT, st);
+  }
+}
+
+// The kernels take the extended epilogue's additions EX and its descriptor as a trailing parameter (EX = 0: none, the
+// plain kernel).
+
+template <class C, int TB, int F, int EX, bool CG>
+__device__ __forceinline__ void
+gemm_body(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
+          const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n, int k,
+          const Epilogue &e, const EpilogueEx &xd, int m0, int n0, float *sA, float *sB, float *ssA, float *ssB) {
   if (!C::template On<TB>::value) { __trap(); return; }
   // NVFP4 x NVFP4 / INT8: exact block sums, then the two scale FFMAs; the result times kOut
   constexpr bool INT = TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8;
   constexpr float kOut = TB == NVFP4A_INT8 ? 0.5f : 0.25f;
-  __shared__ __align__(16) float sA[C::BK * (C::BM + C::PAD)];
-  __shared__ __align__(16) float sB[C::BK * (C::BN + C::PAD)];
-  __shared__ __align__(16) float ssA[INT ? C::BM : 1], ssB[INT ? C::BN : 1];
   const int tx = threadIdx.x % C::TX, ty = threadIdx.x / C::TX;
-  const int m0 = blockIdx.y * C::BM, n0 = blockIdx.x * C::BN;
   using LA = TileLoader<C, C::BM, NVFP4A_NVFP4, INT, (F & kF_ASWZ) != 0, (F & kF_AUE) != 0>;
-  using LB = TileLoader<C, C::BN, TB, INT, (F & kF_BSWZ) != 0, (F & kF_BUE) != 0>;
+  using LB = TileLoader<C, C::BN, TB, INT, (F & kF_BSWZ) != 0, (F & kF_BUE) != 0, CG>;
   static_assert(C::TX * 4 >= 32 && C::TY * 4 >= 32, "fragment XOR must stay inside a 32-column block");
   LA la; la.init(A, lda, SA, ldsa, m0, m);
   LB lb; lb.init(B, ldb, SB, ldsb, n0, n);
@@ -225,6 +264,11 @@ gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
 
   // Epilogue, staged through sA one column of the thread tile at a time (BM rows x TY columns).
   static_assert(C::TY <= C::BK && C::BM % 4 == 0, "a staged column must fit in sA");
+  static_assert(!EX || C::BM % 16 == 0, "the extended epilogue takes whole m16 slices");
+  if (EX & kEX_NORM) {  // s_j to sB, free once every warp is done with the last k-tile
+    __syncthreads();
+    ex_tile_scales<C::BN, C::NT>(xd, sB, n0, n);
+  }
   EpiState st = epi_begin(e);
 #pragma unroll 1
   for (int j = 0; j < C::TN; ++j) {  // run-time j: one copy of the epilogue
@@ -239,10 +283,25 @@ gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ 
                   : make_float4(acc[4 * g][jj], acc[4 * g + 1][jj], acc[4 * g + 2][jj], acc[4 * g + 3][jj]);
       }
     __syncthreads();
-    epi_staged_pass<C::BM, C::TY, C::NT>(e, st, sA, m0, m, n, j,
-                                          [&](int jp, int c) { return n0 + (jp / 4) * C::TY * 4 + c * 4 + (jp & 3); });
+    if (EX) ex_staged_pass<C::BM, C::TY, C::NT, EX, CG>(e, xd, st, sA, sB, m0, n0, m, n, n0 + (j / 4) * C::TY * 4 + (j & 3), 4);
+    else
+      epi_staged_pass<C::BM, C::TY, C::NT, CG>(e, st, sA, m0, m, n, j,
+                                            [&](int jp, int c) { return n0 + (jp / 4) * C::TY * 4 + c * 4 + (jp & 3); });
   }
   epi_end(e, st);
+}
+
+template <class C, int TB, int F, int EX = 0, class... X>
+__global__ void __launch_bounds__(C::NT, TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8 ? 1 : C::MINB)
+gemm_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
+            const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n, int k,
+            Epilogue e, X... xs) {
+  constexpr bool INT = TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8;
+  __shared__ __align__(16) float sA[C::BK * (C::BM + C::PAD)];
+  __shared__ __align__(16) float sB[C::BK * (C::BN + C::PAD)];
+  __shared__ __align__(16) float ssA[INT ? C::BM : 1], ssB[INT ? C::BN : 1];
+  gemm_body<C, TB, F, EX, false>(A, lda, SA, ldsa, B, ldb, SB, ldsb, m, n, k, e, ex_arg(xs...),
+                                 blockIdx.y * C::BM, blockIdx.x * C::BN, sA, sB, ssA, ssB);
 }
 
 template <class C, int TB, int F = 0>
@@ -250,6 +309,13 @@ cudaError_t gemm_launch(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, 
                         const uint8_t *SB, int ldsb, int m, int n, int k, const Epilogue &e, cudaStream_t s) {
   dim3 grid((n + C::BN - 1) / C::BN, (m + C::BM - 1) / C::BM);
   gemm_kernel<C, TB, F><<<grid, C::NT, 0, s>>>(A, lda, SA, ldsa, B, ldb, SB, ldsb, m, n, k, e);
+  return cudaGetLastError();
+}
+template <class C, int TB, int EX>
+cudaError_t gemm_launch_ex(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb, const uint8_t *SB,
+                           int ldsb, int m, int n, int k, const Epilogue &e, const EpilogueEx &x, cudaStream_t s) {
+  dim3 grid((n + C::BN - 1) / C::BN, (m + C::BM - 1) / C::BM);
+  gemm_kernel<C, TB, 0, EX><<<grid, C::NT, 0, s>>>(A, lda, SA, ldsa, B, ldb, SB, ldsb, m, n, k, e, x);
   return cudaGetLastError();
 }
 
@@ -264,11 +330,11 @@ cudaError_t gemm_launch(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, 
 // scheduling than they gain in occupancy.
 // ---------------------------------------------------------------------------------------------
 // 4 consecutive values i .. i + 3 of a BF16 / FP16 / FP32 array; vec: aligned for one vector access
-template <int T>
+template <int T, bool CG = false>
 __device__ __forceinline__ void load4_any(const void *p, size_t i, bool vec, float v[4]) {
-  if (vec && T == NVFP4A_FP32) { const float4 a = *(const float4 *)((const float *)p + i); v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; }
-  else if (vec) { const uint2 w = *(const uint2 *)((const uint16_t *)p + i); unpack2<T>(w.x, v[0], v[1]); unpack2<T>(w.y, v[2], v[3]); }
-  else for (int q = 0; q < 4; ++q) v[q] = load_any(T, p, i + q);
+  if (vec && T == NVFP4A_FP32) { const float4 a = load_global<CG>((const float4 *)((const float *)p + i)); v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w; }
+  else if (vec) { const uint2 w = load_global<CG>((const uint2 *)((const uint16_t *)p + i)); unpack2<T>(w.x, v[0], v[1]); unpack2<T>(w.y, v[2], v[3]); }
+  else for (int q = 0; q < 4; ++q) v[q] = load_any<CG>(T, p, i + q);
 }
 template <int T>
 __device__ __forceinline__ void store4_any(void *p, size_t i, bool vec, const float v[4]) {
@@ -292,21 +358,18 @@ struct Dp4aCfgT {
 using Dp4aCfg = Dp4aCfgT<128, 8, 1>;
 using Dp4aCfgNarrow = Dp4aCfgT<64, 4, 2>;  // ~120 registers: two blocks per SM
 
-template <class C, int TB, int F>
-__global__ void __launch_bounds__(C::NT, C::MINB)
-gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
-                 const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n,
-                 int k, Epilogue e) {
+template <class C, int TB, int F, int EX, bool CG>
+__device__ __forceinline__ void
+gemm_dp4a_body(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
+               const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n,
+               int k, const Epilogue &e, const EpilogueEx &xd, int m0, int n0,
+               uint4 sAB[2][2][C::KBT * C::BM], float2 ssa2[2][C::KBT][C::BM], float ssb2[2][C::KBT][C::BN]) {
 #if __CUDA_ARCH__ < 610
   __trap();
 #else
   constexpr int BM = C::BM, BN = C::BN, KBT = C::KBT;
-  __shared__ __align__(16) uint4 sAB[2][2][KBT * BM];  // [A / B][buffer][block][row]: 16 int8 per block and row
   uint4 (*sA2)[KBT * BM] = sAB[0], (*sB2)[KBT * BM] = sAB[1];  // B buffers sized for BM >= BN
-  __shared__ __align__(16) float2 ssa2[2][KBT][BM];  // (sa, -1.5 * 2^23 * sa)
-  __shared__ __align__(16) float ssb2[2][KBT][BN];   // [block][ty * TN + j]
   const int tid = threadIdx.x, tx = tid % C::TX, ty = tid / C::TX;
-  const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
   // loads: every thread takes two blocks of one row of A (16 bytes) and of B (16 bytes of NVFP4, 32 of
   // INT8) per k-tile; threads 0..127 the 4 block scales of a row of A (one 32-bit word), threads 128..255
   // those of a row of B (a word of 4 E4M3, or 4 floats for INT8).  Rows past the end of the matrix read
@@ -336,9 +399,9 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
   for (int i = 0; i < C::TM; ++i)
 #pragma unroll
     for (int j = 0; j < C::TN; ++j) acc[i][j] = 0.f;
-  uint4 ra = pa[0], rb = pb[0], rb2 = Q8 ? pb[1] : make_uint4(0, 0, 0, 0);
-  uint32_t rs = sa_thr || !Q8 ? ps[0] : 0;
-  float4 rsb = Q8 && !sa_thr ? psb[0] : make_float4(0.f, 0.f, 0.f, 0.f);
+  uint4 ra = pa[0], rb = load_global<CG>(pb), rb2 = Q8 ? load_global<CG>(pb + 1) : make_uint4(0, 0, 0, 0);
+  uint32_t rs = sa_thr || !Q8 ? (CG && !sa_thr ? __ldcg(ps) : ps[0]) : 0;
+  float4 rsb = Q8 && !sa_thr ? load_global<CG>(psb) : make_float4(0.f, 0.f, 0.f, 0.f);
   const int tiles = k / (16 * KBT);
   auto decode = [&](int buf) {
     uint4 *sA = sA2[buf], *sB = sB2[buf];
@@ -361,9 +424,11 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
   };
   auto load_next = [&] {
     pa += 2; ra = *pa;
-    pb += 2 * BW; rb = pb[0];
-    if (Q8) rb2 = pb[1];
-    if (Q8 && !sa_thr) rsb = *++psb; else if (PSA == 1 && PSB == 1) rs = *++ps; else { ps += pstep; rs = *ps; }
+    pb += 2 * BW; rb = load_global<CG>(pb);
+    if (Q8) rb2 = load_global<CG>(pb + 1);
+    if (Q8 && !sa_thr) rsb = load_global<CG>(++psb);
+    else if (PSA == 1 && PSB == 1) { ++ps; rs = CG && !sa_thr ? __ldcg(ps) : *ps; }
+    else { ps += pstep; rs = CG && !sa_thr ? __ldcg(ps) : *ps; }
   };
   decode(0);
   if (tiles > 1) load_next();
@@ -404,6 +469,24 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
     __syncthreads();
   }
 
+  if (EX) {  // staged as the C path below (raw accumulators), s_j in the B scale buffers
+    const EpilogueEx x = xd;
+    float *stage = reinterpret_cast<float *>(sAB), *scs = &ssb2[0][0][0];
+    if (EX & kEX_NORM) ex_tile_scales<BN, C::NT>(x, scs, n0, n);
+    EpiState st = epi_begin(e);
+#pragma unroll
+    for (int h = 0; h < C::TN / 4; ++h) {
+      __syncthreads();
+#pragma unroll
+      for (int jl = 0; jl < 4; ++jl)
+#pragma unroll
+        for (int i = 0; i < C::TM; ++i) stage[(jl * C::TY + ty) * BM + tx + C::TX * i] = acc[i][4 * h + jl] * kOut;
+      __syncthreads();
+      ex_staged_pass<BM, 4 * C::TY, C::NT, EX, CG>(e, x, st, stage, scs, m0, n0, m, n, n0 + 4 * h * C::TY, 1);
+    }
+    epi_end(e, st);
+    return;
+  }
   // Epilogue (the operations of epi_store; C is read by the thread that writes the same element of D, so C
   // may alias D).  With one resident block per SM nothing overlaps it.  Without C every output is stored
   // straight from the registers, an interior tile without bias or amax skipping the per-output checks.
@@ -421,7 +504,7 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
 #pragma unroll
     for (int i = 0; i < C::TM; ++i) { const int gi = m0 + tx + C::TX * i; ra[i] = epi_row_part(e, gi < m ? gi : 0); }
 #pragma unroll
-    for (int j = 0; j < C::TN; ++j) { const int gj = n0 + ty + C::TY * j; rb[j] = epi_col_part(e, gj < n ? gj : 0); }
+    for (int j = 0; j < C::TN; ++j) { const int gj = n0 + ty + C::TY * j; rb[j] = epi_col_part<CG>(e, gj < n ? gj : 0); }
 #pragma unroll
     for (int j = 0; j < C::TN; ++j)
 #pragma unroll
@@ -450,7 +533,7 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
 #pragma unroll
     for (int i = 0; i < C::TM; ++i) { const int gi = m0 + tx + C::TX * i; ra[i] = epi_row_part(e, gi < m ? gi : 0); }
 #pragma unroll
-    for (int j = 0; j < C::TN; ++j) { const int gj = n0 + ty + C::TY * j; rb[j] = epi_col_part(e, gj < n ? gj : 0); }
+    for (int j = 0; j < C::TN; ++j) { const int gj = n0 + ty + C::TY * j; rb[j] = epi_col_part<CG>(e, gj < n ? gj : 0); }
 #pragma unroll
     for (int h = 0; h < C::TN / 4; ++h) {
       __syncthreads();  // the k loop, or the previous half, is done with the buffers
@@ -468,7 +551,10 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
         const bool all4 = gi + 3 < m;
         float v[4], cv[4];
         *reinterpret_cast<float4 *>(v) = *reinterpret_cast<const float4 *>(&stage[c * BM + r]);
-        load4_any<CT>(e.c, (size_t)gj * e.ldc + gi, all4 && vc, cv);
+        if (CG && !all4) {
+#pragma unroll
+          for (int u = 0; u < 4; ++u) cv[u] = gi + u < m ? load_any<CG>(CT, e.c, (size_t)gj * e.ldc + gi + u) : 0.f;
+        } else load4_any<CT, CG>(e.c, (size_t)gj * e.ldc + gi, all4 && vc, cv);
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
           if (e.bias && gi + u < m) v[u] = __fadd_rn(v[u], load_any(e.bias_dtype, e.bias, gi + u));
@@ -499,6 +585,50 @@ gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restri
 #endif
 }
 
+template <class C, int TB, int F, int EX = 0, class... X>
+__global__ void __launch_bounds__(C::NT, C::MINB)
+gemm_dp4a_kernel(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
+                 const uint8_t *__restrict__ B, int ldb, const uint8_t *__restrict__ SB, int ldsb, int m, int n,
+                 int k, Epilogue e, X... xs) {
+  __shared__ __align__(16) uint4 sAB[2][2][C::KBT * C::BM];
+  __shared__ __align__(16) float2 ssa2[2][C::KBT][C::BM];
+  __shared__ __align__(16) float ssb2[2][C::KBT][C::BN];
+  gemm_dp4a_body<C, TB, F, EX, false>(A, lda, SA, ldsa, B, ldb, SB, ldsb, m, n, k, e, ex_arg(xs...),
+                                      blockIdx.y * C::BM, blockIdx.x * C::BN, sAB, ssa2, ssb2);
+}
+
+// A tile's shared memory is supplied by the executor; static launch storage remains in the wrappers above.
+template <class C, int TB> struct GemmShared {
+  static constexpr bool INT = TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8;
+  __align__(16) float a[C::BK * (C::BM + C::PAD)], b[C::BK * (C::BN + C::PAD)];
+  __align__(16) float sa[INT ? C::BM : 1], sb[INT ? C::BN : 1];
+};
+template <class C> struct Dp4aShared {
+  __align__(16) uint4 ab[2][2][C::KBT * C::BM];
+  __align__(16) float2 sa[2][C::KBT][C::BM];
+  __align__(16) float sb[2][C::KBT][C::BN];
+};
+struct GemmItemArgs {
+  const uint8_t *A, *SA, *B, *SB;
+  int lda, ldsa, ldb, ldsb, m, n, k;
+  Epilogue e;
+  EpilogueEx x;
+};
+template <class C, int TB, int EX, bool CG = true>
+__device__ __forceinline__ void gemm_item(const GemmItemArgs &a, int item, unsigned, void *smem) {
+  auto &s = *(GemmShared<C, TB> *)smem;
+  const int mt = (a.m + C::BM - 1) / C::BM;
+  gemm_body<C, TB, 0, EX, CG>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, a.m, a.n, a.k, a.e, a.x,
+                              item % mt * C::BM, item / mt * C::BN, s.a, s.b, s.sa, s.sb);
+}
+template <class C, int EX, bool CG = true>
+__device__ __forceinline__ void gemm_dp4a_item(const GemmItemArgs &a, int item, unsigned, void *smem) {
+  auto &s = *(Dp4aShared<C> *)smem;
+  const int mt = (a.m + C::BM - 1) / C::BM;
+  gemm_dp4a_body<C, NVFP4A_INT8, 0, EX, CG>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, a.m, a.n, a.k, a.e, a.x,
+                                          item % mt * C::BM, item / mt * C::BN, s.ab, s.sa, s.sb);
+}
+
 // Candidates of the dense-B FFMA kernel: id, BM, BN, TM, TN.  All share the 8 x 8 thread tile (same
 // FFMA : LDS ratio); the block tile only trades parallelism on small grids, which depends on the SM
 // count.  Ids are what src/nvfp4effma_tuned.h stores.
@@ -519,6 +649,10 @@ NVFP4A_GEMM_CANDIDATES(NVFP4A_DEF_GEMM)
 
 namespace nvfp4a {
 namespace kern {
+template <int ID, int TB, int F> const void *gemm_kernel_ptr();
+template <int ID, int TB, int EX> const void *gemm_kernel_ex_ptr();
+template <int TB, int F> const void *dp4a_kernel_ptr(bool narrow);
+template <int EX> const void *dp4a_kernel_ex_ptr(bool narrow);
 // Entry points, explicitly instantiated by the instance objects: the FFMA kernel of config ID for B dtype TB
 // (gemm_nvfp4effma_inst.cu) and the DP4A kernel, wide or narrow tile (gemm_dp4a_inst.cu), per formats F.
 template <int ID, int TB, int F>
@@ -527,5 +661,12 @@ cudaError_t gemm_entry(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, c
 template <int TB, int F>
 cudaError_t dp4a_entry(bool narrow, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb,
                        const uint8_t *SB, int ldsb, int m, int n, int k, const Epilogue &e, cudaStream_t s);
+// the extended epilogue's kernels (linear E4M3 scales of A; FFMA: B BF16, or INT8 below sm_61; DP4A: B INT8), additions EX
+template <int ID, int TB, int EX>
+cudaError_t gemm_entry_ex(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb, const uint8_t *SB,
+                          int ldsb, int m, int n, int k, const Epilogue &e, const EpilogueEx &x, cudaStream_t s);
+template <int EX>
+cudaError_t dp4a_entry_ex(bool narrow, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb,
+                          const uint8_t *SB, int ldsb, int m, int n, int k, const Epilogue &e, const EpilogueEx &x, cudaStream_t s);
 }  // namespace kern
 }  // namespace nvfp4a

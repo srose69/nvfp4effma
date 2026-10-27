@@ -46,6 +46,68 @@ scales finite (no E4M3 NaN code; not checked).
 **Constraints of the conversions:** `cols`, `lds`, `ldd` multiples of 16; dense data 16-byte aligned, NVFP4
 data 8-byte aligned; quantization input finite.
 
+## Extended epilogue
+
+`nvfp4a_gemm_ex`, `nvfp4a_gemv_tc_ex` and `nvfp4a_gemm_tc_ex` take the arguments of `nvfp4a_gemm`,
+`nvfp4a_gemv_tc` and `nvfp4a_gemm_tc` plus an `nvfp4a_epilogue` descriptor (NULL: the plain call), so that the
+GEMM / GEMV of a transformer layer ends in one call on every path (DP4A / FFMA GEMV, tiled GEMM, tensor-core GEMV
+and GEMM):
+
+| Addition | Fields | What it does |
+|---|---|---|
+| column scale | `norm_parts`, `norm_nparts`, `norm_ld`, `norm_inv_n`, `norm_eps` | the deferred RMSNorm scalar of each column (token): `s_j = RN(1 / sqrt(Σ parts · inv_n + eps))` in a fixed order, folded into B's global |
+| SwiGLU | `swiglu` | rows interleaved by 8 within m16 slices (gate, then up); D gets `m / 2` rows `silu(g) · u` |
+| second output | `d2`, `d2_dtype`, `ldd2`, `w2`, `w2_dtype`, `sq`, `ld_sq` | `d2 = RN(v · w2[i])` and per m16 slice and column the sum of `RN(v · v)` — the parts of the next call's column scale |
+
+Every sum has a fixed order, and each part is written by one thread: no atomics. D, the second output and the parts are
+bit for bit the plain call's values with these operations applied (`tests/test_epilogue.cu`). With any addition, A's
+block scales are linear E4M3 and B is BF16 or INT8. The exact definitions are in `include/nvfp4effma.h`.
+
+## Work items
+
+`include/nvfp4effma_items.h` describes the work of `nvfp4a_gemm_ex` (n ≤ 8: blocks of rows on CUDA cores),
+`nvfp4a_gemv_tc_ex` (m16 slices on tensor cores) and `nvfp4a_gemm_tc_ex` (128 × 128 tiles over all of k, without
+workspace or stream-K) as items that an executor runs from kernels of its own (a persistent program, a fused graph):
+
+- `nvfp4a_gemm_ex_items` / `nvfp4a_gemv_tc_ex_items` / `nvfp4a_gemm_tc_ex_items` take the call's arguments
+  (without a workspace) and return an `nvfp4a_items`:
+  - the number of items and their row / column tile shape;
+  - the CTA shape and the shared memory to hand over;
+  - the registers of the library's own kernel;
+  - its virtual architecture (`arch`), which determines the device entries' CTA and shared layout;
+  - the device entry and its argument type, plus the argument bytes to copy to the device.
+- `nvfp4a_item_access` lists what an item reads and writes, as strided byte ranges relative to the call's argument
+  pointers (`write`: 0 read, 1 store, 2 atomic max), including the row / column 0 fallback reads at boundaries.
+  Pass NULL and capacity 0 to query the number; invalid queries return -1.
+
+The device entries are in `include/nvfp4effma_items.cuh`. An executor calls
+`entry(*(const args_type *)p, item, threadIdx.x, smem)` on every thread of the CTA, followed by a CTA barrier before
+shared memory is reused or the next item begins. Use the described thread count as the executor's launch bound.
+Compile it for the plan's `compute_<arch>` and JIT the PTX on the current device, with nvcc or with
+NVRTC using `--std=c++17 --device-as-default-execution-space` and these include paths: the library's `include/` and
+`src/`, CUDA's `include/`, and `include/cccl` on CUDA 13+.
+
+For the executor launch, A's data/image, block scales and global, bias and `w2` are immutable weights. B's
+data/image, block and global scales, C (also when C aliases D) and `norm_parts` may be produced by another CTA:
+the entries read these through L2 (`ld.cg`, or `cp.async.cg` for the newer TC GEMM pipeline), not through the
+non-coherent read-only cache. The executor establishes GPU-scope release/acquire ordering before the entry and
+waits for all consumers before reusing an input buffer. To publish outputs on sm_6x, every writer issues a device
+fence, then the CTA synchronizes and signals atomically; sm_70+ supports release/acquire instructions. Entries do
+not contain the executor's inter-CTA publication protocol.
+
+`tests/test_items.cu` builds an executor this way and runs the items persistently on fewer CTAs than items. Its
+outputs match the call's bit for bit for GEMV and TC GEMV. TC GEMM tiles match the existing library kernel launched
+without stream-K, bit for bit: the normal call may regroup a tile's sums across CTAs, so bit equality with that call
+is not promised. No floating-point tolerance is used in this integration test, including for SwiGLU and the sums of
+squares. Every logical output byte is covered exactly once, padding is not written, and ranges stay within their
+arguments. The stream-K epilogue is checked separately by `tests/test_epilogue.cu`.
+It also runs two resident CTAs cooperatively: one primes its read-only cache, the other publishes zeros and then the
+reference B, scales, C and norm parts; two epochs reuse the same poisoned buffers in one launch, without host intervention. The result
+still matches the library reference byte for byte, including BF16 / FP16 / FP32 residual C. These publication
+cases require cooperative launch support (otherwise reported as skipped); `out/test_items --coherence-only` runs
+them alone. `--readonly-control` selects the former input-cache policy for diagnosis; cache invalidation behavior
+differs between GPUs, so that mode is not a portable must-fail test.
+
 ## Tensor cores (sm_75 … sm_89)
 
 The tensor-core kernels read the operands as **images**: their bytes and block scales rearranged in the order
