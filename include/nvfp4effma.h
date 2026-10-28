@@ -67,7 +67,7 @@
 #ifndef NVFP4EFFMA_H
 #define NVFP4EFFMA_H
 
-#define NVFP4EFFMA_VERSION "0.5.0"
+#define NVFP4EFFMA_VERSION "0.6.0"
 
 #ifdef __CUDACC_RTC__  /* NVRTC (the work items' device entries): the types only */
 typedef struct CUstream_st *cudaStream_t;

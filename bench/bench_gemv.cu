@@ -50,6 +50,51 @@ int main(int argc, char **argv) {
       char name[64]; snprintf(name, 64, "nvfp4a gemv n=%d x=%s -> BF16%s", n, xn[xt], st == NVFP4A_OK ? "" : " FAILED");
       row(name, x, (double)abytes, "");
     }
+  // the extended epilogue (nvfp4a_gemm_ex): x BF16 / INT8 (A's scales linear E4M3), every mask against the
+  // plain call of the same x dtype and n (SwiGLU needs n a multiple of 8)
+  printf("\nExtended epilogue (x = time / the plain row of the same x dtype and n)\n");
+  {
+    const int np = 37;  // a typical RMSNorm's part count (the cost does not depend on it)
+    void *dparts, *dw2, *dd2, *dsq;
+    cudaMalloc(&dparts, (size_t)32 * np * 4); cudaMalloc(&dw2, (size_t)M * 2);
+    cudaMalloc(&dd2, (size_t)32 * M * 2); cudaMalloc(&dsq, (size_t)32 * (M / 16) * 4);
+    std::vector<float> hp((size_t)32 * np, 0.01f);
+    std::vector<unsigned short> hw(M, 0x3f80);  // BF16 1.0
+    cudaMemcpy(dparts, hp.data(), hp.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw2, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice);
+    const struct { const char *name; unsigned mask; } masks[] = {
+        {"norm", 1}, {"swiglu", 2}, {"norm+swiglu", 3}, {"out2", 4}, {"norm+out2", 5}};
+    for (nvfp4a_dtype xt : {NVFP4A_BF16, NVFP4A_INT8})
+      for (int n : {1, 8, 32}) {
+        nvfp4a_tensor X = {dX, xt, xt == NVFP4A_INT8 ? dsX : nullptr, 0, nullptr, nullptr};
+        nvfp4a_status st = NVFP4A_OK;
+        const float plain = bench.run([&] { st = nvfp4a_gemm(M, n, K, 1.f, &A, K, &X, K, 0.f, nullptr, 0, &Y, M, nullptr, 0); }, 200).ms;
+        char pname[80]; snprintf(pname, sizeof pname, "gemv n=%d x=%s plain%s", n, xn[xt], st == NVFP4A_OK ? "" : " FAILED");
+        row(pname, {plain, 0.0}, (double)abytes, "");
+        for (const auto &mk : masks) {
+          if ((mk.mask & 2) && n % 8) continue;
+          nvfp4a_epilogue ex{};
+          if (mk.mask & 1) {
+            ex.norm_parts = (const float *)dparts; ex.norm_nparts = ex.norm_ld = np;
+            ex.norm_inv_n = 1.f / np; ex.norm_eps = 1e-6f;
+          }
+          if (mk.mask & 2) ex.swiglu = 1;
+          if (mk.mask & 4) {
+            ex.d2 = dd2; ex.d2_dtype = NVFP4A_BF16; ex.ldd2 = M;
+            ex.w2 = (const void *)dw2; ex.w2_dtype = NVFP4A_BF16;
+            ex.sq = (float *)dsq; ex.ld_sq = M / 16;
+          }
+          nvfp4a_status s2 = NVFP4A_OK;
+          const BenchRow x = bench.run([&] { s2 = nvfp4a_gemm_ex(M, n, K, 1.f, &A, K, &X, K, 0.f, nullptr, 0, &Y, M, nullptr, &ex, 0); }, 200);
+          char name[80], note[32];
+          snprintf(name, sizeof name, "gemv_ex n=%d x=%s ex %d (%s)%s", n, xn[xt], mk.mask, mk.name, s2 == NVFP4A_OK ? "" : " FAILED");
+          snprintf(note, sizeof note, "   x%.3f", x.ms / plain);
+          row(name, x, (double)abytes, note);
+        }
+      }
+    for (void *q : {dparts, dw2, dd2, dsq}) cudaFree(q);
+  }
+
   // Transformer Engine / cuBLASLt formats (bench_util.h): per x dtype and n every format against its "plain"
   // row.  dsA / dsX hold the swizzled layout's padding (M a multiple of 128; x: 128 rows of K / 16 bytes).
   printf("\nTransformer Engine formats, -> BF16 (x = time / plain of the same x dtype and n)\n");

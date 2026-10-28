@@ -365,7 +365,10 @@ def test_tc_weight(T, act):
     else:
         xv = ref_value(nf.quantize(x))
     wv = ref_value(w)
-    y = nf.linear(x, tw, bias, out_dtype=torch.float32)
+    try:  # the image builds on any GPU; the kernels need sm_75 .. sm_89 (W4A16 sm_80+)
+        y = nf.linear(x, tw, bias, out_dtype=torch.float32)
+    except NotImplementedError as e:
+        pytest.skip(f"no tensor-core path: {e}")
     assert y.shape == (T, N) and y.dtype == torch.float32
     check_close(y, xv @ wv.t() + bias.double(), xv.abs() @ wv.abs().t(), K, torch.float32)
     assert nf.linear(x, tw).dtype == torch.bfloat16

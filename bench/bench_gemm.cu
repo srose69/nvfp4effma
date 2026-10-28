@@ -61,6 +61,70 @@ int main(int argc, char **argv) {
   }
   gemm("nvfp4a_gemm NVFP4 x NVFP4, FP32 D += (accumulate)", B, F, 1.f);
 
+  // the extended epilogue (nvfp4a_gemm_ex / nvfp4a_gemm_tc_ex): B INT8 / BF16, A's scales linear E4M3; every
+  // mask against the plain call of the same B dtype, measured as the section's own baseline row.  The masks'
+  // buffers serve both the CUDA-core section and the tensor-core kinds below.
+  const int np = 37;  // a typical RMSNorm's part count (the cost does not depend on it)
+  void *dparts, *dw2, *dd2, *dsq;
+  cudaMalloc(&dparts, (size_t)N * np * 4); cudaMalloc(&dw2, (size_t)M * 2); cudaMalloc(&dd2, (size_t)N * M * 2);
+  cudaMalloc(&dsq, (size_t)N * (M / 16) * 4);
+  {
+    std::vector<float> hp((size_t)N * np, 0.01f), hs((size_t)N * (M / 16), 0.f);
+    std::vector<unsigned short> hw(M, 0x3f80);  // BF16 1.0
+    cudaMemcpy(dparts, hp.data(), hp.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw2, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice);
+    cudaMemcpy(dsq, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+  }
+  const struct { const char *name; unsigned mask; } kExMasks[] = {
+      {"norm", 1}, {"swiglu", 2}, {"norm+swiglu", 3}, {"out2", 4}, {"norm+out2", 5}};
+  auto exOf = [&](unsigned mask) {
+    nvfp4a_epilogue ex{};
+    if (mask & 1) {
+      ex.norm_parts = (const float *)dparts; ex.norm_nparts = ex.norm_ld = np;
+      ex.norm_inv_n = 1.f / np; ex.norm_eps = 1e-6f;
+    }
+    if (mask & 2) ex.swiglu = 1;
+    if (mask & 4) {
+      ex.d2 = dd2; ex.d2_dtype = NVFP4A_BF16; ex.ldd2 = M;
+      ex.w2 = (const void *)dw2; ex.w2_dtype = NVFP4A_BF16;
+      ex.sq = (float *)dsq; ex.ld_sq = M / 16;
+    }
+    return ex;
+  };
+  auto exRow = [&](const char *call, const char *bn, unsigned mask, float plain, const auto &f) {
+    nvfp4a_status st = NVFP4A_OK;
+    const BenchRow x = bench.run([&] { st = f(); }, 20);
+    const char *mn = mask == 1 ? "norm" : mask == 2 ? "swiglu" : mask == 3 ? "norm+swiglu" : mask == 4 ? "out2" : "norm+out2";
+    char name[96]; snprintf(name, sizeof name, "%s NVFP4 x %s, ex %d (%s)%s", call, bn, mask, mn, st == NVFP4A_OK ? "" : " (FAILED)");
+    const double gmacs = macs / x.ms / 1e6, peak = p.multiProcessorCount * 128 * x.mhz / 1e3;
+    printf("%-52s %6.3f ms %7.1f GMAC/s %5.0f MHz %9.1f%%   x%.3f\n", name, x.ms, gmacs, x.mhz,
+           x.mhz > 0 ? 100 * gmacs / peak : 0.0, x.ms / plain);
+    fflush(stdout);
+  };
+  printf("\nExtended epilogue (x = time / the plain row of the same B dtype)\n");
+  {
+    void *q8, *s8; cudaMalloc(&q8, (size_t)N * K); cudaMalloc(&s8, (size_t)N * K / 16 * 4);
+    std::vector<signed char> hq((size_t)N * K); for (auto &x : hq) x = (signed char)(rnd() % 255 - 127);
+    std::vector<float> hsq((size_t)N * K / 16, 0.01f);
+    cudaMemcpy(q8, hq.data(), hq.size(), cudaMemcpyHostToDevice); cudaMemcpy(s8, hsq.data(), hsq.size() * 4, cudaMemcpyHostToDevice);
+    for (nvfp4a_dtype bt : {NVFP4A_INT8, NVFP4A_BF16}) {
+      const char *bn = bt == NVFP4A_INT8 ? "INT8" : "BF16";
+      const nvfp4a_tensor b = bt == NVFP4A_INT8 ? nvfp4a_tensor{q8, bt, s8, 0, nullptr, nullptr}
+                                                : nvfp4a_tensor{dX, bt, nullptr, 0, nullptr, nullptr};
+      nvfp4a_status st = NVFP4A_OK;
+      const float plain = bench.run([&] { st = nvfp4a_gemm(M, N, K, 1.f, &A, K, &b, K, 0.f, nullptr, 0, &D, M, nullptr, 0); }, 20).ms;
+      char name[96]; snprintf(name, sizeof name, "nvfp4a_gemm NVFP4 x %s -> BF16 (plain)%s", bn, st == NVFP4A_OK ? "" : " (FAILED)");
+      row(name, {plain, 0.0});
+      for (const auto &mk : kExMasks) {
+        const nvfp4a_epilogue ex = exOf(mk.mask);
+        exRow("nvfp4a_gemm_ex", bn, mk.mask, plain, [&] {
+          return nvfp4a_gemm_ex(M, N, K, 1.f, &A, K, &b, K, 0.f, nullptr, 0, &D, M, nullptr, &ex, 0);
+        });
+      }
+    }
+    cudaFree(q8); cudaFree(s8);
+  }
+
   // nvfp4a_gemm_tc (tensor cores, sm_75 .. sm_89): the images built once (an activation image's cost on its own row),
   // the GEMM timed alone; B NVFP4 (W4A4), INT8 (W4A8), BF16 (W4A16)
   {
@@ -88,6 +152,16 @@ int main(int argc, char **argv) {
         nvfp4a_status st = nvfp4a_tc_image(NVFP4A_TC_B, kd.b, K, N, K, ib, 0);
         if (st == NVFP4A_OK)
           row(kd.name, bench.run([&] { st = nvfp4a_gemm_tc(M, N, K, 1.f, &Ai, &Bi, 0.f, nullptr, 0, &D, M, nullptr, ws, 0); }, 20));
+        if (st == NVFP4A_OK && kd.b->dtype != NVFP4A_NVFP4) {  // the extended epilogue takes B INT8 / BF16
+          const char *bn = kd.b->dtype == NVFP4A_INT8 ? "INT8" : "BF16";
+          const float plain = bench.run([&] { nvfp4a_gemm_tc(M, N, K, 1.f, &Ai, &Bi, 0.f, nullptr, 0, &D, M, nullptr, ws, 0); }, 20).ms;
+          for (const auto &mk : kExMasks) {
+            const nvfp4a_epilogue ex = exOf(mk.mask);
+            exRow("nvfp4a_gemm_tc_ex", bn, mk.mask, plain, [&] {
+              return nvfp4a_gemm_tc_ex(M, N, K, 1.f, &Ai, &Bi, 0.f, nullptr, 0, &D, M, nullptr, &ex, ws, 0);
+            });
+          }
+        }
         const BenchRow x = bench.run([&] { nvfp4a_tc_image(NVFP4A_TC_B, kd.b, K, N, K, ib, 0); }, 20);
         printf("%-50s %6.3f ms%s\n", kd.image, x.ms, st == NVFP4A_OK ? "" : " (FAILED)");
       }
@@ -135,5 +209,6 @@ int main(int argc, char **argv) {
       }
     }
   }
+  for (void *q : {dparts, dw2, dd2, dsq}) cudaFree(q);
   return 0;
 }

@@ -285,13 +285,36 @@ __device__ __forceinline__ void gemv_group_item(const GemvItemArgs &base, int it
   else gemv_item<C, 8, XT, 0, EX, CG>(a, item % mt, thread, smem);
 }
 
+// The EX tail lowers ptxas's register allocation of INT8 (127 -> 100) and with it the k-loop's
+// memory-level parallelism: the loop runs at ~0.6x the plain kernel's bandwidth (the BF16 kernels'
+// loops stay identical).  A 2-CTA floor restores the budget (124 registers, the plain kernel's load
+// schedule; measured in handoff_fbla/tools/probe_gemv_ex.cu).  BF16 needs its full 133 registers
+// (a 128 cap spills 8 bytes and slows gate_up by ~8%), so it keeps the plain kernel's bound.  The two
+// variants are overloads on a hand-rolled SFINAE guard: <type_traits> does not compile under NVRTC.
+template <bool B> struct GemvExOnly;  // (undefined when the guard fails)
+template <> struct GemvExOnly<true> { using type = int; };
+
 template <class C, int NB, int XT, int F, int EX>
-__global__ void __launch_bounds__(C::WARPS * 32)
-gemv_kernel_ex(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
-               const uint8_t *__restrict__ X, int ldx, const uint8_t *__restrict__ SX, int ldsx, int m, int k, Epilogue e, EpilogueEx x) {
+__device__ __forceinline__ void gemv_ex_body(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
+                                             const uint8_t *__restrict__ X, int ldx, const uint8_t *__restrict__ SX, int ldsx, int m,
+                                             int k, const Epilogue &e, const EpilogueEx &x) {
   if (!C::template On<NB, XT>::value) { __trap(); return; }
   __shared__ float stage[gemv_smem_floats<C, NB, EX>() ? gemv_smem_floats<C, NB, EX>() : 1];
   gemv_item<C, NB, XT, F, EX, false>(GemvItemArgs{A, SA, X, SX, lda, ldsa, ldx, ldsx, m, k, e, x}, blockIdx.x, threadIdx.x, stage);
+}
+
+template <class C, int NB, int XT, int F, int EX, typename GemvExOnly<XT == NVFP4A_INT8>::type = 0>
+__global__ void __launch_bounds__(C::WARPS * 32, 2)
+gemv_kernel_ex(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
+               const uint8_t *__restrict__ X, int ldx, const uint8_t *__restrict__ SX, int ldsx, int m, int k, Epilogue e, EpilogueEx x) {
+  gemv_ex_body<C, NB, XT, F, EX>(A, lda, SA, ldsa, X, ldx, SX, ldsx, m, k, e, x);
+}
+
+template <class C, int NB, int XT, int F, int EX, typename GemvExOnly<XT != NVFP4A_INT8>::type = 0>
+__global__ void __launch_bounds__(C::WARPS * 32)
+gemv_kernel_ex(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
+               const uint8_t *__restrict__ X, int ldx, const uint8_t *__restrict__ SX, int ldsx, int m, int k, Epilogue e, EpilogueEx x) {
+  gemv_ex_body<C, NB, XT, F, EX>(A, lda, SA, ldsa, X, ldx, SX, ldsx, m, k, e, x);
 }
 
 template <class C, int NB, int XT, int F, int EX>

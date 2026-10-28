@@ -6,6 +6,6 @@ authors:
   - name: "srose69"
 repository-code: "https://github.com/srose69/nvfp4effma"
 license: AGPL-3.0-only
-version: "0.5.0"
-date-released: "2026-10-26"
+version: "0.6.0"
+date-released: "2026-10-28"
 keywords: [nvfp4, fp4, e2m1, quantization, cuda, gemm, gemv, dp4a, tensor-cores, pascal, pytorch]
