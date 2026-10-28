@@ -41,42 +41,30 @@ and [E5M2EffMA](https://github.com/srose69/e5m2effma); they can be used together
 
 ## Performance at a glance
 
-GTX 1080. The baseline is cuBLAS on **FP32 data** of the same shape (SGEMM / SGEMV) — the fastest way to
-run the same model on this GPU without 4-bit weights. Median times; the FP32 peak of each GEMM row is
-taken at the SM clock measured while that row ran:
+Median times; the baseline is cuBLAS on **FP32 data** of the same shape (SGEMM, and SGEMM n=8 for the
+batch-8 GEMV rows) — the fastest way to run the same model on these GPUs without 4-bit weights. Full
+tables with utilization and clocks: [benches/1080.md](benches/1080.md) (GTX 1080 FE, DP4A / FFMA),
+[benches/l40s.md](benches/l40s.md) (L40S, tensor cores); per-GPU summary:
+[benches/table.md](benches/table.md); methodology: [docs/performance.md](docs/performance.md).
 
-| Workload | NVFP4EffMA | Utilization | Baseline: cuBLAS FP32 | Speed vs baseline |
-|---|---:|---|---:|---:|
-| GEMM 4096³, NVFP4 × NVFP4 → BF16 | 9.42 ms | **156 %** of FP32 peak (7.3 TMAC/s) | SGEMM 19.1 ms (76 % of FP32 peak) | **2.03×** |
-| GEMM 4096³, NVFP4 × INT8 (W4A8) → BF16 | 9.33 ms | **158 %** of FP32 peak (7.4 TMAC/s) | SGEMM 19.1 ms (76 % of FP32 peak) | **2.05×** |
-| GEMM 4096³, NVFP4 × NVFP4, FP32 D += (accumulate) | 9.77 ms | 150 % of FP32 peak | SGEMM 19.1 ms (76 % of FP32 peak) | **1.96×** |
-| GEMM 4096³, NVFP4 weights × BF16 activations, exact | 19.6 ms | 75 % of FP32 peak | SGEMM 19.1 ms (76 % of FP32 peak) | 0.98× |
-| `linear` 4096³, BF16 activations, default `act="auto"` (int8 quantization included) | 10.0 ms | — | SGEMM 19.1 ms | **1.9×** |
-| GEMV 8192 × 8192, batch 1 (BF16 x) | 0.139 ms | 272 GB/s, **85 %** of DRAM peak | SGEMV 1.042 ms | **7.5×** |
-| GEMV 8192 × 8192, batch 8 (INT8 x) | 0.158 ms | 238 GB/s, 74 % of DRAM peak | SGEMM 1.538 ms | **9.7×** |
-| GEMV 8192 × 8192, batch 8 (BF16 x) | 0.346 ms | 109 GB/s, 34 % of DRAM peak | SGEMM 1.538 ms | **4.4×** |
-| Quantization, 8192 × 8192 BF16 → NVFP4 | 0.64 ms | 270 GB/s, **84 %** of DRAM peak | — | — |
+| Workload | GTX 1080 FE (sm_61) | L40S (sm_89) |
+|---|---:|---:|
+| GEMM 4096³, NVFP4 × NVFP4 → BF16 (W4A4) | 10.0 ms — **1.9×** SGEMM | 0.70 ms — **3.7×** SGEMM |
+| GEMM 4096³, NVFP4 × INT8 (W4A8) | 9.5 ms — **2.0×** | 0.64 ms — **4.1×** |
+| GEMM 4096³, NVFP4 × BF16, exact (W4A16) | 19.9 ms — 1.0× | 0.52 ms — **5.0×** |
+| GEMV 8192², batch 1 (BF16 x) | 0.139 ms — 271 GB/s, **85 %** of DRAM | 0.026 ms — 1.46 TB/s |
+| GEMV 8192², batch 8 (INT8 x) | 0.160 ms — 236 GB/s, 74 % of DRAM | 0.025 ms — 1.51 TB/s |
+| Quantization, 8192² BF16 → NVFP4 | 0.64 ms — 270 GB/s, **84 %** | 0.24 ms — 721 GB/s, **94 %** |
 
-Most Transformer Engine representations (swizzled or UE5M3 scales, amax and per-row globals) compute
-within a few percent of plain NVFP4 — within 1.5 % in GEMM, −6.5 … +3 % in GEMV, where swizzled x scales
-are even about 5 % faster. Creating them costs more than using them: quantize once, not per call
-([docs/performance.md](docs/performance.md#transformer-engine-formats-using-them-is-cheap-creating-them-is-not);
-full tables: [benches/1080.md](benches/1080.md)).
-
-FP32 peak: 20 SMs × 128 FFMA × SM clock (1818–1837 MHz in the GEMM rows); DRAM peak: 320 GB/s; GEMV
-bandwidth counts the values and the block scales. With both operands in NVFP4 the DP4A kernel does four
-exact products per instruction and exceeds the FP32 FFMA peak; with BF16 activations a MAC costs one FP32
-FFMA, so compute-bound GEMM tops out at SGEMM speed while reading 7× fewer weight bytes, and
-bandwidth-bound kernels (decoding) get the full benefit of the smaller weights. 
-
-**On Pascal, use W4A8 for prefill speed** (`act="auto"` / `"int8"`): exact W4A16 is bound by the FP32 FFMA rate there (no fast FP16, no
-int path for BF16 values) and runs at SGEMM speed. Against llama.cpp's NVFP4
-kernels on the same GPU (int8 activations, like W4A8 here), interleaved runs: 1.0–4.5× faster on every
-shape measured — 1.47× at 4096³, 3.9–4.5× for 8-token decoding, 1.45–1.66× at 512 tokens
-([docs/performance.md](docs/performance.md#compared-with-llamacpp)). CUTLASS has not been measured.
-
-Results by GPU: [benches/table.md](benches/table.md) (full GTX 1080 run: [benches/1080.md](benches/1080.md));
-methodology and how to add your GPU: [docs/performance.md](docs/performance.md).
+On the 1080, W4A4 / W4A8 do four exact products per DP4A and run past the FP32 FFMA peak (7.3 TMAC/s,
+158 %), while exact W4A16 is FFMA-bound and matches SGEMM reading 7× fewer weight bytes — **so on Pascal
+use W4A8 for prefill** (`act="auto"` / `"int8"`). On the L40S the same block sums run on INT8 / BF16
+`mma` (W4A16 at 132.8 TMAC/s, 290 % of the FP32 peak), and the 8192² weights fit its 96 MB L2, so the
+GEMV reads them at twice the DRAM rate. Against llama.cpp's NVFP4 kernels on the 1080 (int8 activations,
+like W4A8), interleaved runs: 1.0–4.5× faster on every shape measured — 1.47× at 4096³, 3.9–4.5× for
+8-token decoding. Most Transformer Engine representations compute within a few percent of plain NVFP4,
+and creating them costs more than using them — quantize once, not per call
+([docs/performance.md](docs/performance.md)); CUTLASS has not been measured.
 
 ## Features
 
