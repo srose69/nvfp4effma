@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// NVFP4EffMA core (device side): exact E2M1 / E4M3 decode, E2M1 / E4M3 / BF16 rounding, typed element
-// access, the GEMM / GEMV epilogue and the per-architecture kernel tables.  Shared by gemm_*, gemv_*
-// and the quantization kernels.
-//
-//   arithmetic : E2M1 x 2 is an exact int8 (0, +-1, 2, 3, 4, 6, 8, 12): NVFP4 x NVFP4 block sums are exact
-//                integers (DP4A from sm_61, FFMA on integer-valued floats below); an E2M1 value times its
-//                E4M3 block scale has at most 6 significant bits, so products with BF16 / FP16 values
-//                are exact in FP32
-//   rounding   : accumulate in FP32 over the whole reduction, round once when storing
-//   contract   : block scales are finite (no E4M3 NaN code); not checked
+// NVFP4EffMA core (device side): exact E2M1 / E4M3 decode, E2M1 / E4M3 / BF16 rounding, typed element access, the GEMM / GEMV
+// epilogue and the per-architecture kernel tables; shared by gemm_*, gemv_* and the quantization kernels.  Block scales are
+// finite (no E4M3 NaN code; not checked); sums accumulate in FP32 over the whole reduction and round once when storing.
 #pragma once
 #ifdef __CUDACC_RTC__  // NVRTC (an executor's kernels: include/nvfp4effma_items.cuh): libcu++ for the C / C++ library
 #include <cuda/std/cstdint>
@@ -39,10 +32,11 @@ using cuda::std::size_t; using cuda::std::uintptr_t;
 namespace nvfp4a {
 
 // ---- arithmetic primitives -------------------------------------------------------------------
-// explicit .rn without .ftz: denormals must be honoured
+// E2M1 x 2 is an exact int8 (0, +-1, 2, 3, 4, 6, 8, 12): NVFP4 x NVFP4 block sums are exact integers (DP4A from sm_61, FFMA on
+// integer-valued floats below); E2M1 times its E4M3 block scale has at most 6 significant bits, so products with BF16 / FP16 are exact.
 __device__ __forceinline__ float fma_rn(float a, float b, float c) {
   float d;
-  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));
+  asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c));  // explicit .rn without .ftz: denormals must be honoured
   return d;
 }
 __device__ __forceinline__ float mul_rn(float a, float b) {
@@ -68,10 +62,9 @@ __device__ __forceinline__ float ue5m3_value(uint32_t b) { return mul_rn(__uint_
 __device__ __forceinline__ float scale_value(uint32_t b, bool ue5m3) { return ue5m3 ? ue5m3_value(b) : e4m3_value(b); }
 template <bool UE> __device__ __forceinline__ float scale_val(uint32_t b) { return UE ? ue5m3_value(b) : e4m3_value(b); }
 
-// Position of block scale (r, c) of an NVFP4 matrix: row part + column part, so kernels compute the row part
-// once and step the column.  ld > 0: linear, ld scales per row.  ld < 0: the swizzled GEMM layout of
-// cuBLASLt / Transformer Engine with -ld = roundup(cols / 16, 4) scales per (padded) row: 128 x 4 tiles of
-// 512 bytes, scale (r, c) at ((r/128) * (-ld/4) + c/4) * 512 + (r%32) * 16 + ((r/32)%4) * 4 + c%4.
+// Position of block scale (r, c): row part + column part, so kernels compute the row part once and step the column.  ld > 0:
+// linear, ld scales per row.  ld < 0: the swizzled GEMM layout (-ld = roundup(cols / 16, 4) scales per padded row), 128 x 4
+// tiles of 512 bytes, scale (r, c) at ((r/128) * (-ld/4) + c/4) * 512 + (r%32) * 16 + ((r/32)%4) * 4 + c%4.
 struct ScaleIdx {
   int ld;
   __host__ __device__ __forceinline__ size_t row(int r) const {
@@ -88,14 +81,11 @@ __host__ __device__ __forceinline__ size_t swz_row(int r, int sc) {
 }
 __host__ __device__ __forceinline__ size_t swz_col(int c) { return ((size_t)(c >> 2) << 9) + (c & 3); }
 
-// Block scale formats of a GEMM / GEMV kernel instance: template parameter F, one instance per combination,
-// so no format test reaches a main loop (F = 0: linear E4M3 scales).  The globals (per tensor or per row,
-// decode factors or amaxes) only enter the epilogue, which handles all of them with the same operations.
-//   kF_ASWZ / kF_BSWZ  the NVFP4 block scales of A / B are in the swizzled layout (ld = -padded columns)
-//   kF_AUE / kF_BUE    ... are UE5M3 (else E4M3)
-// B bits apply to NVFP4 B only (INT8 and dense B have none): kFormats = all, kFormatsA = A bits only (the
-// same values 0 .. 3).
+// Block scale formats of a GEMM / GEMV kernel instance: template parameter F, one instance per combination, so no format
+// test reaches a main loop (F = 0: linear E4M3 scales).  The globals (per tensor or per row, decode factors or amaxes)
+// only enter the epilogue.  kF_ASWZ / kF_BSWZ: NVFP4 block scales of A / B swizzled (ld = -padded columns); kF_AUE / kF_BUE: UE5M3.
 constexpr int kF_ASWZ = 1, kF_AUE = 2, kF_BSWZ = 4, kF_BUE = 8;
+// B bits apply to NVFP4 B only: kFormats = all, kFormatsA = A bits only (the same values 0 .. 3)
 constexpr int kFormats = 16, kFormatsA = 4;
 
 // E2M1 nibble j of w -> exact FP32 times 2^E: sign | (n & 7) << 22 encodes value(n) * 2^-126 (the
@@ -179,11 +169,9 @@ __host__ __device__ __forceinline__ uint32_t f32_to_e2m1(float x) {
   return s | (q - 0x4B000000u + 4u);
 }
 
-// x / d correctly rounded for a divisor known in advance, r = RN(1 / d): x * r, then one FMA correction with
-// the exact remainder (Brisebarre, Muller, Raina).  Zero: x * r (the signed zero).  The correction does not
-// hold for subnormal quotients and infinite x: those (and NaN) take IEEE division -- a branch real data does
-// not take (zeros, frequent, must not: they would diverge into the slow path).  Valid for the divisors
-// whose exhaustive test passes (tests/test_nvfp4effma.cu: the 4over6 denominators 6 * 256 and 6 * 448).
+// x / d correctly rounded for a divisor known in advance, r = RN(1 / d): x * r, then one FMA correction with the exact remainder
+// (Brisebarre, Muller, Raina).  Zero: x * r (signed zero, must not take the slow path).  The correction fails for subnormal quotients
+// and infinite x: those and NaN take IEEE division.  Valid for divisors with a passing exhaustive test (tests/test_nvfp4effma.cu: 6 * 256, 6 * 448).
 __device__ __forceinline__ float div_by(float x, float d, float r) {
   const float q = __fmul_rn(x, r), aq = fabsf(q);
   if (x != 0.f && !(aq >= 0x1p-125f && aq <= 3.40282347e38f)) return __fdiv_rn(x, d);
@@ -270,10 +258,8 @@ __device__ __forceinline__ void amax_commit(float *amax, float m) {
 }
 
 // ---- GEMM / GEMV epilogue --------------------------------------------------------------------
-// Global value of an NVFP4 / INT8 operand: v = gX[row * sX] -- one value (stride 0) or one per row (stride 1)
-// -- or 1 without one; amax globals contribute the factor 1 / (6 * scale_max) to gf (1 otherwise, exact).
-// s(i, j) = ((alpha * vA(i)) * vB(j)) * gf: Transformer Engine's order, and for per-tensor decode factors
-// ((alpha * gA) * gB) as before.  The same operations for every kind of global: no format branch.
+// Global of an NVFP4 / INT8 operand: v = gX[row * sX] (stride 0: one value, 1: one per row) or 1 without one; amax globals contribute
+// 1 / (6 * scale_max) to gf.  s(i, j) = ((alpha * vA(i)) * vB(j)) * gf (Transformer Engine's order), the same for every kind of global.
 struct Epilogue {
   const float *ga, *gb;  // device globals of A / B (NULL = 1)
   int sa, sb;            // their strides: 0 (per tensor) or 1 (per row of A = output row i, of B = column j)
@@ -323,7 +309,10 @@ struct EpilogueEx {
   const float *norm_parts; int norm_nparts, norm_ld; float norm_inv_n, norm_eps;
   void *d2; int d2_dtype, ldd2; const void *w2; int w2_dtype;
   float *sq; int ld_sq;
+  const int *n_dev;  // work items only: the columns computed are min(n, *n_dev)
 };
+// the columns an item computes
+__device__ __forceinline__ int items_columns(const EpilogueEx &x, int n) { return x.n_dev ? min(n, __ldcg(x.n_dev)) : n; }
 // a kernel's descriptor: its trailing parameter, none in the plain kernel (EX = 0)
 __device__ __forceinline__ EpilogueEx ex_arg() { return EpilogueEx{}; }
 __device__ __forceinline__ EpilogueEx ex_arg(const EpilogueEx &x) { return x; }
@@ -404,7 +393,7 @@ constexpr int kOperandTypes = 5;
 
 // Largest n that runs the GEMV kernel (in groups of 8 columns, each group reading A once) instead of the
 // tiled kernel, per B dtype (NVFP4, BF16, FP16, FP32, INT8): where the tiled kernel has too few tiles to
-// fill the GPU, re-reading A per group is faster.  Measured on a GTX 1080 at m = k = 8192.
+// fill the GPU, re-reading A per group is faster.
 #ifdef NVFP4A_GEMV_MAXN  // measurement builds: one limit for every dtype
 constexpr int kGemvMaxN[kOperandTypes] = {NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN, NVFP4A_GEMV_MAXN};
 #else
@@ -463,11 +452,9 @@ constexpr bool gemv_selected(int cc, int id, int xt, int nb) {
 #define NVFP4A_ARCH_CC 0
 #endif
 
-// Host: the current device's SM count and table (src/nvfp4effma.cu).  sass = the SASS version the device runs
-// (DP4A from 61), ptx = the PTX version its code was built from: it decides the tensor-core paths, from 75 to 89 (tc;
-// W4A16 from 80; NVFP4A_DP4A=1 in the environment turns them off) -- the same as sass for SASS builds, and right for
-// PTX JIT-compiled for a newer GPU.  supported = false when the device has native FP4 (sm_100+), predates sm_50, or
-// the library carries no SASS that runs on it.
+// Host: the current device's SM count and table (src/nvfp4effma.cu).  sass = the SASS version the device runs (DP4A from 61);
+// ptx = the PTX version its code was built from, which decides the tensor-core paths (tc: 75 to 89, W4A16 from 80; NVFP4A_DP4A=1
+// turns them off), equal to sass for SASS builds.  supported = false for native FP4 (sm_100+), < sm_50, or no runnable SASS.
 struct DeviceInfo { int cc, sass, ptx, sms; bool supported, tc; const ArchTable *table; };
 const DeviceInfo &device_info();
 

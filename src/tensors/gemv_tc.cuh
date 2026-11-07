@@ -1,22 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// NVFP4EffMA GEMV on tensor cores (sm_75 .. sm_89; BF16 x from sm_80): D = alpha * A x^T + ..., n <= 8 columns of x,
-// A as its image (image.cuh, the GEMM's: A16 for BF16 x, A8 for INT8 x with FP32 block scales and for NVFP4 x), x as it
-// is.  Bound by the DRAM stream of A's image, read once.
-//
-// CTA = one m16 slice of A, all of k; its KS warps split the slice's groups (4 k-tiles) into contiguous ranges.  Every
-// load is at an immediate offset from one pointer per stream, stepped once per group: A's 4 k-tiles (a warp's 512
-// contiguous bytes each, L1 bypassed, L2 evict-first) and their scales, x and its scales of the group.  A warp keeps P
-// groups in flight in registers, no shared memory on the way.  Per k-tile:
-//   BF16 x   lane (g, t) multiplies block t of rows g, g + 8 (decoded to BF16 a * sa exactly) with x's 16 values of
-//            column g at the same k: 4 BF16 mma (their 16 k need not be one block: the scale is in A)
-//   INT8 /   per block j an integer mma (its 16 k one block): 1.5 * 2^23 + p of the exact block sum, acc = fma(fma(D,
-//   NVFP4 x  sa, -1.5 * 2^23 sa), sb, acc).  The lane loads block t of column g, a 4 x 4 transpose within the quad
-//            (words of INT8 x, halfwords of NVFP4 x; SHFL) gives each lane its part of every block
-// x's columns past n read column n - 1 (computed, not stored).  The k sums stay in registers to the end: the warps'
-// partial sums of an output added in warp order through shared memory (deterministic), one store per output.
-// The extended epilogue (EX, its descriptor the trailing parameter): warp w forms s_w after its k range; the slice's
-// values go through shared memory to ex_finish.
+// NVFP4EffMA GEMV on tensor cores (sm_75 .. sm_89; BF16 x from sm_80): D = alpha * A x^T + ..., n <= 8 columns of x, A as its image
+// (image.cuh, the GEMM's: A16 for BF16 x, A8 for INT8 x with FP32 block scales and for NVFP4 x), x as it is; A's image is read once.
+// CTA = one m16 slice of A, all of k; its KS warps split the slice's groups (4 k-tiles) into contiguous ranges.
 #pragma once
 #include "gemm_tc.cuh"  // dec4o, the images
 
@@ -31,30 +17,28 @@ constexpr int kF_XS16 = 16;
 // shared memory of a slice (floats): the warps' partial sums; the extended epilogue's s_j and staged values
 __host__ __device__ constexpr int gemv_tc_smem_floats(int ex) { return kGvWarps * 4 * 32 + (ex ? kGvWarps + 8 * 16 : 0); }
 
-// The work item: m16 slice sl of A (all of k) on the CTA's kGvWarps warps (thread: the thread in the CTA), its shared
-// memory smem (gemv_tc_smem_floats(EX) floats).  gemv_tc_kernel runs one a CTA; an executor may run it from its own kernel.
+// The warps' sums of m16 slice sl of A over the groups [G0, G1) of its k (a group: 4 k-tiles; the whole k: 0 .. ceil(kt / 4)),
+// left in smem as red[warp][output][lane] (thread: the thread in the CTA; the caller synchronizes the CTA).
 // CG: x, its block/global scales and C through L2; the immutable weight image retains its read-only loads.
-template <int XT, int F, int EX, bool CG = false>
-__device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, int ldx,
-                                              const uint8_t *__restrict__ sx, int ldsx, int m, int n, int kt, const Epilogue &e,
-                                              const EpilogueEx &xd, int sl, unsigned thread, float *smem) {
+template <int XT, int F, bool CG>
+__device__ __forceinline__ void gemv_tc_sums(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, int ldx,
+                                             const uint8_t *__restrict__ sx, int ldsx, int n, int kt, int sl, int G0, int G1,
+                                             unsigned thread, float *smem) {
 #if !defined(NVFP4A_TC) || (!defined(NVFP4A_TC80) && XT != NVFP4A_NVFP4 && XT != NVFP4A_INT8)  // (W4A16: sm_80+)
   __trap();
 #else
   using namespace tc;
   constexpr bool Q8 = XT == NVFP4A_INT8, N4 = XT == NVFP4A_NVFP4, H = !Q8 && !N4;
-  // P: groups in flight per warp.  A group is already 2304 bytes of A in flight per warp, several times its share of the
-  // DRAM's latency-bandwidth product; the integer paths take one (two CTAs an SM within 128 registers: the same bytes in
-  // flight, twice the warps to hide the decode), W4A16 two (two CTAs an SM either way)
+  // P: groups in flight per warp (a group is 2304 bytes of A per warp): the integer paths take one (two CTAs an SM within 128
+  // registers: the same bytes in flight, twice the warps to hide the decode), W4A16 two (two CTAs an SM either way)
   constexpr int KS = kGvWarps, P = H ? 2 : 1;
   constexpr bool UEA = F & kF_AUE, UEB = N4 && (F & kF_BUE), SWB = N4 && (F & kF_BSWZ), S16 = N4 && !SWB && (F & kF_XS16);
-  constexpr float kOut = H ? 1.f : Q8 ? 0.5f : 0.25f;  // integer paths: the A values are doubled, NVFP4 x values too
   // per group: x bytes of a lane's column, x scale bytes of a column; NVFP4 x scales per k-tile (no S16): a word ST apart
   constexpr int XG = H ? 512 : Q8 ? 256 : 128, SG = Q8 ? 64 : SWB ? 2048 : 16, ST = SWB ? 512 : 4;
   float (*red)[4][32] = reinterpret_cast<float (*)[4][32]>(smem);
   const int lane = thread & 31, w = thread >> 5, g = lane >> 2, t4 = lane & 3;
-  const int ng = (kt + 3) >> 2, q = ng / KS, r = ng - q * KS;
-  const int N = q + (w < r), g0 = w * q + (w < r ? w : r);  // the warp's groups g0 .. g0 + N - 1
+  const int ng = (kt + 3) >> 2, np = G1 - G0, q = np / KS, r = np - q * KS;
+  const int N = q + (w < r), g0 = G0 + w * q + (w < r ? w : r);  // the warp's groups g0 .. g0 + N - 1
   const int nlast = kt - 4 * (ng - 1);                     // k-tiles of the slice's last group (1 .. 4)
   const uint8_t *pa = ia + ((size_t)sl * ng + g0) * GV + 16 * lane;
   const uint8_t *ps = ia + ((size_t)sl * ng + g0) * GV + 2048 + (H ? 8 * lane : 32 * g);
@@ -69,6 +53,8 @@ __device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, co
     pb1 = sx + (SWB ? swz_row(c1, -ldsx) + swz_col(16 * g0) : (size_t)c1 * ldsx + 16 * g0);
   }
   const uint64_t pol = l2_evict_first();  // A's L2 policy (ldg_stream)
+  // every load is at an immediate offset from one pointer per stream, stepped once per group: A's 4 k-tiles (a warp's 512 contiguous
+  // bytes each, L1 bypassed, L2 evict-first) and their scales, x and its scales; a warp keeps P groups in flight in registers
   struct Stage {
     uint4 a[4];  // A: k-tile T's words (word j: A16 the mma j, A8 block j)
     uint4 s[2];  // A scales: A16 s[0].x, .y (tile T: bytes 2 T, 2 T + 1 of 8); A8 tiles 0, 1 / 2, 3 (word row g, g + 8)
@@ -124,7 +110,8 @@ __device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, co
     for (int T = 0; T < 4; ++T) {
       if (H) {
 #ifdef NVFP4A_TC80
-        // the lane's block t of rows g, g + 8: 0x40 + 2a -> BF16 192 + 2a -> fma(., sa / 2, -96 sa) = a sa
+        // lane (g, t) multiplies block t of rows g, g + 8 (a * sa exact in BF16) with x's 16 values of column g at the same k: 4 BF16 mma
+        // (their 16 k need not be one block: the scale is in A); 0x40 + 2a -> BF16 192 + 2a -> fma(., sa / 2, -96 sa) = a sa
         const uint32_t sw = (T < 2 ? st.s[0].x : st.s[0].y) >> (16 * (T & 1));
         const float sa0 = scale_val<UEA>(sw & 0xFF), sa1 = scale_val<UEA>((sw >> 8) & 0xFF);
         const auto pair = [](float v) { const uint32_t h = __float_as_uint(v) >> 16; return h | h << 16; };
@@ -139,6 +126,8 @@ __device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, co
         }
 #endif
       } else {
+        // per block j an integer mma (its 16 k one block): 1.5 * 2^23 + p of the exact block sum, acc = fma(fma(D, sa, -1.5 * 2^23 sa),
+        // sb, acc).  The lane loads block t of column g; a 4 x 4 transpose within the quad (SHFL) gives each lane its part of every block
         uint32_t b[4];
         if (Q8) {  // the quad's 4 x 4 transpose: lane t has block t's words, gets word t of every block
           const uint4 v = st.x[T];
@@ -189,7 +178,7 @@ __device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, co
 
   // the ring: stage j holds group i + j.  Every warp runs the same Q groups, the busiest warp's count (uniform: no
   // branch around the mma and shuffles), past its own N zero stages; the slice's last group may hold fewer k-tiles
-  const int Q = (ng + KS - 1) / KS;
+  const int Q = (np + KS - 1) / KS;
   const bool lastw = g0 + N == ng;  // the warp holds the slice's last group
   const auto vt_of = [&](int gi) { return gi < N ? (lastw && gi == N - 1 ? nlast : 4) : 0; };
   Stage st[P];
@@ -201,9 +190,21 @@ __device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, co
     for (int j = 0; j < P; ++j) { consume(st[j]); load(st[j], vt_of(i + j + P)); }
   }
 
-  // the warps' partial sums -> one per output, added in warp order; lanes of warps 0 - 3 store output (lane, w)
+  // the k sums stay in registers to the end; the warps' partial sums of an output are added in warp order through shared memory
+  // (deterministic), one store per output; x's columns past n read column n - 1 (computed, not stored)
 #pragma unroll
   for (int u = 0; u < 4; ++u) red[w][u][lane] = acc[u];
+#endif
+}
+
+// The slice's epilogue: output (row, col) of lane (g, t4) and warp w < 4 is sum(w, lane) * kOut, `sum` the ordered sum of the
+// output's terms; one store per output.  The extended epilogue's additions EX: warp w forms s_w after its k range, the slice's
+// values go through shared memory to ex_finish.
+template <int EX, bool CG, class Sum>
+__device__ __forceinline__ void gemv_tc_finish(const Epilogue &e, const EpilogueEx &xd, int m, int n, int sl, unsigned thread,
+                                               float *smem, float kOut, const Sum &sum) {
+  constexpr int KS = kGvWarps;
+  const int lane = thread & 31, w = thread >> 5, g = lane >> 2, t4 = lane & 3;
   if (EX) {
     float *scs = smem + KS * 4 * 32, *stage = scs + KS;  // s_j; values [col][row in the slice]
     // s_w after the warp's own k range (before it, its dependent loads would hold back the stream of A)
@@ -212,12 +213,10 @@ __device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, co
     __syncthreads();
     EpiState es = epi_begin(e);
     if (w < 4) {
-      float v = red[0][w][lane];
-#pragma unroll
-      for (int u = 1; u < KS; ++u) v += red[u][w][lane];
+      const float v0 = sum(w, lane);
       const int r = g + 8 * (w >> 1), row = sl * 16 + r, col = 2 * t4 + (w & 1);
       if (row < m && col < n) {
-        v = ex_value<CG>(e, row, col, v * kOut, scs[col]);
+        const float v = ex_value<CG>(e, row, col, v0 * kOut, scs[col]);
         if (!(EX & kEX_SWIGLU)) {
           store_any(e.d_dtype, e.d, (size_t)col * e.ldd + row, v);
           es.amax = fmaxf(es.amax, fabsf(v));
@@ -234,15 +233,29 @@ __device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, co
   }
   __syncthreads();
   if (w < 4) {
-    float v = red[0][w][lane];
-#pragma unroll
-    for (int u = 1; u < KS; ++u) v += red[u][w][lane];
+    const float v = sum(w, lane);
     const int row = sl * 16 + g + 8 * (w >> 1), col = 2 * t4 + (w & 1);
     EpiState es = epi_begin(e);
     if (row < m && col < n) epi_store<CG>(e, es, row, col, v * kOut);
     epi_end(e, es);
   }
-#endif
+}
+
+// The work item: m16 slice sl of A (all of k) on the CTA's kGvWarps warps (thread: the thread in the CTA), its shared
+// memory smem (gemv_tc_smem_floats(EX) floats).  gemv_tc_kernel runs one a CTA; an executor may run it from its own kernel.
+template <int XT, int F, int EX, bool CG = false>
+__device__ __forceinline__ void gemv_tc_slice(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ x, int ldx,
+                                              const uint8_t *__restrict__ sx, int ldsx, int m, int n, int kt, const Epilogue &e,
+                                              const EpilogueEx &xd, int sl, unsigned thread, float *smem) {
+  constexpr float kOut = XT == NVFP4A_INT8 ? 0.5f : XT == NVFP4A_NVFP4 ? 0.25f : 1.f;  // integer paths: the A values are doubled
+  gemv_tc_sums<XT, F, CG>(ia, x, ldx, sx, ldsx, n, kt, sl, 0, (kt + 3) >> 2, thread, smem);
+  const float (*red)[4][32] = reinterpret_cast<const float (*)[4][32]>(smem);
+  gemv_tc_finish<EX, CG>(e, xd, m, n, sl, thread, smem, kOut, [&](int w, int lane) {
+    float v = red[0][w][lane];
+#pragma unroll
+    for (int u = 1; u < kGvWarps; ++u) v += red[u][w][lane];
+    return v;
+  });
 }
 
 template <int XT, int F, int EX = 0, class... X>
@@ -263,6 +276,51 @@ struct GemvTcItemArgs {
 template <int XT, int F, int EX, bool CG = true>
 __device__ __forceinline__ void gemv_tc_item(const GemvTcItemArgs &a, int item, unsigned thread, void *smem) {
   gemv_tc_slice<XT, F, EX, CG>(a.ia, a.x, a.ldx, a.sx, a.ldsx, a.m, a.n, a.kt, a.e, a.xd, item, thread, (float *)smem);
+}
+
+// The slice cut along k (include/nvfp4effma_items.h): part items -- a slice over a part of its groups, the warps' sums added
+// in warp order and scaled back exactly, to FP32 partials -- and combine items -- a slice: its parts added in order, then the
+// epilogue.  The partials of a slice: [part][column][16 rows] floats, the slices one after the other.
+struct GemvTcSplitArgs {
+  GemvTcItemArgs g;
+  float *partials;
+  int parts;
+};
+// part p of `parts` over the ng groups of k: the groups [p ng / parts, (p + 1) ng / parts)
+__host__ __device__ __forceinline__ void gemv_tc_part_range(int kt, int parts, int part, int *g0, int *g1) {
+  const long long ng = (kt + 3) >> 2;
+  *g0 = static_cast<int>(part * ng / parts);
+  *g1 = static_cast<int>((part + 1) * ng / parts);
+}
+template <int XT, int F>
+__device__ __forceinline__ void gemv_tc_part_item(const GemvTcSplitArgs &s, int item, unsigned thread, void *smem) {
+  constexpr float kOut = XT == NVFP4A_INT8 ? 0.5f : XT == NVFP4A_NVFP4 ? 0.25f : 1.f;
+  const GemvTcItemArgs &a = s.g;
+  const int slices = (a.m + 15) / 16, sl = item % slices, part = item / slices;
+  int g0, g1;
+  gemv_tc_part_range(a.kt, s.parts, part, &g0, &g1);
+  float *red = static_cast<float *>(smem);
+  gemv_tc_sums<XT, F, true>(a.ia, a.x, a.ldx, a.sx, a.ldsx, a.n, a.kt, sl, g0, g1, thread, red);
+  __syncthreads();
+  const int lane = thread & 31, w = thread >> 5, g = lane >> 2, t4 = lane & 3, col = 2 * t4 + (w & 1);
+  if (w < 4 && col < a.n) {
+    const float (*r)[4][32] = reinterpret_cast<const float (*)[4][32]>(red);
+    float v = r[0][w][lane];
+    for (int u = 1; u < kGvWarps; ++u) v += r[u][w][lane];
+    __stcg(s.partials + (static_cast<size_t>(sl) * s.parts + part) * a.n * 16 + col * 16 + g + 8 * (w >> 1), v * kOut);
+  }
+}
+template <int EX>
+__device__ __forceinline__ void gemv_tc_combine_item(const GemvTcSplitArgs &s, int item, unsigned thread, void *smem) {
+  const GemvTcItemArgs &a = s.g;
+  const float *p = s.partials + static_cast<size_t>(item) * s.parts * a.n * 16;
+  gemv_tc_finish<EX, true>(a.e, a.xd, a.m, a.n, item, thread, static_cast<float *>(smem), 1.f, [&](int w, int lane) {
+    const int col = 2 * (lane & 3) + (w & 1), r = (lane >> 2) + 8 * (w >> 1);
+    if (col >= a.n) return 0.f;
+    float v = __ldcg(p + col * 16 + r);
+    for (int q = 1; q < s.parts; ++q) v = __fadd_rn(v, __ldcg(p + (static_cast<size_t>(q) * a.n + col) * 16 + r));
+    return v;
+  });
 }
 
 // Entry point (src/tensors/gemv_tc_inst.cu): x dtype XT (NVFP4, INT8, BF16), formats F (kF_AUE; NVFP4 x kF_BUE, kF_BSWZ,

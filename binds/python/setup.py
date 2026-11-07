@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Build of the NVFP4EffMA PyTorch extension.
-
-    pip install ./binds/python --no-build-isolation        (from the repository root)
-
-The CUDA library is built first with the repository Makefile (parallel, see its header), for:
-  NVFP4EFFMA_ARCHS="61 75"          explicit list of compute capabilities, or
-  TORCH_CUDA_ARCH_LIST="6.1;7.5"   the usual PyTorch variable, or
-  the GPUs visible to PyTorch at build time, or, without any, every supported one (sm_50..sm_90).
-Architectures outside sm_50..sm_90 are dropped: those GPUs have native FP4 (or are too old).
-Other variables: CUDA_HOME (toolkit), NVFP4EFFMA_CCBIN (host compiler for nvcc), MAX_JOBS,
-NVFP4EFFMA_OBJDIR (reuse an object directory with the library already built for these architectures),
-NVFP4EFFMA_LOCAL_VERSION (local version label of a release wheel, e.g. cu126torch2.7).
-"""
+"""Build of the NVFP4EffMA PyTorch extension: ``pip install ./binds/python --no-build-isolation`` (from the repository root).
+Architectures: NVFP4EFFMA_ARCHS="61 75", else TORCH_CUDA_ARCH_LIST="6.1;7.5", else the GPUs visible to PyTorch, else sm_50..sm_90;
+those outside sm_50..sm_90 are dropped (native FP4, or too old).  Other variables: CUDA_HOME, NVFP4EFFMA_CCBIN, MAX_JOBS, NVFP4EFFMA_ROOT."""
 import os
 import re
 import subprocess
@@ -85,6 +75,7 @@ class Build(BuildExtension):
         # NVFP4EFFMA_OBJDIR: an object directory that already holds the library for these architectures
         # (dev/release.sh builds it once for all wheels); make then only checks that it is up to date
         objdir = os.path.abspath(os.environ.get("NVFP4EFFMA_OBJDIR") or os.path.join(self.build_temp, "libnvfp4effma"))
+        # the library is built first with the repository Makefile; NVFP4EFFMA_CCBIN: host compiler for nvcc, MAX_JOBS: make JOBS
         cmd = ["make", "-C", ROOT, f"OBJDIR={objdir}", f"ARCHS={' '.join(map(str, target_archs()))}",
                f"CUDA_HOME={CUDA_HOME}", f"{objdir}/libnvfp4effma.a"]
         if os.environ.get("NVFP4EFFMA_CCBIN"):

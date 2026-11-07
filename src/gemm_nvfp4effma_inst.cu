@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// One FFMA GEMM instance object: -DNVFP4A_ID=<config> -DNVFP4A_TB=<B dtype> -DNVFP4A_F=<formats>, or with
-// -DNVFP4A_EX=<additions> instead of the formats the extended epilogue's kernel (linear E4M3 scales).  Small
-// objects keep the build parallel; the kernel bodies are compiled only for the architectures that dispatch
-// to them (dense B: the configurations their table or the defaults select; NVFP4 / INT8 B: configuration 0
-// below sm_61, where there is no DP4A), trapping stubs elsewhere.
+// One FFMA GEMM instance object: -DNVFP4A_ID=<config> -DNVFP4A_TB=<B dtype> -DNVFP4A_F=<formats>, or -DNVFP4A_EX=<additions>
+// instead of the formats for the extended epilogue's kernel (linear E4M3 scales).  Kernel bodies are compiled only for the
+// architectures that dispatch to them (dense B: table or default configurations; NVFP4 / INT8 B: configuration 0 below sm_61).
+#include <limits.h>
 #include "gemm_nvfp4effma.cuh"
 
 namespace nvfp4a {
@@ -42,6 +41,15 @@ cudaError_t gemm_entry(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, c
 }
 template cudaError_t gemm_entry<NVFP4A_ID, NVFP4A_TB, NVFP4A_F>(const uint8_t *, int, const uint8_t *, int, const uint8_t *, int,
                                                                const uint8_t *, int, int, int, int, const Epilogue &, cudaStream_t);
+template <int ID, int TB, int F>
+cudaError_t gemm_grouped_entry(const GroupedArgs &a, int rows, cudaStream_t s) {
+  using C = LibGemm<ID>;
+  const long long tiles = (long long)((a.m + C::BM - 1) / C::BM) * ((rows + C::BN - 1) / C::BN + a.groups);
+  if (tiles > INT_MAX) return cudaErrorInvalidConfiguration;
+  gemm_grouped_kernel<C, TB, F><<<(unsigned)tiles, C::NT, 0, s>>>(a);
+  return cudaGetLastError();
+}
+template cudaError_t gemm_grouped_entry<NVFP4A_ID, NVFP4A_TB, NVFP4A_F>(const GroupedArgs &, int, cudaStream_t);
 #endif
 
 }  // namespace kern

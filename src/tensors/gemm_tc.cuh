@@ -1,19 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// NVFP4EffMA GEMM on tensor cores (sm_75 .. sm_89; BF16 B from sm_80), streaming the operands' images (image.cuh).
-//   NVFP4 / INT8 B  per output and block of 16 k one integer mma gives 1.5 * 2^23 + p of the exact block sum p
-//                   (mma.cuh); y = fma(1.5 * 2^23 + p, sa, -1.5 * 2^23 sa) = p sa exactly, acc = fma(y, sb, acc)
-//   BF16 B          A decoded to BF16 a * sa (exact), one BF16 mma per 16 k with FP32 accumulation
-// Then the DP4A kernel's epilogue (times 1/4 for NVFP4 B, 1/2 for INT8: the decoded values are doubled).
-//
-// CTA = 128 x 128 outputs, 8 compute warps (warp tile 64 x 32 for NVFP4 B, 32 x 64 otherwise) and the producers.  NS
-// slots of shared memory, a slot = one k-tile: A's 8 slices, B's record, the scales converted in consumption order.
-// K-tile u in slot u % NS:
-//   copy     the copier waits on the slot's EMPTY named barrier (an mbarrier arrive is a MEMBAR on sm_8x, too dear for
-//            every thread and k-tile), cp.async of A and B arriving on the slot's LANDED mbarrier
-//   publish  the publisher loads A's scales from the image, waits for LANDED, writes the converted scales, arrives on FULL
-//   consume  each compute warp waits for FULL on its own, runs the k-tile, arrives on EMPTY
-// sm_75 (no cp.async, no mbarrier): four producer warps load through registers, a sequence number per slot.
+// NVFP4EffMA GEMM on tensor cores (sm_75 .. sm_89; BF16 B from sm_80), streaming the operands' images (image.cuh).  CTA = 128 x 128
+// outputs, 8 compute warps (warp tile 64 x 32 for NVFP4 B, 32 x 64 otherwise) and the producers; NS slots of shared memory, a slot =
+// one k-tile (A's 8 slices, B's record, the scales converted in consumption order), k-tile u in slot u % NS; copy / publish / consume below.
 #pragma once
 #include "../gemm_nvfp4effma.cuh"
 #include "image.cuh"
@@ -21,10 +10,10 @@
 namespace nvfp4a {
 namespace kern {
 
-// 8 compute warps and the producers: sm_80+ a copier and a publisher; sm_75 four producer warps (no cp.async: their
-// loads go through registers, eight 16-byte chunks a thread in flight)
+// 8 compute warps and the producers: sm_80+ a copier and a publisher; sm_75 (no cp.async, no mbarrier) four producer warps loading
+// through registers, a sequence number per slot (eight 16-byte chunks a thread in flight)
 constexpr int kTcProducers80 = 2, kTcProducers75 = 4;
-// threads of the variant compiled for this device pass (its register bound: sm_80+ 320 threads, 204 registers each)
+// threads of the variant compiled for this device pass (they bound its registers per thread: 64K registers per SM)
 #ifdef NVFP4A_TC80
 constexpr int kTcThreads = 256 + 32 * kTcProducers80;
 #else
@@ -64,10 +53,9 @@ template <int TB> __host__ __device__ constexpr int tc_smem_bytes(bool v75) {
   return v75 ? TcSlot<TB, true>::NS * (TcSlot<TB, true>::BYTES + 16) : TcSlot<TB, false>::NS * (TcSlot<TB, false>::BYTES + 16);
 }
 
-// F: the scale formats kF_AUE / kF_BUE (the images hold every layout linear); EX: the extended epilogue's additions (xd its
-// descriptor).  IT: a work item, tile `item` over all of k on this CTA (no workspace; the CTA's threads are kTcThreads,
-// smem tc_smem_bytes); else the launch's persistent CTAs over the units.
-// CG (default IT): B's image/global and C read through L2 for an intra-launch consumer.
+// F: the scale formats kF_AUE / kF_BUE (the images hold every layout linear); EX: the extended epilogue's additions (xd its descriptor).
+// IT: a work item, tile `item` over all of k on this CTA (no workspace; kTcThreads threads, smem tc_smem_bytes); else the launch's
+// persistent CTAs over the units.  CG (default IT): B's image/global and C read through L2 for an intra-launch consumer.
 template <int TB, int F, int EX, bool IT, bool CG = IT>
 __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, const uint8_t *__restrict__ ib, int m, int n, int kt,
                                              const Epilogue &e, float *ws, unsigned *flags, const EpilogueEx &xd, int item,
@@ -90,13 +78,12 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
   constexpr bool UEA = F & kF_AUE, UEB = F & kF_BUE;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t4 = lane & 3;
   const int wm = warp / WN, wn = warp % WN;
-  // Persistent CTAs over units = (output tile, k-tile), tiles rastered in groups of GM row blocks (tile_of: a wave's A
-  // and B records stay in L2).  W full waves of whole tiles (CTA c: tiles c, c + G, ..); with a workspace the last,
-  // partial wave split stream-K into even shares of its units: a tile cut between CTAs is finished by the one holding
-  // its k-tile 0, last, from the FP32 partials of the others (ws; flags back to 0 once read).  The split is recomputed
-  // from the parameters and re-read %ctaid where needed, so none of it stays live through the compute warps' hot loop.
+  // Persistent CTAs over units = (output tile, k-tile), tiles rastered in groups of GM row blocks (tile_of: a wave's A and B records stay
+  // in L2).  W full waves of whole tiles (CTA c: tiles c, c + G, ..); with a workspace the last, partial wave is split stream-K into even
+  // shares of its units: a cut tile is finished last by the CTA holding its k-tile 0, from the others' FP32 partials (ws; flags back to 0).
   constexpr int GM = 8;
   struct Split { int c, G, W, beg; long long usk; };  // usk: stream-K units
+  // recomputed from the parameters, %ctaid re-read where needed: none of it stays live through the compute warps' hot loop
   const auto split = [&] {
     Split s;
     s.c = IT ? item : (int)ctaid_x(); s.G = IT ? ((n + BN - 1) / BN) * ((m + BM - 1) / BM) : (int)nctaid_x();
@@ -116,6 +103,12 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
     const int grp = lin / (GM * nt), first = grp * GM, gsz = min(GM, mt - first), t = lin - grp * GM * nt;
     mb = first + t % gsz; nb = t / gsz;
   };
+  const int ne = IT ? items_columns(xd, n) : n;  // the columns computed (tiles keep the maximum's raster, so ranges stay envelopes)
+  if (IT) {
+    int mb, nb;
+    tile_of(item, mb, nb);
+    if (nb * BN >= ne) return;  // (CTA-uniform)
+  }
   int U;
   {
     const Split s = split();
@@ -140,14 +133,10 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
 #endif
   __syncthreads();
 
-  // the scale bytes in consumption order (the publisher / the sm_75 producers), from the image (ga: the k-tile's group of
-  // slice 0, T = kk % 4) into the slot:
-  //   A: rows g and g + 8 of a slice -> [slice 8][block 4][g 8]: integer paths sa FP32 (8 bytes, A8: the words of tile T
-  //      at 32 g + 8 T); BF16 (sa / 2, -96 sa) as BF16 pairs (16 bytes, exact: <= 5 significant bits; A16: lane (g, t)'s
-  //      block t, bytes 8 (4 g + t) + 2 T, + 1)
-  //   B (NVFP4): raw [pair 8][t 4][slice 2][c 2] words -> [block 4][slice quad 4][t 4][slice 4][c 2] floats
-  // (load and conversion apart: the publisher issues the loads before its wait for the copy)
-  struct RawA { uint4 u0, u1; };
+  // the scale bytes in consumption order (the publisher / the sm_75 producers), from the image (ga: the k-tile's group of slice 0,
+  // T = kk % 4) into the slot.  A: rows g and g + 8 of a slice -> [slice 8][block 4][g 8]: integer paths sa FP32 (8 bytes, A8: the words
+  // of tile T at 32 g + 8 T); BF16 (sa / 2, -96 sa) as BF16 pairs (16 bytes, exact: <= 5 significant bits; A16: lane (g, t)'s block t, bytes 8 (4 g + t) + 2 T, + 1)
+  struct RawA { uint4 u0, u1; };  // (load and conversion apart: the publisher issues the loads before its wait for the copy)
   const auto load_a = [&](const uint8_t *ga, int T, int x) {  // pair x = 8 slice + g
     const uint8_t *sc = ga + (x >> 3) * sstride + 2048 + 32 * (x & 7);
     RawA r;
@@ -183,6 +172,7 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
       }
     }
   };
+  // B (NVFP4) scales: raw [pair 8][t 4][slice 2][c 2] words -> [block 4][slice quad 4][t 4][slice 4][c 2] floats
   const auto conv_b = [&](uint8_t *p, int l) {  // l = 4 pair + t
     const int pr = l >> 2, t = l & 3;
     const uint4 w = reinterpret_cast<const uint4 *>(p + L::BS)[l];
@@ -193,8 +183,9 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
                       scale_val<UEB>((w.z >> (8 * kb)) & 0xFF), scale_val<UEB>((w.w >> (8 * kb)) & 0xFF));
   };
 #ifdef NVFP4A_TC80
-  // k-tile u into slot u % NS (the copier, lane l: A's 8 slices' 16-byte chunk l, B's chunks l + 32 i), completion
-  // arriving on LANDED.  a: A's k-tile kk group of slice 0 (+ 16 lane), b: B's record (+ 16 lane)
+  // copy: k-tile u into slot u % NS (the copier, lane l: A's 8 slices' 16-byte chunk l, B's chunks l + 32 i), after waiting on the slot's
+  // EMPTY named barrier (an mbarrier arrive is a MEMBAR on sm_8x, too dear for every thread and k-tile); completion arrives on LANDED.
+  // a: A's k-tile kk group of slice 0 (+ 16 lane), b: B's record (+ 16 lane)
   const auto copy = [&](int u, const uint8_t *a, int kk, const uint8_t *b) {
     const uint32_t d = s0 + (u % NS) * SLOT;
     a += 512 * (kk & 3);
@@ -204,7 +195,8 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
     for (int i = 0; i < RB / 512; ++i) cp_async16(d + L::B + 512 * i, b + 512 * i);
     cp_async_mbar_arrive(landed + 8 * (u % NS));
   };
-  // the publisher: k-tile u's copy landed, its scales (from the image) converted, FULL
+  // publish: the publisher loads A's scales from the image, waits for LANDED, writes the converted scales, arrives on FULL; each
+  // compute warp then waits for FULL on its own, runs the k-tile, arrives on EMPTY
   const auto publish = [&](int u, const uint8_t *ga, int kk) {
     const RawA r0 = load_a(ga, kk & 3, lane), r1 = load_a(ga, kk & 3, lane + 32);
     mbar_wait(landed + 8 * (u % NS), (u / NS) & 1);
@@ -295,23 +287,20 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
       for (int j = 0; j < NJ; ++j) mma_bf16(acc[i][j], f.a[i][0], f.a[i][1], f.a[i][2], f.a[i][3], f.b[j][0], f.b[j][1]);
 #endif
   };
-  // the integer paths: a k-tile in one straight block (ktile_i), per block its mma operands as loaded -- A's words, B's
-  // words (INT8) or nibble halves (NVFP4) -- decoded (dec4) next to their use, the scales (A rows' sa, B columns' sb)
-  // from the slot.  (Blocks loaded one ahead across k-tiles, as W4A16's, spilled the accumulators over the slot
-  // handover: the FFMA chains leave no room for a second block of operands and scales.)  INT8 B [block][slice
-  // quad][lane][slice 4] words, sb [block][octet][t][slice 8][c 2]; NVFP4 B [pair][lane][slice 2][word 2] (word w =
-  // blocks 2 w, 2 w + 1), sb [block][quad][t][slice 4][c 2]
+  // the integer paths: a k-tile in one straight block (ktile_i), per block its mma operands as loaded -- A's words, B's words (INT8) or
+  // nibble halves (NVFP4) -- decoded (dec4) next to their use, the scales (A rows' sa, B columns' sb) from the slot; no block is loaded
+  // one ahead across k-tiles (as W4A16's): the FFMA chains leave no room for a second block of operands and scales
   struct FragI { uint32_t a[MT], b[NJ]; };
   const auto load_i = [&](FragI &f, const uint8_t *p, int kb) {
 #pragma unroll
     for (int i = 0; i < MT; ++i) f.a[i] = reinterpret_cast<const uint32_t *>(p)[(32 * (MT * wm + i) + lane) * 4 + kb];
-    if (Q8) {
+    if (Q8) {  // INT8 B [block][slice quad][lane][slice 4] words, sb [block][octet][t][slice 8][c 2]
 #pragma unroll
       for (int jq = 0; jq < NJ / 4; ++jq) {  // 4 n8 slices' B words in one LDS.128
         const uint4 bw = reinterpret_cast<const uint4 *>(p + L::B)[(kb * 4 + NJ / 4 * wn + jq) * 32 + lane];
         f.b[4 * jq] = bw.x; f.b[4 * jq + 1] = bw.y; f.b[4 * jq + 2] = bw.z; f.b[4 * jq + 3] = bw.w;
       }
-    } else {
+    } else {  // NVFP4 B [pair][lane][slice 2][word 2] (word w = blocks 2 w, 2 w + 1), sb [block][quad][t][slice 4][c 2]
 #pragma unroll
       for (int j = 0; j < NJ; ++j) {
         const uint32_t w = reinterpret_cast<const uint32_t *>(p + L::B)[(32 * (NJ / 2 * wn + j / 2) + lane) * 4 + 2 * (j & 1) + (kb >> 1)];
@@ -381,33 +370,32 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
     }
   };
 
-  // ---- epilogue of the tile at (m0, n0) (the operations of the DP4A kernel's): v = acc * kOut * s, + bias, beta * C + v
-  // in one FMA, amax of the stored values.  Staged through slot p, the slot of the tile's last k-tile (its EMPTY
-  // arrival waits for the epilogue; the stream fills the other slots with the next tile meanwhile), warp-local after
-  // one barrier (every compute warp is done reading the slot): a warp stages its outputs in its own 8 SLD floats, one
-  // n8 slice x two m16 slices (8 columns x 32 rows) a pass, then lane l writes rows 8 (l % 4) .. + 7 of column l / 4
-  // (one 16-byte store for BF16 / FP16 output).  Cold code: lane and warp re-read (tid_x), nothing it derives is hoisted
-  // into the hot loop; C (beta != 0) element by element.
-  // The extended epilogue: s_j of the tile's columns behind the staging (a warp per column), the column parts times s_j;
-  // a pass's values (two whole m16 slices) to ex_finish, the warp's lanes sharing it.
+  // ---- epilogue of the tile at (m0, n0) (the operations of the DP4A kernel's): v = acc * kOut * s, + bias, beta * C + v in one FMA, amax
+  // of the stored values.  Staged through slot p, the slot of the tile's last k-tile (its EMPTY arrival waits for the epilogue; the stream
+  // fills the other slots with the next tile meanwhile), warp-local after one barrier (every compute warp is done reading the slot).
   constexpr int EPI = 15, SLD = 36;  // EPI: the compute warps' named barrier; SLD: staged column, 32 rows + 4 (banks)
   static_assert((NC / 32 * 8 * SLD + BN) * 4 <= SLOT && MT % 2 == 0, "the warps' staging fits in a slot");
   static_assert(!EX || !N4, "the extended epilogue's warp tile: 32 rows");
   const auto epilogue = [&](int m0, int n0, uint8_t *p, auto dc) {
     constexpr int DT = decltype(dc)::value;
+    // cold code: lane and warp re-read (tid_x), nothing it derives is hoisted into the hot loop
     const int tx = (int)tid_x(), ln = tx & 31, wp = tx >> 5, gg = ln >> 2, tt = ln & 3;
     const int rb = m0 + wp / WN * TM, cb = n0 + wp % WN * TN;  // the warp's rows and columns
+    // a warp stages its outputs in its own 8 SLD floats, one n8 slice x two m16 slices (8 columns x 32 rows) a pass; lane l then writes
+    // rows 8 (l % 4) .. + 7 of column l / 4 (one 16-byte store for BF16 / FP16 output); C (beta != 0) element by element
     float *stage = reinterpret_cast<float *>(p) + wp * 8 * SLD;
     const bool use_c = e.beta != 0.f, vd = ((uintptr_t)e.d % (8 * Elem<DT>::bytes)) == 0 && e.ldd % 8 == 0;
     EpiState st = epi_begin(e);
     bar_sync<NC>(EPI);  // the compute warps are done with the slot
+    // extended epilogue: s_j of the tile's columns behind the staging (a warp per group of 8 columns), the column parts times s_j;
+    // a pass's values (two whole m16 slices) go to ex_finish, the warp's lanes sharing it
     float *scs = reinterpret_cast<float *>(p) + NC / 32 * 8 * SLD;
     if (EX & kEX_NORM) {
       static_assert(BN == 8 * (NC / 32) * 2, "two groups of 8 columns a warp");
 #pragma unroll 1
       for (int c = 8 * wp; c < BN; c += 8 * (NC / 32)) {
         float v[8];
-        ex_norm_scales<8>(xd, n0 + c, n, ln, v);
+        ex_norm_scales<8>(xd, n0 + c, ne, ln, v);
 #pragma unroll
         for (int q = 0; q < 8; ++q)
           if (ln == q) scs[c + q] = v[q];
@@ -430,7 +418,7 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
 #pragma unroll
         for (int x = 0; x < 2; ++x) {
           const int gj = cb + 8 * j + 2 * tt + x;
-          colp[x] = epi_col_part<CG>(e, gj < n ? gj : 0);
+          colp[x] = epi_col_part<CG>(e, gj < ne ? gj : 0);
           if (EX & kEX_NORM) colp[x] = __fmul_rn(colp[x], scs[gj - n0]);
         }
 #pragma unroll
@@ -443,7 +431,7 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
                   __fmul_rn(acc[i0 + ii][j][2 * hh + x] * kOut, epi_scale_ab(e, rowp[ii][hh], colp[x]));
         warp_sync();
         // lane: rows gi .. gi + 7 (cnt of them in range) of column gj; bias and C (rare) applied in the stage
-        const int gi = rb + 16 * i0 + 8 * tt, gj = cb + 8 * j + gg, cnt = gj < n ? min(8, m - gi) : 0;
+        const int gi = rb + 16 * i0 + 8 * tt, gj = cb + 8 * j + gg, cnt = gj < ne ? min(8, m - gi) : 0;
         float *sv = &stage[gg * SLD + 8 * tt];
         if (e.bias || use_c) {
 #pragma unroll 1
@@ -457,7 +445,7 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
         if (EX & kEX_SWIGLU) {  // lane: column gg, slice tt / 2, rows 4 (tt % 2) .. + 3 of its halves -> 4 rows of D
           warp_sync();
           const int sr = 16 * (tt >> 1), r = 4 * (tt & 1), dr = (rb + 16 * i0 + sr) / 2 + r;
-          if (gj < n && rb + 16 * i0 + sr < m) {
+          if (gj < ne && rb + 16 * i0 + sr < m) {
             const float *q = &stage[gg * SLD + sr + r];
             float h[4];
 #pragma unroll
@@ -466,7 +454,7 @@ __device__ __forceinline__ void gemm_tc_body(const uint8_t *__restrict__ ia, con
           }
         } else if (EX & kEX_OUT2) {
           warp_sync();
-          ex_finish<EX>(e, xd, stage, SLD, rb + 16 * i0, 2, cb + 8 * j, 1, 8, m, n, ln, 32, st);
+          ex_finish<EX>(e, xd, stage, SLD, rb + 16 * i0, 2, cb + 8 * j, 1, 8, m, ne, ln, 32, st);
         }
         float v[8];
         *reinterpret_cast<float4 *>(v) = *reinterpret_cast<const float4 *>(sv);
@@ -681,6 +669,8 @@ cudaError_t tc_image_a(bool h, const uint8_t *A, int lda, const uint8_t *SA, int
 cudaError_t tc_image_a_convert(bool h, const uint8_t *src, int m, int k, uint8_t *dst, cudaStream_t s);
 cudaError_t tc_image_a_raw(bool h, const uint8_t *src, int m, int k, uint8_t *data, int ldd, uint8_t *scales, int lds, cudaStream_t s);
 cudaError_t tc_image_b(int tb, const uint8_t *B, int ldb, const uint8_t *SB, int ldsb, int n, int k, uint8_t *img, cudaStream_t s);
+const void *image_bh_kernel_ptr();  // the BF16 and the INT8 B transcoders (the work items' resources are theirs)
+const void *image_b8_kernel_ptr();
 template <int TB, int F>
 cudaError_t tc_entry(const uint8_t *ia, const uint8_t *ib, int m, int n, int k, const Epilogue &e, uint8_t *ws, cudaStream_t s);
 // the extended epilogue's (gemm_tc_inst.cu with -DNVFP4A_EX): B INT8 or BF16, A's scales E4M3, additions EX

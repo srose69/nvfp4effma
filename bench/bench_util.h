@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// Shared measurement helper of the benchmarks.
-//
-// Before the first row: NVFP4A_BENCH_WARMUP (default 4) plain FP32 matrix products 2048 x 2048, 0.5 s apart,
-// so that GPU Boost has raised the clocks (otherwise the first rows run at a lower SM clock).
-// Every row: one untimed call (module loading), NVFP4A_BENCH_COOL seconds of idle GPU (default 2) so
-// each row starts from a similar temperature, then NVFP4A_BENCH_REPS timed calls (default per bench).
-// The reported time is the median.  While a row runs, a host thread samples the SM clock through NVML
-// every 5 ms; percentages of the FP32 peak use that row's own mean clock, so rows that heat the GPU
-// more (and run at a lower clock) are not compared against a clock they never had.
+// Shared measurement helper: NVFP4A_BENCH_WARMUP (4) FP32 products first so the clocks are raised, then per row one
+// untimed call, NVFP4A_BENCH_COOL (2) s idle and NVFP4A_BENCH_REPS timed calls; the time is the median.
+// A host thread samples the SM clock through NVML every 5 ms; % of FP32 peak uses the row's own mean clock.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -156,10 +150,9 @@ class Bench {
   cudaEvent_t a_, b_;
 };
 
-// Transformer Engine / cuBLASLt operand formats, each a kernel instance of its own: one feature at a time
-// (where a regression comes from), then the combinations Transformer Engine produces.  B flags apply to an
-// NVFP4 B only; rows with B flags are skipped for other B dtypes.  Every row is compared with "plain" of
-// the same block (linear E4M3 scales, per-tensor decode factors), measured in the same run.
+// Transformer Engine / cuBLASLt operand formats, each its own kernel instance: single features first, then
+// the Transformer Engine combinations. B flags apply to an NVFP4 B only (rows skipped for other B dtypes);
+// every row is compared with "plain" (linear E4M3 scales, per-tensor decode factors) of the same run.
 #ifdef NVFP4EFFMA_H
 struct TeFmt { const char *name; unsigned fa, fb; };
 static const unsigned kSW = NVFP4A_SCALES_SWIZZLED, kUE = NVFP4A_SCALES_UE5M3, kAM = NVFP4A_GLOBAL_AMAX,

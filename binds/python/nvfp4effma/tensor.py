@@ -8,34 +8,22 @@ from typing import Optional, Tuple
 
 import torch
 
-from . import _C
+from . import _C, _ops
 
 
 class NVFP4Tensor:
-    """An NVFP4 tensor of logical shape ``[..., cols]``.
-
-    * ``data``: uint8 ``[..., >= cols / 2]``, column 2c in the low nibble of byte c.
-    * ``scales``: one block scale per 16 values along the last dimension -- float8_e4m3fn (or its bytes as
-      uint8), or UE5M3 bytes (uint8, ``ue5m3=True``).  Linear layout ``[..., >= cols / 16]`` (ModelOpt's
-      ``weight_scale``; Transformer Engine pads it to ``[roundup(rows, 128), roundup(cols / 16, 4)]``), or
-      the swizzled GEMM layout of cuBLASLt / Transformer Engine (``swizzled=True``): a 2-D
-      ``[roundup(rows, 128), roundup(cols / 16, 4)]`` buffer.
-    * the global: ``global_scale`` (the decode factor, ModelOpt's ``weight_scale_2``) or ``amax``
-      (Transformer Engine stores the amax: decode factor = amax / (6 * scale_max)); float32 with one element,
-      or one per row (row-scaled NVFP4).  Neither: 1.
-    * ``scale_max``: the bound of the global encoding, 0 = the scale type's maximum (448 / 114688), 256 for
-      Transformer Engine's 4over6 tensors.
-    * ``columnwise``: optionally the columnwise representation, an ``NVFP4Tensor`` of the transpose
-      (Transformer Engine's columnwise data), used by the backward GEMMs.
-
-    ``value = e2m1 * scale * global``.
-    """
+    """An NVFP4 tensor of logical shape ``[..., cols]``: ``value = e2m1 * scale * global``, in the layouts of ModelOpt,
+    Transformer Engine and cuBLASLt (the parts are described beside their checks in ``__init__``)."""
 
     def __init__(self, data: torch.Tensor, scales: torch.Tensor, global_scale: Optional[torch.Tensor] = None, *,
                  amax: Optional[torch.Tensor] = None, scale_max: int = 0, swizzled: bool = False, ue5m3: bool = False,
                  cols: Optional[int] = None, columnwise: Optional["NVFP4Tensor"] = None, block: Optional[Tuple[int, int]] = None):
+        # data: uint8 [..., >= cols / 2], column 2c in the low nibble of byte c
         if data.dtype != torch.uint8:
             raise TypeError(f"data must be torch.uint8 (two E2M1 values per byte), got {data.dtype}")
+        # scales: one block scale per 16 values of the last dim, float8_e4m3fn (or its uint8 bytes) or UE5M3 bytes (ue5m3=True);
+        # linear [..., >= cols / 16] (ModelOpt weight_scale; TE pads to [roundup(rows, 128), roundup(cols / 16, 4)]) or, with
+        # swizzled=True, the cuBLASLt / TE GEMM layout: a 2-D [roundup(rows, 128), roundup(cols / 16, 4)] buffer
         if ue5m3:
             if scales.dtype != torch.uint8:
                 raise TypeError(f"UE5M3 scales are stored as torch.uint8, got {scales.dtype}")
@@ -43,6 +31,8 @@ class NVFP4Tensor:
             scales = scales.view(torch.float8_e4m3fn)
         elif scales.dtype != torch.float8_e4m3fn:
             raise TypeError(f"scales must be torch.float8_e4m3fn (or uint8), got {scales.dtype}")
+        # global: global_scale (the decode factor, ModelOpt weight_scale_2) or amax (Transformer Engine: decode factor =
+        # amax / (6 * scale_max)); float32, one element or one per row (row-scaled NVFP4); neither: 1
         if global_scale is not None and amax is not None:
             raise ValueError("give either global_scale (a decode factor) or amax, not both")
         g = global_scale if global_scale is not None else amax
@@ -68,12 +58,14 @@ class NVFP4Tensor:
             raise ValueError(f"the global has {g.numel()} elements: 1 (per tensor) or {rows} (one per row)")
         if not (data.device == scales.device and (g is None or g.device == data.device)):
             raise ValueError("data, scales and the global must be on one device")
+        # scale_max: bound of the global encoding, 0 = the scale type's maximum (448 / 114688), 256 for TE's 4over6 tensors
         if scale_max not in (0, 256, 448, 114688):
             raise ValueError(f"scale_max must be 0, 256, 448 or 114688, got {scale_max}")
         self.data, self.scales = data, scales
         self.global_scale = g.reshape(-1) if g is not None else None
         self.global_is_amax = amax is not None
         self.scale_max, self.swizzled, self.ue5m3 = scale_max, swizzled, ue5m3
+        # columnwise: optionally an NVFP4Tensor of the transpose (TE's columnwise data), used by the backward GEMMs
         self.columnwise, self.block = columnwise, block
 
     # ---- metadata ---------------------------------------------------------------------------------------
@@ -155,7 +147,7 @@ class NVFP4Tensor:
             out = self
         else:
             d, s, g, _, _, cols = self._flat()
-            sc = _C.swizzle_scales(s.view(torch.uint8), d.shape[0], cols, swizzled)
+            sc = _ops.swizzle_scales(s.view(torch.uint8), d.shape[0], cols, swizzled)
             if not self.ue5m3:
                 sc = sc.view(torch.float8_e4m3fn)
             out = NVFP4Tensor(self.data, sc, None if self.global_is_amax else g, amax=g if self.global_is_amax else None,
@@ -177,7 +169,7 @@ class NVFP4Tensor:
         if self.per_row:
             raise ValueError("per-row globals do not transpose")
         d, s, g, flags, smax, cols = self._flat()
-        dt, st = _C.transpose(d, s.view(torch.uint8), flags, smax, cols)
+        dt, st = _ops.transpose(d, s.view(torch.uint8), flags, smax, cols)
         if not self.ue5m3:
             st = st.view(torch.float8_e4m3fn)
         return NVFP4Tensor(dt, st, None if self.global_is_amax else g, amax=g if self.global_is_amax else None,
@@ -202,17 +194,12 @@ class NVFP4Tensor:
 
 
 class Int8Tensor:
-    """Activations quantized to int8 with one FP32 scale per 16 values along the last dimension, as
-    ``linear(..., act="int8")`` does internally (W4A8): ``value = data * scale``.  Produced by
-    ``nvfp4effma.quantize_int8``; ``linear`` takes it as ``x`` directly, so the quantized activations can be
-    kept (e.g. for a backward pass) and reused without quantizing twice.
-
-    * ``data``: int8 ``[..., cols]``, cols a multiple of 16.
-    * ``scales``: float32 ``[..., cols / 16]``.
-    * ``dtype``: the dtype of the values it was quantized from; ``linear`` returns this dtype by default.
-    """
+    """int8 activations with one FP32 scale per 16 values of the last dim (W4A8), ``value = data * scale``; made by
+    ``quantize_int8``, taken by ``linear`` as ``x`` directly, so they can be kept and reused without quantizing twice."""
 
     def __init__(self, data: torch.Tensor, scales: torch.Tensor, dtype: torch.dtype = torch.bfloat16):
+        # data: int8 [..., cols], cols a multiple of 16; scales: float32 [..., cols / 16]
+        # dtype: the dtype of the values it was quantized from; linear returns this dtype by default
         if data.dtype != torch.int8:
             raise TypeError(f"data must be torch.int8, got {data.dtype}")
         if scales.dtype != torch.float32:
@@ -255,10 +242,9 @@ class Int8Tensor:
 
 
 class TCWeight:
-    """An NVFP4 weight ``[N, K]`` with its tensor-core image (sm_75 .. sm_89), which serves both the GEMM and, up to 8
-    rows of ``x``, the GEMV.  ``act`` picks the image and so the activations it multiplies: ``"exact"`` bfloat16
-    (W4A16, sm_80+), ``"int8"`` / ``"nvfp4"`` (W4A8 / W4A4: one image for both).  The image is as large as the
-    weight; it is built once, here."""
+    """An NVFP4 weight ``[N, K]`` with its tensor-core image (sm_75 .. sm_89), built once here; serves the GEMM and, up to 8
+    rows of ``x``, the GEMV.  ``act`` picks the image: ``"exact"`` bfloat16 (W4A16, sm_80+), ``"int8"`` / ``"nvfp4"`` (W4A8 / W4A4,
+    one image for both)."""
 
     def __init__(self, weight: NVFP4Tensor, act: str = "exact"):
         if not isinstance(weight, NVFP4Tensor) or weight.dim() != 2:
@@ -267,7 +253,7 @@ class TCWeight:
             raise ValueError(f"act must be 'exact', 'int8' or 'nvfp4', got {act!r}")
         d, s, _, f, _, k = weight._flat()
         self.weight, self.act = weight, act
-        self.image = _C.tc_image(0 if act == "exact" else 2, d, s.view(torch.uint8), f, k)
+        self.image = _ops.tc_image(0 if act == "exact" else 2, d, s.view(torch.uint8), f, k)
 
     @property
     def shape(self) -> Tuple[int, ...]:
@@ -278,12 +264,9 @@ class TCWeight:
 
 
 class NVFP4Linear(torch.nn.Module):
-    """``y = x @ W.T + bias`` with an NVFP4 weight ``W`` ``[out_features, in_features]`` (in_features a
-    multiple of 64).  The buffers carry the names of NVFP4 checkpoints: ``weight`` (uint8, packed),
-    ``weight_scale`` (float8_e4m3fn, linear ``[out, in / 16]``), ``weight_scale_2`` (float32 global decode
-    factor).  ``x`` stays in its own dtype (bfloat16 / float16 / float32); the output has the dtype of ``x``.
-    ``act`` chooses how the activations enter the matmul (default ``"auto"``: exact for up to 2 rows, int8
-    beyond; see ``nvfp4effma.linear``)."""
+    """``y = x @ W.T + bias``, NVFP4 weight ``[out_features, in_features]`` (in_features a multiple of 64); output dtype = ``x``'s.
+    Buffers use NVFP4 checkpoint names: ``weight`` (uint8, packed), ``weight_scale`` (float8_e4m3fn, linear ``[out, in / 16]``),
+    ``weight_scale_2`` (float32 global decode factor).  ``act``: see ``nvfp4effma.linear`` (``"auto"``)."""
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None,
                  dtype: torch.dtype = torch.bfloat16, act: str = "auto"):

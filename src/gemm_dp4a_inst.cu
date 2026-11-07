@@ -2,6 +2,7 @@
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 // One DP4A GEMM instance object: -DNVFP4A_TB=<B dtype: NVFP4 or INT8> -DNVFP4A_F=<formats>, both tiles; or with
 // -DNVFP4A_EX=<additions> the extended epilogue's kernels (B INT8, linear E4M3 scales).
+#include <limits.h>
 #include "gemm_nvfp4effma.cuh"
 
 namespace nvfp4a {
@@ -46,6 +47,18 @@ cudaError_t dp4a_entry(bool narrow, const uint8_t *A, int lda, const uint8_t *SA
 }
 template cudaError_t dp4a_entry<NVFP4A_TB, NVFP4A_F>(bool, const uint8_t *, int, const uint8_t *, int, const uint8_t *, int,
                                                     const uint8_t *, int, int, int, int, const Epilogue &, cudaStream_t);
+template <int TB, int F>
+cudaError_t dp4a_grouped_entry(bool narrow, const GroupedArgs &a, int rows, cudaStream_t s) {
+  const auto go = [&](auto cfg) {
+    using C = decltype(cfg);
+    const long long tiles = (long long)((a.m + C::BM - 1) / C::BM) * ((rows + C::BN - 1) / C::BN + a.groups);
+    if (tiles > INT_MAX) return cudaErrorInvalidConfiguration;
+    gemm_dp4a_grouped_kernel<C, TB, F><<<(unsigned)tiles, C::NT, 0, s>>>(a);
+    return cudaGetLastError();
+  };
+  return narrow ? go(Dp4aCfgNarrow()) : go(Dp4aCfg());
+}
+template cudaError_t dp4a_grouped_entry<NVFP4A_TB, NVFP4A_F>(bool, const GroupedArgs &, int, cudaStream_t);
 #endif
 
 }  // namespace kern

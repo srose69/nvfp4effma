@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// nvfp4a_gemm_ex (and the tensor-core _ex entries) against the host: the accumulators come from the same entry without the
-// descriptor (same kernel, same order; unit scales, FP32 D), the epilogue's operations are emulated:
-//   D, second output, sums of squares   bit for bit (s_j: the lanes' order, the butterfly, 1 / sqrt rounded to nearest)
-//   SwiGLU                              against silu(g) u, within the GPU's fast exp (its error grows with |g|) and division
-// Every addition mask, B BF16 and INT8, D BF16 and FP32, with and without bias / C, n on the GEMV path and beyond.
+// nvfp4a_gemm_ex (and tensor-core _ex entries) against the host: accumulators from the same entry without the descriptor (same kernel and
+// order; unit scales, FP32 D), the epilogue emulated: D, second output, sums of squares bit for bit (s_j: lanes' order, butterfly, 1 / sqrt to
+// nearest); SwiGLU within the GPU's fast exp (error grows with |g|) and division.  Every addition mask, B BF16 / INT8, D BF16 / FP32, bias / C, n.
 #include "test_util.h"
 
 namespace {

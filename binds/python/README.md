@@ -65,6 +65,7 @@ FFMA rate there and runs at SGEMM speed.
 | `quantize_int8(x)` | BF16 / FP16 / FP32 `[..., K]` (K a multiple of 16) → `Int8Tensor`: `scale = max \|x\| / 127` per 16 values, `data = round(x / scale)` — the activations of `act="int8"` |
 | `dequantize(t, dtype=torch.bfloat16)` | `(e2m1 · scale) · global`, or TE's `e2m1 · ((scale · amax) / (6 · scale_max))`, rounded once |
 | `linear(x, weight, bias=None, *, act, out_dtype, out, alpha, beta, amax_out)` | `alpha·x @ weight.T + bias + beta·out`; `weight` an `NVFP4Tensor` `[N, K]` (K a multiple of 64); `x` a dense `[..., K]` tensor, a 2-D `NVFP4Tensor` or an `Int8Tensor`; `act`: `"exact"` (W4A16), `"int8"` (W4A8, x quantized to int8 per 16 values first), `"nvfp4"` (W4A4) or `"auto"` (default: `"exact"` up to `AUTO_EXACT_MAX_ROWS` = 2 rows, where both run at memory speed, `"int8"` beyond, where it is twice as fast); output BF16 / FP16 / FP32 (default: the dtype of a dense `x` or the source dtype of an `Int8Tensor`, else BF16) |
+| `grouped_linear(x, weight, seg, groups, bias=None, *, act="int8", out_dtype, out, alpha, beta, amax_out)` | Mixture-of-experts layer in one launch, `linear` for every group: `alpha·x_g @ weight_g.T + bias_g + beta·out` for the rows `seg[g]:seg[g+1]` of `x` (dense `[R, K]`, a 2-D `NVFP4Tensor` or an `Int8Tensor`; `act` for a dense `x`: `"int8"` (default), `"exact"`, `"nvfp4"`), `weight` the `NVFP4Tensor` `[groups·N, K]` stacking the groups' `[N, K]` weights (every scale layout, type and global `linear` takes), `bias` `[groups·N]`; `seg` int32 `[groups + 1]` on the device (`seg[0] = 0`: the counts never reach the host, CUDA-graph capturable); result `[R, N]` (rows past `seg[groups]` zero), each group's rows equal `linear` of that group on the tiled kernel, bit for bit |
 | `NVFP4Tensor(data, scales, global_scale=None, *, amax=None, scale_max=0, swizzled=False, ue5m3=False, cols=None, columnwise=None, block=None)` | `data` uint8 `[..., K/2]` (the even column in the low nibble), `scales` float8_e4m3fn `[..., K/16]` (linear; padded 2-D buffers as TE allocates them are fine) or the swizzled `[roundup(rows, 128), roundup(K/16, 4)]` buffer, UE5M3 as uint8; `global_scale` (decode factor) or `amax` (TE), float32 `[1]` or one per row; `.shape`, `.dequantize()`, `.with_scale_layout(swizzled)`, `.transpose_2d()` (16 × 16 tiles), `NVFP4Tensor.from_float(x, **recipe)`, `NVFP4Tensor.from_te(t)` |
 | `Int8Tensor(data, scales, dtype=torch.bfloat16)` | `data` int8 `[..., K]`, `scales` float32 `[..., K/16]`, `dtype` the source dtype (default output dtype of `linear`); `.shape`, `.dequantize(dtype=None)`, `Int8Tensor.from_float(x)` |
 | `get_include()` | `[include, src]` directories of `nvfp4effma.h` and the device-side codecs `nvfp4effma.cuh`, for CUDA extensions built on this package; code compiled from them matches only this version |
@@ -80,6 +81,15 @@ Wrong dtypes, devices, shapes or an output that overlaps an input raise `TypeErr
 anything runs; operands in a layout the kernels cannot read directly (strided views, unaligned slices) are
 copied once; GPUs with native FP4 (sm_100+) raise `NotImplementedError`; library or CUDA failures raise
 `RuntimeError` with the library's description. Inference only: there is no autograd support.
+
+## `torch.ops`, `torch.compile` and CUDA graphs
+
+Every operation is also a PyTorch operator, `torch.ops.nvfp4effma.{quantize_ex, quantize_int8, dequantize, transpose, swizzle_scales, linear,
+linear_out, grouped_linear, grouped_linear_out, tc_image, linear_tc, linear_tc_out}`, and the functions above call them. Each has a schema (the
+amax outputs and the `_out` variants' `out` are declared mutated), a Meta kernel that computes only the result's shape and dtype, and a CUDA kernel
+that enqueues on the current stream, allocates through PyTorch's allocator and reads nothing back to the host. So `torch.compile` traces a call as one
+opaque node without a graph break, and a call can be captured in a CUDA graph: `grouped_linear` keeps the row counts `seg` on the device, so one captured
+graph serves different counts (`torch.library.opcheck` and the capture / replay are in `tests/test_nvfp4effma.py`).
 
 ## Tests
 

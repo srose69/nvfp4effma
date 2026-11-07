@@ -6,7 +6,8 @@
 #include "test_util.h"
 
 int main() {
-  int fails = 0, idx = 0;
+  std::vector<Case> cases;
+  int idx = 0;
   const nvfp4a_dtype outs[] = {NVFP4A_BF16, NVFP4A_FP32, NVFP4A_FP16};
   const nvfp4a_dtype ops[] = {NVFP4A_NVFP4, NVFP4A_INT8, NVFP4A_BF16, NVFP4A_FP16, NVFP4A_FP32};
   const int gs[][2] = {{1, 64}, {33, 576}, {300, 1024}, {1000, 4160}};
@@ -15,7 +16,7 @@ int main() {
       const int *g = gs[(n + bt) % 4];
       Case c{g[0], n, g[1], bt, outs[idx % 3], n == 3 ? -1 : (int)outs[idx % 3], idx % 3 == 0 ? -1 : (int)NVFP4A_BF16,
              idx % 2 ? 0.75f : 1.f, n == 3 ? 1.f : (idx % 4 == 1 ? -1.5f : 0.f)};
-      fails += run_case(c);
+      cases.push_back(c);
       ++idx;
     }
   // more than 8 columns: groups of 8 on the GEMV path, around its limit (kGemvMaxN) on both sides
@@ -23,7 +24,7 @@ int main() {
     for (int n : {12, 17, 32, 33, 48, 49}) {
       Case c{300, n, 1024, bt, outs[idx % 3], n == 17 ? -1 : (int)outs[idx % 3], idx % 2 ? (int)NVFP4A_BF16 : -1,
              1.f, n == 17 ? 1.f : 0.f};
-      fails += run_case(c);
+      cases.push_back(c);
       ++idx;
     }
   // Transformer Engine / cuBLASLt tensors: every operand format (every kernel instance) -- swizzled
@@ -37,9 +38,10 @@ int main() {
         Case c{z[0], z[1], z[2], bt, outs[v % 3], v % 4 == 1 ? -1 : (int)outs[v % 3], v % 3 ? (int)NVFP4A_BF16 : -1,
                v % 2 ? 1.25f : 1.f, v % 4 == 1 ? 1.f : 0.f};
         set_formats(c, bt == NVFP4A_NVFP4 ? i : test_format_a(i), v);
-        fails += run_case(c);
+        cases.push_back(c);
       }
   }
+  const int fails = run_cases(cases);
   printf(fails ? "\n%d FAILED\n" : "\nALL PASS\n", fails);
   return fails != 0;
 }

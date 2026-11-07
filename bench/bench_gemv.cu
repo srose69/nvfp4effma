@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// nvfp4a_gemm on the GEMV path (small n): NVFP4 weights (4.5 bits per value with the block scales) read
-// once per group of 8 columns, so the figure of merit is the effective bandwidth over A (n = 16 and 32 read
-// it 2 and 4 times).  Compared with the DRAM peak, a
-// device-to-device copy (practical bandwidth) and cuBLAS SGEMV / SGEMM on FP32 weights of the same
-// shape (7.1x the bytes).  Median time per row after an idle pause (see bench_util.h).
+// nvfp4a_gemm on the GEMV path (small n): A (4.5 bits per value with block scales) is read once per group of 8 columns;
+// figure of merit = effective bandwidth over A, vs the DRAM peak, a device-to-device copy and cuBLAS SGEMV / SGEMM
+// on FP32 weights of the same shape (7.1x the bytes). Median per row after an idle pause (bench_util.h).
 #include <vector>
 #include <cublas_v2.h>
 #include "../include/nvfp4effma.h"

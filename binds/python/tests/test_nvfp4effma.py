@@ -1,11 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-"""Tests of the PyTorch bindings: quantization bit for bit against an independent reference of the
-documented formulas, linear layers against a float64 reference, the module, and rejection of bad input.
-
-Bit-exactness of the kernels themselves is covered by the C tests (make test); here the bound for
-matmuls is the output rounding plus the FP32 accumulation error.
-"""
+"""Tests of the PyTorch bindings: quantization bit for bit against an independent reference of the documented formulas,
+linear layers against a float64 reference (bound: output rounding + FP32 accumulation error), the module, bad input.
+Bit-exactness of the kernels themselves is covered by the C tests (make test)."""
 import pytest
 import torch
 
@@ -420,6 +417,125 @@ def test_strided_inputs_are_copied():
     x = big[:, 32:288]  # row stride 320, offset: not usable as is
     assert torch.equal(nf.linear(x, w, act="exact"), nf.linear(x.contiguous(), w, act="exact"))
     assert torch.equal(nf.linear(x, w), nf.linear(x.contiguous(), w))
+
+
+def group_slice(t, a, b):
+    """Rows a:b of an NVFP4Tensor with linear scales (the global is shared)."""
+    return nf.NVFP4Tensor(t.data[a:b], t.scales[a:b], amax=t.amax, scale_max=t.scale_max, ue5m3=t.ue5m3, cols=t.cols)
+
+
+def grouped_setup(G=4, N=128, K=256, counts=(70, 0, 130, 61), **quant):
+    w = rand((G * N, K), seed=30, scale=0.05)
+    q = nf.quantize(w, **quant)
+    seg = torch.tensor([0] + torch.tensor(counts).cumsum(0).tolist(), dtype=torch.int32, device=DEV)
+    return q, seg, rand((sum(counts), K), torch.bfloat16, seed=31)
+
+
+needs_dp4a = pytest.mark.skipif(torch.cuda.is_available() and torch.cuda.get_device_capability() < (6, 1), reason="needs sm_61 (DP4A)")
+
+
+@needs_dp4a
+@pytest.mark.parametrize("act", ["exact", "int8", "nvfp4"])
+@pytest.mark.parametrize("quant", [dict(), dict(scale_dtype="ue5m3"), dict(swizzled=True)])
+def test_grouped_linear_equals_linear_per_group(act, quant):
+    """Every group's rows are linear's of that group, bit for bit (counts above the GEMV kernel's), with bias; a swizzled weight too (N = 128: a group is
+    a tile of scales); the dense activations of act="nvfp4" are quantized once, so the groups share the activations' global."""
+    G, N, K = 4, 128, 256
+    q, seg, x = grouped_setup(G, N, K, **quant)
+    bias = rand((G * N,), torch.bfloat16, seed=32)
+    y = nf.grouped_linear(x, q, seg, G, bias, act=act)
+    assert y.shape == (x.shape[0], N) and y.dtype == torch.bfloat16
+    xin = nf.quantize(x) if act == "nvfp4" else nf.quantize_int8(x) if act == "int8" else x
+    for g in range(G):
+        a, b = seg[g].item(), seg[g + 1].item()
+        if a == b:
+            continue
+        wg = nf.NVFP4Tensor(q.data[g * N:(g + 1) * N], q.scales[g * N:(g + 1) * N], amax=q.amax, scale_max=q.scale_max, ue5m3=q.ue5m3,
+                            swizzled=q.swizzled, cols=K)
+        if act == "nvfp4":
+            ref = nf.linear(group_slice(xin, a, b), wg, bias[g * N:(g + 1) * N], out_dtype=torch.bfloat16)
+        elif act == "int8":
+            ref = nf.linear(nf.Int8Tensor(xin.data[a:b], xin.scales[a:b], x.dtype), wg, bias[g * N:(g + 1) * N])
+        else:
+            ref = nf.linear(x[a:b], wg, bias[g * N:(g + 1) * N], act="exact")
+        assert torch.equal(ref, y[a:b]), f"group {g}"
+    assert torch.equal(nf.grouped_linear(xin, q, seg, G, bias, act=act), y)  # the same operand given already quantized
+
+
+@needs_dp4a
+def test_grouped_linear_accumulate_alpha_and_amax():
+    G, N, K = 4, 128, 256
+    q, seg, x = grouped_setup(G, N, K, scale_dtype="ue5m3")
+    y = nf.grouped_linear(x, q, seg, G)
+    out = torch.full_like(y, 2.0)
+    amax = torch.zeros(1, device=DEV)
+    r = nf.grouped_linear(x, q, seg, G, out=out, alpha=0.5, beta=1.0, amax_out=amax)
+    assert r is out
+    ref = (0.5 * y.float() + 2.0)
+    assert float((out.float() - ref).abs().max()) <= 0.02 * float(ref.abs().max())
+    assert float(amax) >= float(out.float().abs().max()) * (1 - 2 ** -7)
+    with pytest.raises(ValueError):
+        nf.grouped_linear(x, q, seg, G, beta=1.0)
+    with pytest.raises(ValueError):
+        nf.grouped_linear(x, q, seg, G, out=out, out_dtype=torch.float32)
+    with pytest.raises(ValueError):
+        nf.grouped_linear(x, q, seg[:-1].contiguous(), G)
+    with pytest.raises(TypeError):
+        nf.grouped_linear(x, q, seg.long(), G)
+
+
+@needs_dp4a
+def test_grouped_linear_cuda_graph_replays_with_new_row_counts():
+    """The row counts live on the device: one captured graph serves different seg values (nothing is read back, nothing baked in)."""
+    G, N, K = 4, 128, 256
+    q, seg, x = grouped_setup(G, N, K)
+    n = x.shape[0]
+    seg2 = torch.tensor([0, 90, 120, 120, n], dtype=torch.int32, device=DEV)
+    x2 = rand((n, K), torch.bfloat16, seed=33)
+    sx, ss = torch.zeros(n, K, device=DEV, dtype=torch.bfloat16), seg.clone()
+    sx.copy_(x)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            nf.grouped_linear(sx, q, ss, G)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        y = nf.grouped_linear(sx, q, ss, G)
+    graph.replay()
+    assert torch.equal(y, nf.grouped_linear(x, q, seg, G))
+    sx.copy_(x2)
+    ss.copy_(seg2)
+    graph.replay()
+    assert torch.equal(y, nf.grouped_linear(x2, q, seg2, G))
+
+
+def test_operators_have_schemas_meta_kernels_and_trace_as_nodes():
+    """torch.ops.nvfp4effma.*: opcheck (schema mutation annotations, fake kernels against the real ones), and torch.compile traces a function of them
+    as black boxes with no graph break."""
+    w = nf.quantize(rand((128, 128), seed=40))
+    x = rand((40, 128), torch.bfloat16, seed=41)
+    xq = nf.quantize_int8(x)
+    wd, ws, wg, wf, wm, _ = w._flat()
+    ws = ws.view(torch.uint8)
+    o = torch.ops.nvfp4effma
+    torch.library.opcheck(o.quantize_int8, (x,))
+    torch.library.opcheck(o.dequantize, (wd, ws, wg, wf, wm, 128, torch.float32))
+    torch.library.opcheck(o.linear, (xq.data, xq.scales, None, 0, 0, wd, ws, wg, wf, wm, 128, None, torch.bfloat16, 1.0, True, None))
+    if torch.cuda.get_device_capability() >= (6, 1):
+        seg = torch.tensor([0, 20, 40], dtype=torch.int32, device=DEV)
+        w2 = nf.quantize(rand((256, 128), seed=42))
+        d2, s2, g2, f2, m2, _ = w2._flat()
+        torch.library.opcheck(o.grouped_linear, (xq.data, xq.scales, None, 0, 0, seg, d2, s2.view(torch.uint8), g2, f2, m2, 128, 2, None,
+                                                 torch.bfloat16, 1.0, True))
+
+    def fn(x, seg):
+        q = nf.quantize_int8(x)
+        return nf.dequantize(w, torch.float32).sum() + nf.linear(q, w).float().sum()
+
+    compiled = torch.compile(fn, backend="aot_eager", fullgraph=True)
+    assert torch.allclose(compiled(x, None), fn(x, None))
 
 
 def test_nvfp4_linear_module():

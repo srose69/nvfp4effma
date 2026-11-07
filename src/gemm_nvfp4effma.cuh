@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// NVFP4EffMA GEMM: the tiled kernel templates, their configuration candidates and the entry points of
-// the per-instance objects (gemm_nvfp4effma_inst.cu).  Host API and dispatch: gemm_nvfp4effma.cu.
-//   gemm_kernel       FFMA, A NVFP4 x B BF16 / FP16 / FP32 (block scale applied when A is decoded into the
-//                     FP32 tile), and NVFP4 x NVFP4 below sm_61 (integer-valued tiles, exact block sums)
-//   gemm_dp4a_kernel  NVFP4 x NVFP4 / INT8 from sm_61: int8 tiles, 4 DP4A + 2 FFMA per output and block
-// Both kernels compute the same NVFP4 x NVFP4 / INT8 values bit for bit.
+// NVFP4EffMA GEMM: tiled kernel templates, their configuration candidates and the entry points of the per-instance
+// objects (gemm_nvfp4effma_inst.cu); host API and dispatch: gemm_nvfp4effma.cu.  gemm_kernel and gemm_dp4a_kernel
+// compute the same NVFP4 x NVFP4 / INT8 values bit for bit.
 #pragma once
 #ifndef __CUDACC_RTC__  // (NVRTC: nvfp4effma.cuh's libcu++)
 #include <type_traits>
@@ -15,43 +12,37 @@
 namespace nvfp4a {
 namespace kern {
 
-// ---------------------------------------------------------------------------------------------
-// FFMA kernel: BM x BN block tile, BK = 16 (one NVFP4 block) k-slice, TM x TN FP32 register tile per
-// thread (groups of 4 rows / columns spread over the block so that LDS.128 fragment reads are
-// conflict-free).  Each operand element is converted to FP32 once per block into a single-buffered
-// shared tile; the inner loop is LDS.128 + FFMA only.
-// ---------------------------------------------------------------------------------------------
-// On<..>::value: whether the kernel body is compiled for the architecture of the current device
-// pass.  The library (gemm_nvfp4effma_inst.cu) compiles a configuration only where a table selects it
-// and leaves a trapping stub elsewhere; the tuner keeps everything.
+// gemm_kernel (FFMA): A NVFP4 x B BF16 / FP16 / FP32 (A's block scale applied when decoded into the FP32 tile), and NVFP4 x
+// NVFP4 below sm_61 (integer-valued tiles, exact block sums).  BM x BN block tile, BK = 16 (one NVFP4 block) k-slice, TM x TN
+// FP32 register tile per thread; operands convert once per block into single-buffered shared tiles, the inner loop is LDS.128 + FFMA.
 template <int BM_, int BN_, int TM_, int TN_>
 struct GemmCfg {
   static constexpr int BM = BM_, BN = BN_, BK = 16, TM = TM_, TN = TN_;
+  // register tile rows / columns come in groups of 4 spread over the block: LDS.128 fragment reads are conflict-free
   static constexpr int TX = BM / TM, TY = BN / TN, NT = TX * TY, PAD = 4;  // lanes run along m
   // resident blocks the register budget targets: 512 threads (<= 128 registers), e.g. 2 x 256 or 4 x 128;
   // 64-thread blocks (small problems, few blocks anyway) get 6 x 64, as 8 x 64 would make them spill
   static constexpr int MINB = NT >= 512 ? 1 : NT >= 128 ? 512 / NT : 6;
+  // On<..>::value: whether the kernel body is compiled for the current device pass's architecture; the library compiles a
+  // configuration only where a table selects it and leaves a trapping stub elsewhere (the tuner keeps everything)
   template <int TB> struct On { static constexpr bool value = true; };
 };
 
-// R x BK tile of a K-contiguous operand of type T -> FP32 shared s[BK][R + PAD].  A chunk is E = 8
-// consecutive k of one row (4 bytes of NVFP4), the BK / E chunks of a row go to adjacent lanes, so a warp
-// reads whole row segments.  The transposing scalar stores would put the lanes of one row into one bank;
-// instead the column of k-group kk / E is XOR-ed with swz(kk) < 32, which only moves it inside its aligned
-// 32-column block: the lanes hit distinct banks, and fragment reads apply the same XOR (a compile-time
-// constant per kk).  Rows past the end of the matrix read row 0: they only feed outputs that the
-// epilogue does not store, so neither a branch nor zeroing is needed.
-//   NVFP4, INT = false: values a * sa (exact)        NVFP4, INT = true: integers 2a, sa to ss[row]
-//   INT8 (INT = true): the int8 values, their FP32 block scale to ss[row]
-// NVFP4 scales: SWZ = swizzled layout (lds = -padded columns), UE = UE5M3.
+// R x BK tile of a K-contiguous operand of type T -> FP32 shared s[BK][R + PAD]; a chunk is E = 8 consecutive k of one row (4 bytes of
+// NVFP4), the BK / E chunks of a row go to adjacent lanes (whole row segments per warp).  Rows past the end read row 0: they only feed
+// outputs the epilogue does not store.  NVFP4 scales: SWZ = swizzled layout (lds = -padded columns), UE = UE5M3.
 template <class C, int R, int T, bool INT, bool SWZ = false, bool UE = false, bool CG = false>
 struct TileLoader {
+  // NVFP4, INT = false: values a * sa (exact); NVFP4, INT = true: integers 2a, sa to ss[row];
+  // INT8 (INT = true): the int8 values, their FP32 block scale to ss[row]
   static constexpr bool FP4 = T == NVFP4A_NVFP4, Q8 = T == NVFP4A_INT8;
   static constexpr int E = R * C::BK / C::NT < 8 ? R * C::BK / C::NT : 8;
   static constexpr int CH = R * C::BK / (E * C::NT), LPR = C::BK / E;  // chunks per thread, lanes per row
   static_assert(CH >= 1 && (R * C::BK) % (E * C::NT) == 0, "tile does not split into chunks");
   static_assert((E == 4 || E == 8) && (!FP4 || E == 8) && R % 32 == 0 && 32 % LPR == 0, "unsupported tile");
   static constexpr int RW = FP4 ? 1 : E * Elem<T>::bytes / 4;  // 32-bit words per chunk
+  // transposing scalar stores would put the lanes of one row into one bank: the column of k-group kk / E is XOR-ed with
+  // swz(kk) < 32 (inside its aligned 32-column block) for distinct banks; fragment reads apply the same XOR
   static __host__ __device__ constexpr int swz(int kk) { return (kk / E) * (32 / LPR); }
   const uint8_t *p[CH], *ps[CH];
   int dst[CH], row[CH];
@@ -126,10 +117,9 @@ struct TileLoader {
   }
 };
 
-// Staged epilogue: pass j stages one column of every thread's register tile -- BM rows x NC columns --
-// in shared memory s[c * BM + r], then each thread stores BM * NC / NT of them, consecutive threads on
-// consecutive rows.  One inlined epilogue in a loop instead of a call per output: no call frame, no
-// stack, and the stores coalesce along m.  col(j, c) maps a staged column to its column in D.
+// Staged epilogue: pass j stages one column of every thread's register tile (BM rows x NC columns) in shared memory
+// s[c * BM + r]; each thread then stores BM * NC / NT of them, consecutive threads on consecutive rows (coalesced along m,
+// no per-output call).  col(j, c) maps a staged column to its column in D.
 template <int BM, int NC, int NT, bool CG = false, class Col>
 __device__ __forceinline__ void epi_staged_pass(const Epilogue &e, EpiState &st, const float *s, int m0, int m, int n,
                                                 int j, Col col) {
@@ -141,10 +131,8 @@ __device__ __forceinline__ void epi_staged_pass(const Epilogue &e, EpiState &st,
   }
 }
 
-// The extended epilogue of a tile (nvfp4a_gemm_ex): s_j of the tile's columns n0 .. n0 + BN - 1 to scs (a warp per
-// column; columns past n take column 0), and the pass over a staged block -- BM rows x NC columns c0 + c cst, accumulators
-// s[c * BM + r] -- that turns them into the values, stores D (unless SwiGLU) and runs ex_finish on whole m16 slices.
-// (a warp per 8 consecutive columns at a time)
+// Extended epilogue of a tile (nvfp4a_gemm_ex): ex_tile_scales writes s_j of the tile's columns n0 .. n0 + BN - 1 to scs
+// (a warp per 8 consecutive columns; columns past n take column 0).
 template <int BN, int NT>
 __device__ __forceinline__ void ex_tile_scales(const EpilogueEx &x, float *scs, int n0, int n) {
   static_assert(BN % 8 == 0, "groups of 8 columns");
@@ -157,6 +145,8 @@ __device__ __forceinline__ void ex_tile_scales(const EpilogueEx &x, float *scs, 
       if ((threadIdx.x & 31) == q) scs[c + q] = v[q];
   }
 }
+// Pass over a staged block (BM rows x NC columns c0 + c cst, accumulators s[c * BM + r]): turns them into the values, stores D
+// (unless SwiGLU) and runs ex_finish on whole m16 slices.
 template <int BM, int NC, int NT, int EX, bool CG = false>
 __device__ __forceinline__ void ex_staged_pass(const Epilogue &e, const EpilogueEx &x, EpiState &st, float *s, const float *scs,
                                                int m0, int n0, int m, int n, int c0, int cst) {
@@ -319,16 +309,10 @@ cudaError_t gemm_launch_ex(const uint8_t *A, int lda, const uint8_t *SA, int lds
   return cudaGetLastError();
 }
 
-// ---------------------------------------------------------------------------------------------
-// DP4A kernel (sm_61+), NVFP4 x NVFP4: block 128 x 128, 256 threads, 8 x 8 outputs per thread (rows
-// tx + 16i, columns ty + 16j), k-tile = 4 NVFP4 blocks.  Nibbles are decoded once per block into int8
-// tiles (PRMT lookups); per output and block, 4 DP4A starting at the bits of 1.5 * 2^23 give the FP32
-// value 1.5 * 2^23 + p of the exact block sum p, y = fma(x, sa, -1.5 * 2^23 * sa) = p * sa exactly, and
-// acc = fma(y, sb, acc) rounds once.  Double-buffered tiles, one barrier per k-tile: tile t + 1 is
-// decoded from registers at the start of iteration t and the loads of tile t + 2 are issued right after.
-// One resident block per SM (153 registers): two blocks at 128 registers lose more to the DP4A chains'
-// scheduling than they gain in occupancy.
-// ---------------------------------------------------------------------------------------------
+// gemm_dp4a_kernel (sm_61+), NVFP4 x NVFP4 / INT8: block 128 x 128, 256 threads, 8 x 8 outputs per thread (rows tx + 16i,
+// columns ty + 16j), k-tile = 4 NVFP4 blocks; nibbles decode once per block into int8 tiles (PRMT lookups); 4 DP4A + 2 FFMA
+// per output and block; one resident block per SM (the narrow tile: two).
+
 // 4 consecutive values i .. i + 3 of a BF16 / FP16 / FP32 array; vec: aligned for one vector access
 template <int T, bool CG = false>
 __device__ __forceinline__ void load4_any(const void *p, size_t i, bool vec, float v[4]) {
@@ -348,15 +332,15 @@ __device__ __forceinline__ void store4_any(void *p, size_t i, bool vec, const fl
   } else for (int q = 0; q < 4; ++q) store_any(T, p, i + q, v[q]);
 }
 
-// BN_ x TN_: 128 x 8 (the large tile) or 64 x 4 (for n up to a few hundred, where 128-wide tiles are half
-// empty and too few to fill the GPU); MINB_ resident blocks per SM.
+// BN_ x TN_: 128 x 8 (the large tile) or 64 x 4 (narrow, for small n where 128-wide tiles are half empty and too few
+// to fill the GPU); MINB_ resident blocks per SM.
 template <int BN_, int TN_, int MINB_>
 struct Dp4aCfgT {
   static constexpr int BM = 128, BN = BN_, TX = 16, TY = 16, TM = 8, TN = TN_, NT = 256, KBT = 4, MINB = MINB_;
   static_assert(BN == TY * TN && TN % 4 == 0 && BN <= BM, "unsupported DP4A tile");
 };
 using Dp4aCfg = Dp4aCfgT<128, 8, 1>;
-using Dp4aCfgNarrow = Dp4aCfgT<64, 4, 2>;  // ~120 registers: two blocks per SM
+using Dp4aCfgNarrow = Dp4aCfgT<64, 4, 2>;  // two blocks per SM
 
 template <class C, int TB, int F, int EX, bool CG>
 __device__ __forceinline__ void
@@ -370,10 +354,9 @@ gemm_dp4a_body(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict
   constexpr int BM = C::BM, BN = C::BN, KBT = C::KBT;
   uint4 (*sA2)[KBT * BM] = sAB[0], (*sB2)[KBT * BM] = sAB[1];  // B buffers sized for BM >= BN
   const int tid = threadIdx.x, tx = tid % C::TX, ty = tid / C::TX;
-  // loads: every thread takes two blocks of one row of A (16 bytes) and of B (16 bytes of NVFP4, 32 of
-  // INT8) per k-tile; threads 0..127 the 4 block scales of a row of A (one 32-bit word), threads 128..255
-  // those of a row of B (a word of 4 E4M3, or 4 floats for INT8).  Rows past the end of the matrix read
-  // row 0 (outputs that are not stored).
+  // loads per k-tile: every thread two blocks of one row of A (16 bytes) and of B (16 bytes NVFP4, 32 INT8); threads 0..127 the
+  // 4 block scales of a row of A (one 32-bit word), threads 128..255 those of a row of B (4 E4M3, or 4 floats for INT8);
+  // rows past the end read row 0 (not stored)
   constexpr bool Q8 = TB == NVFP4A_INT8;
   constexpr float kOut = Q8 ? 0.5f : 0.25f;  // the A values are doubled; NVFP4 B values too
   constexpr int BW = Q8 ? 2 : 1;  // uint4 per thread and k-tile of B
@@ -430,6 +413,8 @@ gemm_dp4a_body(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict
     else if (PSA == 1 && PSB == 1) { ++ps; rs = CG && !sa_thr ? __ldcg(ps) : *ps; }
     else { ps += pstep; rs = CG && !sa_thr ? __ldcg(ps) : *ps; }
   };
+  // double-buffered tiles, one barrier per k-tile: tile t + 1 is decoded from registers at the start of iteration t, the loads
+  // of tile t + 2 are issued right after
   decode(0);
   if (tiles > 1) load_next();
   __syncthreads();
@@ -456,6 +441,8 @@ gemm_dp4a_body(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict
           const float2 sn = ssa[kb][tx + C::TX * i];
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
+            // 4 DP4A starting at the bits of 1.5 * 2^23 give the FP32 value 1.5 * 2^23 + p of the exact block sum p;
+            // y = fma(x, sa, -1.5 * 2^23 * sa) = p * sa exactly, acc = fma(y, sb, acc) rounds once
             int p = __dp4a((int)av.x, (int)bv[j].x, 0x4B400000);
             p = __dp4a((int)av.y, (int)bv[j].y, p);
             p = __dp4a((int)av.z, (int)bv[j].z, p);
@@ -617,16 +604,75 @@ struct GemmItemArgs {
 template <class C, int TB, int EX, bool CG = true>
 __device__ __forceinline__ void gemm_item(const GemmItemArgs &a, int item, unsigned, void *smem) {
   auto &s = *(GemmShared<C, TB> *)smem;
-  const int mt = (a.m + C::BM - 1) / C::BM;
-  gemm_body<C, TB, 0, EX, CG>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, a.m, a.n, a.k, a.e, a.x,
+  const int mt = (a.m + C::BM - 1) / C::BM, n = items_columns(a.x, a.n);
+  if (item / mt * C::BN >= n) return;  // (CTA-uniform) a tile past the columns computed
+  gemm_body<C, TB, 0, EX, CG>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, a.m, n, a.k, a.e, a.x,
                               item % mt * C::BM, item / mt * C::BN, s.a, s.b, s.sa, s.sb);
 }
 template <class C, int EX, bool CG = true>
 __device__ __forceinline__ void gemm_dp4a_item(const GemmItemArgs &a, int item, unsigned, void *smem) {
   auto &s = *(Dp4aShared<C> *)smem;
-  const int mt = (a.m + C::BM - 1) / C::BM;
-  gemm_dp4a_body<C, NVFP4A_INT8, 0, EX, CG>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, a.m, a.n, a.k, a.e, a.x,
+  const int mt = (a.m + C::BM - 1) / C::BM, n = items_columns(a.x, a.n);
+  if (item / mt * C::BN >= n) return;
+  gemm_dp4a_body<C, NVFP4A_INT8, 0, EX, CG>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, a.m, n, a.k, a.e, a.x,
                                           item % mt * C::BM, item / mt * C::BN, s.ab, s.sa, s.sb);
+}
+
+// Grouped GEMM (nvfp4a_gemm_grouped): group g computes the rows [g m, (g + 1) m) of the stacked weight A against the rows [seg[g], seg[g + 1])
+// of B, in the coordinates of the stacked operands: a tile of group g starts at row g m + t BM of A and at row seg[g] + t' BN of B, bounded by
+// the group's ends (m_end = (g + 1) m, n_end = seg[g + 1]).  Every operand is addressed by its global row, so the scale layouts (linear or
+// swizzled), per-row globals and the bias need no offsets; D and C are shifted by -g m rows so that the global row index lands on the group's.
+// Block b of the grid runs one tile of the first group whose tiles (m tiles x column tiles) contain it; blocks past the total return.
+struct GroupedArgs {
+  const uint8_t *A, *SA, *B, *SB;
+  const int *seg;
+  int lda, ldsa, ldb, ldsb, m, k, groups, d_bytes, c_bytes;
+  Epilogue e;
+};
+template <int BM, int BN>
+__device__ __forceinline__ bool grouped_tile(const GroupedArgs &a, int &g, int &m0, int &n0, int &m_end, int &n_end) {
+  const int mt = (a.m + BM - 1) / BM;
+  int tile = blockIdx.x, row0 = 0, n = 0;
+  for (g = 0; g < a.groups; ++g) {
+    row0 = __ldg(a.seg + g);
+    n = __ldg(a.seg + g + 1) - row0;
+    const int tiles = mt * ((n + BN - 1) / BN);
+    if (tile < tiles) break;
+    tile -= tiles;
+  }
+  if (g == a.groups) return false;
+  m0 = g * a.m + tile % mt * BM;
+  n0 = row0 + tile / mt * BN;
+  m_end = (g + 1) * a.m;
+  n_end = row0 + n;
+  return true;
+}
+__device__ __forceinline__ Epilogue grouped_epilogue(const GroupedArgs &a, int g) {
+  Epilogue e = a.e;
+  e.d = (uint8_t *)e.d - (size_t)g * a.m * a.d_bytes;
+  if (e.c) e.c = (const uint8_t *)e.c - (size_t)g * a.m * a.c_bytes;
+  return e;
+}
+template <class C, int TB, int F>
+__global__ void __launch_bounds__(C::NT, C::MINB) gemm_dp4a_grouped_kernel(const GroupedArgs a) {
+  __shared__ __align__(16) uint4 sAB[2][2][C::KBT * C::BM];
+  __shared__ __align__(16) float2 ssa2[2][C::KBT][C::BM];
+  __shared__ __align__(16) float ssb2[2][C::KBT][C::BN];
+  int g, m0, n0, m_end, n_end;
+  if (!grouped_tile<C::BM, C::BN>(a, g, m0, n0, m_end, n_end)) return;
+  gemm_dp4a_body<C, TB, F, 0, false>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, m_end, n_end, a.k, grouped_epilogue(a, g),
+                                     EpilogueEx{}, m0, n0, sAB, ssa2, ssb2);
+}
+template <class C, int TB, int F>
+__global__ void __launch_bounds__(C::NT, TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8 ? 1 : C::MINB) gemm_grouped_kernel(const GroupedArgs a) {
+  constexpr bool INT = TB == NVFP4A_NVFP4 || TB == NVFP4A_INT8;
+  __shared__ __align__(16) float sA[C::BK * (C::BM + C::PAD)];
+  __shared__ __align__(16) float sB[C::BK * (C::BN + C::PAD)];
+  __shared__ __align__(16) float ssA[INT ? C::BM : 1], ssB[INT ? C::BN : 1];
+  int g, m0, n0, m_end, n_end;
+  if (!grouped_tile<C::BM, C::BN>(a, g, m0, n0, m_end, n_end)) return;
+  gemm_body<C, TB, F, 0, false>(a.A, a.lda, a.SA, a.ldsa, a.B, a.ldb, a.SB, a.ldsb, m_end, n_end, a.k, grouped_epilogue(a, g),
+                                EpilogueEx{}, m0, n0, sA, sB, ssA, ssB);
 }
 
 // Candidates of the dense-B FFMA kernel: id, BM, BN, TM, TN.  All share the 8 x 8 thread tile (same
@@ -661,6 +707,12 @@ cudaError_t gemm_entry(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, c
 template <int TB, int F>
 cudaError_t dp4a_entry(bool narrow, const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb,
                        const uint8_t *SB, int ldsb, int m, int n, int k, const Epilogue &e, cudaStream_t s);
+// the grouped kernels (nvfp4a_gemm_grouped): DP4A (B NVFP4 / INT8, wide or narrow tile) and FFMA (configuration ID), `rows` bounding the rows of
+// all groups
+template <int TB, int F>
+cudaError_t dp4a_grouped_entry(bool narrow, const GroupedArgs &a, int rows, cudaStream_t s);
+template <int ID, int TB, int F>
+cudaError_t gemm_grouped_entry(const GroupedArgs &a, int rows, cudaStream_t s);
 // the extended epilogue's kernels (linear E4M3 scales of A; FFMA: B BF16, or INT8 below sm_61; DP4A: B INT8), additions EX
 template <int ID, int TB, int EX>
 cudaError_t gemm_entry_ex(const uint8_t *A, int lda, const uint8_t *SA, int ldsa, const uint8_t *B, int ldb, const uint8_t *SB,

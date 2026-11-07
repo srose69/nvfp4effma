@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// The extended epilogue (nvfp4a_gemm_ex, nvfp4a_gemv_tc_ex, nvfp4a_gemm_tc_ex) against the same entry without it, on the
-// layers of Qwen3-0.6B and -8B with the additions each one takes: qkv the column scale, gate / up (interleaved by 8) the
-// column scale and SwiGLU, o and down the second output.  Per path (CUDA cores; tensor cores where the device has them),
-// x dtype and n: the plain row's time and A's bytes / s, then the extended one's and its ratio.  Median per row after an
-// idle pause (bench_util.h).
+// Extended epilogue (nvfp4a_gemm_ex, nvfp4a_gemv_tc_ex, nvfp4a_gemm_tc_ex) vs the plain entry on Qwen3-0.6B / 8B layers:
+// qkv column scale, gate_up column scale + SwiGLU, o / down second output; per path (CUDA / tensor cores), x dtype, n:
+// plain time and A bytes/s, extended time and ratio. Paired medians after an idle pause (bench_util.h).
 #include <vector>
 #include "../include/nvfp4effma.h"
 #include "bench_util.h"

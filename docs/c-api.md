@@ -32,6 +32,7 @@ values of a row (`value = q · block_scale`); `nvfp4a_quantize` produces it from
 |---|---|
 | `nvfp4a_gemm` | `D = α·A·Bᵀ + bias + β·C`, column-major D (`D[i + j·ldd]`). A: NVFP4, m rows of k values. B: NVFP4 (W4A4), INT8 (W4A8), BF16, FP16 or FP32 (W4A16), n rows of k values. C, D, bias: BF16, FP16 or FP32; C may alias D, and `C = NULL` with β ≠ 0 accumulates into D. For a linear layer `y = x·Wᵀ`: A = W (`m` = out features), B = x (`n` = tokens), D = y (`ldd` = out features). For small `n` the bandwidth-bound GEMV kernel runs, in groups of 8 columns. |
 | `nvfp4a_gemm_dual` | `nvfp4a_gemm` on tensors with a rowwise and a columnwise representation (`nvfp4a_dual_tensor`): `trans_a` / `trans_b` pick the half whose blocks run along k — the backward GEMMs of a linear layer (example below). |
+| `nvfp4a_gemm_grouped` | Mixture of experts in one launch: group `g` computes `D_g = α·A_g·B_gᵀ + bias + β·C_g` of `nvfp4a_gemm`, `A_g` = rows `[g·m, (g+1)·m)` of a stacked NVFP4 weight, `B_g` = rows `[seg[g], seg[g+1])` of `B`, `D_g` (`C_g`) the same rows of a row-major output. Every operand of `nvfp4a_gemm` is taken: A's scales E4M3 / UE5M3, linear or swizzled, every kind of global, B NVFP4 / INT8 / BF16 / FP16 / FP32, bias, C, the amax of D; it runs on the kernels `nvfp4a_gemm` picks (DP4A from sm_61, FFMA below and for dense B). `seg` is a device array: the row counts never reach the host, the call is graph-capturable, and every output equals `nvfp4a_gemm` of its group with the tiled kernel, byte for byte (tests/test_grouped.cu). The tensor-core images are not taken. |
 | `nvfp4a_quantize` | BF16 / FP16 / FP32 `[rows][cols]` → NVFP4 (1 × 16 blocks, the destination's flags and global), or → INT8 (W4A8 activations); `dst->amax` gets `max |x|`. |
 | `nvfp4a_quantize_ex` | Transformer Engine's quantization: rowwise and / or columnwise destination, 1 × 16 or 16 × 16 blocks, 4over6 (MAE / MSE), the global amax computed first (`nvfp4a_quant_config`). |
 | `nvfp4a_dequantize` | NVFP4 → BF16 / FP16 / FP32: `(e2m1 · sb) · g` (amax global: `e2m1 · ((sb · amax) · 1 / (6 M))`), rounded once; `dst->amax` gets `max |value|`. |
@@ -83,8 +84,8 @@ workspace or stream-K) as items that an executor runs from kernels of its own (a
 The device entries are in `include/nvfp4effma_items.cuh`. An executor calls
 `entry(*(const args_type *)p, item, threadIdx.x, smem)` on every thread of the CTA, followed by a CTA barrier before
 shared memory is reused or the next item begins. Use the described thread count as the executor's launch bound.
-Compile it for the plan's `compute_<arch>` and JIT the PTX on the current device, with nvcc or with
-NVRTC using `--std=c++17 --device-as-default-execution-space` and these include paths: the library's `include/` and
+Compile it for the plan's `compute_<arch>`: ahead of time with nvcc (`-gencode arch=compute_<arch>,code=sm_<the device's>`)
+or at run time with NVRTC (`--std=c++17 --device-as-default-execution-space`, the PTX JIT-compiled on the device), with these include paths: the library's `include/` and
 `src/`, CUDA's `include/`, and `include/cccl` on CUDA 13+.
 
 For the executor launch, A's data/image, block scales and global, bias and `w2` are immutable weights. B's
@@ -107,6 +108,27 @@ still matches the library reference byte for byte, including BF16 / FP16 / FP32 
 cases require cooperative launch support (otherwise reported as skipped); `out/test_items --coherence-only` runs
 them alone. `--readonly-control` selects the former input-cache policy for diagnosis; cache invalidation behavior
 differs between GPUs, so that mode is not a portable must-fail test.
+
+### k-split GEMV items
+
+`nvfp4a_gemv_split_items` cuts the CUDA-core GEMV (n ≤ 8) along k into two passes of items, so that a layer's GEMV
+can spread over more CTAs than it has row blocks. `k_parts` runs from 1 to `nvfp4a_gemv_split_max_parts(k)`, one part
+being a run of 512-value units of k.
+
+- Part items (`NVFP4A_ITEM_GEMV_PART`, item = part · blocks + block) write each lane-reduced sum of a block of rows over
+  one part of k to FP32 partials; combine items (`NVFP4A_ITEM_GEMV_COMBINE`, item = block) add a block's partials in
+  part order and then run the call's epilogue.
+- The partials are `nvfp4a_gemv_split_workspace_bytes` bytes, owned by the executor and 16-byte aligned.
+  `nvfp4a_item_access` names them `NVFP4A_ARG_PARTIALS`: part items store disjoint ranges, combine items read them.
+- `k_parts = 1` equals `nvfp4a_gemm_ex` bit for bit. With more parts the additions are regrouped by part: the result
+  stays within the FP32 error of the exact sum and is the same bits for every executor and launch shape.
+- `nvfp4a_gemv_tc_split_items` does the same for the tensor-core GEMV (`NVFP4A_ITEM_GEMV_TC_PART` /
+  `NVFP4A_ITEM_GEMV_TC_COMBINE`): a part is a run of groups (4 k-tiles of 64 values) of an m16 slice, whose warps' sums
+  are stored for the slice's 16 rows; `nvfp4a_gemv_tc_split_max_parts` is the number of groups and
+  `nvfp4a_gemv_tc_split_workspace_bytes` sizes the partials.
+- `tests/test_gemv_split.cu` checks both paths: bit equality at one part, the error against the exact sum in double for the plain
+  epilogue, equal bits across launch shapes, and that part items change exactly their declared partials and combine
+  items read nothing outside their declared ranges.
 
 ## Tensor cores (sm_75 … sm_89)
 

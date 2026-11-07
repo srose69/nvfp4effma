@@ -4,9 +4,12 @@
 // kernel), the NVFP4 x NVFP4 path (DP4A from sm_61, FFMA below) and the dense-B configuration choice; the
 // tensor-core API (nvfp4a_tc_image, nvfp4a_gemm_tc, nvfp4a_gemv_tc; sm_75 .. sm_89).
 #include <stdio.h>
+#include <string.h>
 #include <limits.h>
+#include <algorithm>
 #include <utility>
 #include "gemm_nvfp4effma.cuh"
+#include "quantize_item.cuh"
 #include "gemv_nvfp4effma.cuh"
 #include "tensors/gemm_tc.cuh"
 #include "tensors/gemv_tc.cuh"
@@ -57,9 +60,8 @@ static const GvExFn kGvEx8[] = {&gemv_tc_entry_ex<NVFP4A_INT8, 1>, &gemv_tc_entr
 static const GvExFn kGvExH[] = {&gemv_tc_entry_ex<NVFP4A_BF16, 1>, &gemv_tc_entry_ex<NVFP4A_BF16, 2>, &gemv_tc_entry_ex<NVFP4A_BF16, 3>,
                                 &gemv_tc_entry_ex<NVFP4A_BF16, 4>, &gemv_tc_entry_ex<NVFP4A_BF16, 5>};
 
-// The 64-wide DP4A tile costs about 2/3 of the 128-wide one for half the work, so it only wins where the
-// last 128-wide tile would be at most half full and there are few of them: n = 57..64 and 129..192
-// (below, the GEMV kernel runs).  Measured on a GTX 1080 at m x k = 4096 x 14336 and 8192 x 8192.
+// The 64-wide DP4A tile is used where the last 128-wide tile would be at most half full and there are few
+// of them: n = 57..64 and 129..192 (below, the GEMV kernel runs).
 static bool dp4a_narrow(int n) { return n % 128 != 0 && n % 128 <= 64 && n <= 192; }
 
 static int gemm_config(int m, int n, int tb) {
@@ -113,6 +115,44 @@ static cudaError_t launch_gemm(int tb, int f, const uint8_t *A, int lda, const u
                       : tb == NVFP4A_FP16 ? gemm_table<cid, NVFP4A_FP16>(std::make_index_sequence<kFormatsA>())[fi] \
                                           : gemm_table<cid, NVFP4A_FP32>(std::make_index_sequence<kFormatsA>())[fi]; \
     return fn(A, lda, SA, ldsa, B, ldb, SB, ldsb, m, n, k, e, s);                                                 \
+  }
+  NVFP4A_GEMM_LIB(NVFP4A_CASE)
+#undef NVFP4A_CASE
+  return cudaErrorInvalidConfiguration;
+}
+
+// the grouped kernels (nvfp4a_gemm_grouped) by B dtype and formats, as launch_gemm picks them for one GEMM
+using GroupedDp4aFn = cudaError_t (*)(bool, const GroupedArgs &, int, cudaStream_t);
+using GroupedFn = cudaError_t (*)(const GroupedArgs &, int, cudaStream_t);
+template <int TB, size_t... I>
+static const GroupedDp4aFn *grouped_dp4a_table(std::index_sequence<I...>) {
+  static const GroupedDp4aFn t[] = {&dp4a_grouped_entry<TB, (int)I>...};
+  return t;
+}
+template <int ID, int TB, size_t... I>
+static const GroupedFn *grouped_table(std::index_sequence<I...>) {
+  static const GroupedFn t[] = {&gemm_grouped_entry<ID, TB, (int)I>...};
+  return t;
+}
+static cudaError_t launch_grouped(int tb, int f, const GroupedArgs &a, int rows, cudaStream_t s) {
+  const DeviceInfo &d = device_info();
+  if (tb == NVFP4A_NVFP4 || tb == NVFP4A_INT8) {
+    if (d.sass >= 61) {
+      const GroupedDp4aFn fn = tb == NVFP4A_NVFP4 ? grouped_dp4a_table<NVFP4A_NVFP4>(std::make_index_sequence<kFormats>())[f]
+                                                  : grouped_dp4a_table<NVFP4A_INT8>(std::make_index_sequence<kFormatsA>())[f & 3];
+      return fn(rows <= 64 * a.groups, a, rows, s);
+    }
+    const GroupedFn fn = tb == NVFP4A_NVFP4 ? grouped_table<0, NVFP4A_NVFP4>(std::make_index_sequence<kFormats>())[f]
+                                            : grouped_table<0, NVFP4A_INT8>(std::make_index_sequence<kFormatsA>())[f & 3];
+    return fn(a, rows, s);
+  }
+  const int id = gemm_config(a.m, rows, tb), fi = f & 3;
+#define NVFP4A_CASE(cid)                                                                                                \
+  if (id == cid) {                                                                                                      \
+    const GroupedFn fn = tb == NVFP4A_BF16   ? grouped_table<cid, NVFP4A_BF16>(std::make_index_sequence<kFormatsA>())[fi] \
+                         : tb == NVFP4A_FP16 ? grouped_table<cid, NVFP4A_FP16>(std::make_index_sequence<kFormatsA>())[fi] \
+                                             : grouped_table<cid, NVFP4A_FP32>(std::make_index_sequence<kFormatsA>())[fi]; \
+    return fn(a, rows, s);                                                                                              \
   }
   NVFP4A_GEMM_LIB(NVFP4A_CASE)
 #undef NVFP4A_CASE
@@ -243,7 +283,7 @@ namespace nvfp4a {
 // arguments' elements (0: the argument is not read / written) and their row strides in elements.
 struct ItemGeom {
   long long kind, rows, cols, m, n, k, lda, ldsa, a_img, b_img, ga, b_eb, ldb, ldsb, gb, c_arg, c_eb, ldc, d_eb, ldd, swiglu,
-      bias_eb, np, norm_ld, w2_eb, d2_eb, ldd2, ld_sq, amax, b_rows;
+      bias_eb, np, norm_ld, w2_eb, d2_eb, ldd2, ld_sq, amax, b_rows, kparts;
 };
 static_assert(sizeof(ItemGeom) <= sizeof(((nvfp4a_items *)0)->geom), "the geometry fits");
 
@@ -270,11 +310,23 @@ static const void *plan_dp4a(int EX, bool narrow, nvfp4a_items *p) {
   return kernels[EX];
 }
 
+// A device argument structure as bytes with its padding zeroed: equal calls give equal bytes.
+template <class T>
+inline void put_args(void *blob, const T &args) {
+  T copy = args;
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_clear_padding)
+  __builtin_clear_padding(&copy);
+#endif
+#endif
+  memcpy(blob, &copy, sizeof copy);
+}
+
 // The work items of a validated call (f: the formats; ldsa / ldsb: scale strides).
 static nvfp4a_status plan_items(const char *fn, int kind, int m, int n, int k, const nvfp4a_tensor *A, int lda, int ldsa,
                                 const nvfp4a_tensor *B, int ldb, int ldsb, float beta, const nvfp4a_tensor *C, const nvfp4a_tensor *D,
                                 const nvfp4a_tensor *bias, const kern::Epilogue &e, const kern::EpilogueEx &x, int EX, int f,
-                                nvfp4a_items *p) {
+                                nvfp4a_items *p, int split = 0, int k_parts = 1, float *partials = nullptr) {
   using namespace nvfp4a::kern;
   if (f || !gemv_ex_dtype(B->dtype))
     return fail(NVFP4A_NOT_SUPPORTED, "%s: work items take A with linear E4M3 scales and B BF16 or INT8", fn);
@@ -293,14 +345,26 @@ static nvfp4a_status plan_items(const char *fn, int kind, int m, int n, int k, c
     const GemvItemArgs a{(const uint8_t *)A->data, (const uint8_t *)A->block_scale, (const uint8_t *)B->data,
                          (const uint8_t *)B->block_scale, lda, ldsa, ldb, ldsb, m, k, e, x};
     static_assert(sizeof a <= NVFP4A_ITEM_ARGS_BYTES, "the arguments fit");
-    if (n <= 8) {
+    if (split) {  // the GEMV cut along k: n <= 8 (checked by the caller)
+      const GemvSplitArgs sa{a, partials, k_parts};
+      static_assert(sizeof sa <= NVFP4A_ITEM_ARGS_BYTES, "the split arguments fit");
+      p->kind = split == 1 ? NVFP4A_ITEM_GEMV_PART : NVFP4A_ITEM_GEMV_COMBINE;
+      if (split == 1) {
+        p->smem_bytes = 0;
+        snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_part_item<nvfp4a::kern::GemvCfg<%d, %d>, %d, %d, 0>", R, MX, n, xt);
+      } else {
+        snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_combine_item<nvfp4a::kern::GemvCfg<%d, %d>, %d, %d>", R, MX, n, EX);
+      }
+      snprintf(p->args_type, sizeof p->args_type, "nvfp4a::kern::GemvSplitArgs");
+      put_args(p->args.bytes, sa); p->args_bytes = (int)sizeof sa;
+    } else if (n <= 8) {
       snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_item<nvfp4a::kern::GemvCfg<%d, %d>, %d, %d, 0, %d>", R, MX, n, xt, EX);
       snprintf(p->args_type, sizeof p->args_type, "nvfp4a::kern::GemvItemArgs");
-      memcpy(p->args.bytes, &a, sizeof a); p->args_bytes = (int)sizeof a;
+      put_args(p->args.bytes, a); p->args_bytes = (int)sizeof a;
     } else {
       snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_group_item<nvfp4a::kern::GemvCfg<%d, %d>, %d, %d, %d>", R, MX, xt, EX, n);
       snprintf(p->args_type, sizeof p->args_type, "nvfp4a::kern::GemvItemArgs");
-      memcpy(p->args.bytes, &a, sizeof a); p->args_bytes = sizeof a;
+      put_args(p->args.bytes, a); p->args_bytes = sizeof a;
     }
   } else if (kind == NVFP4A_ITEM_GEMM || kind == NVFP4A_ITEM_GEMM_DP4A) {
     if (kind == NVFP4A_ITEM_GEMM_DP4A) kernel = plan_dp4a(EX, dp4a_narrow(n), p);
@@ -318,7 +382,7 @@ static nvfp4a_status plan_items(const char *fn, int kind, int m, int n, int k, c
     const GemmItemArgs a{(const uint8_t *)A->data, (const uint8_t *)A->block_scale, (const uint8_t *)B->data,
                          (const uint8_t *)B->block_scale, lda, ldsa, ldb, ldsb, m, n, k, e, x};
     static_assert(sizeof a <= NVFP4A_ITEM_ARGS_BYTES, "the tiled arguments fit");
-    memcpy(p->args.bytes, &a, sizeof a); p->args_bytes = sizeof a;
+    put_args(p->args.bytes, a); p->args_bytes = sizeof a;
   } else if (kind == NVFP4A_ITEM_GEMM_TC) {
     static const void *const t8[] = {tc_kernel_ptr<NVFP4A_INT8, 0>(), tc_kernel_ex_ptr<NVFP4A_INT8, 1>(), tc_kernel_ex_ptr<NVFP4A_INT8, 2>(),
                                      tc_kernel_ex_ptr<NVFP4A_INT8, 3>(), tc_kernel_ex_ptr<NVFP4A_INT8, 4>(), tc_kernel_ex_ptr<NVFP4A_INT8, 5>()};
@@ -335,7 +399,7 @@ static nvfp4a_status plan_items(const char *fn, int kind, int m, int n, int k, c
     snprintf(p->args_type, sizeof p->args_type, "nvfp4a::kern::GemmTcItemArgs");
     const GemmTcItemArgs a{(const uint8_t *)A->data, (const uint8_t *)B->data, m, n, k / 64, e, x};
     static_assert(sizeof a <= NVFP4A_ITEM_ARGS_BYTES, "the arguments fit");
-    memcpy(p->args.bytes, &a, sizeof a);
+    put_args(p->args.bytes, a);
     p->args_bytes = (int)sizeof a;
   } else {
     static const void *const tc8[] = {gemv_tc_kernel_ptr<NVFP4A_INT8, 0>(), gemv_tc_kernel_ex_ptr<NVFP4A_INT8, 1>(),
@@ -346,16 +410,28 @@ static nvfp4a_status plan_items(const char *fn, int kind, int m, int n, int k, c
                                       gemv_tc_kernel_ex_ptr<NVFP4A_BF16, 4>(), gemv_tc_kernel_ex_ptr<NVFP4A_BF16, 5>()};
     kernel = (xt == NVFP4A_INT8 ? tc8 : tch)[EX];
     p->rows = 16;
-    p->smem_bytes = gemv_tc_smem_floats(EX) * 4;
-    snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_tc_item<%d, 0, %d>", xt, EX);
-    snprintf(p->args_type, sizeof p->args_type, "nvfp4a::kern::GemvTcItemArgs");
     const GemvTcItemArgs a{(const uint8_t *)A->data, (const uint8_t *)B->data, (const uint8_t *)B->block_scale, ldb, ldsb, m, n, k / 64,
                            e, x};
     static_assert(sizeof a <= NVFP4A_ITEM_ARGS_BYTES, "the arguments fit");
-    memcpy(p->args.bytes, &a, sizeof a);
-    p->args_bytes = (int)sizeof a;
+    if (split) {  // the slice cut along k (checked by the caller)
+      const GemvTcSplitArgs sa{a, partials, k_parts};
+      static_assert(sizeof sa <= NVFP4A_ITEM_ARGS_BYTES, "the split arguments fit");
+      p->kind = split == 1 ? NVFP4A_ITEM_GEMV_TC_PART : NVFP4A_ITEM_GEMV_TC_COMBINE;
+      p->smem_bytes = gemv_tc_smem_floats(split == 1 ? 0 : EX) * 4;
+      if (split == 1) snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_tc_part_item<%d, 0>", xt);
+      else snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_tc_combine_item<%d>", EX);
+      snprintf(p->args_type, sizeof p->args_type, "nvfp4a::kern::GemvTcSplitArgs");
+      put_args(p->args.bytes, sa);
+      p->args_bytes = (int)sizeof sa;
+    } else {
+      p->smem_bytes = gemv_tc_smem_floats(EX) * 4;
+      snprintf(p->entry, sizeof p->entry, "nvfp4a::kern::gemv_tc_item<%d, 0, %d>", xt, EX);
+      snprintf(p->args_type, sizeof p->args_type, "nvfp4a::kern::GemvTcItemArgs");
+      put_args(p->args.bytes, a);
+      p->args_bytes = (int)sizeof a;
+    }
   }
-  const long long count = (1LL + (m - 1) / p->rows) * (p->cols ? 1LL + (n - 1) / p->cols : 1);
+  const long long count = (1LL + (m - 1) / p->rows) * (p->cols ? 1LL + (n - 1) / p->cols : 1) * (split == 1 ? k_parts : 1);
   if (count > INT_MAX) return fail(NVFP4A_NOT_SUPPORTED, "%s: work-item count exceeds INT_MAX", fn);
   p->items = (int)count;
   cudaFuncAttributes fa{};
@@ -364,7 +440,7 @@ static nvfp4a_status plan_items(const char *fn, int kind, int m, int n, int k, c
   p->arch = fa.ptxVersion;
 
   ItemGeom g{};
-  g.kind = kind; g.rows = p->rows; g.cols = p->cols; g.m = m; g.n = n; g.k = k; g.lda = lda; g.ldsa = ldsa;
+  g.kind = p->kind; g.kparts = split ? k_parts : 0; g.rows = p->rows; g.cols = p->cols; g.m = m; g.n = n; g.k = k; g.lda = lda; g.ldsa = ldsa;
   g.a_img = kind == NVFP4A_ITEM_GEMV_TC || kind == NVFP4A_ITEM_GEMM_TC ? (long long)((k / 64 + 3) / 4) * tc::GV : 0;
   g.b_rows = kind == NVFP4A_ITEM_GEMM_DP4A ? 128 : p->cols;
   g.b_img = kind == NVFP4A_ITEM_GEMM_TC ? (long long)(k / 64) * (xt == NVFP4A_INT8 ? tc::rb_bytes<NVFP4A_INT8>() : tc::rb_bytes<NVFP4A_BF16>())
@@ -389,7 +465,7 @@ namespace nvfp4a {
 static nvfp4a_status gemm_run(const char *fn, int m, int n, int k, float alpha, const nvfp4a_tensor *A, int lda, const nvfp4a_tensor *B,
                               int ldb, float beta, const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd,
                               const nvfp4a_tensor *bias, const kern::EpilogueEx &ex, int EX, cudaStream_t stream,
-                              nvfp4a_items *plan = nullptr) {
+                              nvfp4a_items *plan = nullptr, int split = 0, int k_parts = 1, float *partials = nullptr) {
   using namespace nvfp4a::kern;
   const auto dense = [](const nvfp4a_tensor *t) { return t->dtype >= NVFP4A_BF16 && t->dtype <= NVFP4A_FP32; };
   const auto blocked = [](const nvfp4a_tensor *t) { return t->dtype == NVFP4A_NVFP4 || t->dtype == NVFP4A_INT8; };
@@ -438,7 +514,9 @@ static nvfp4a_status gemm_run(const char *fn, int m, int n, int k, float alpha, 
   const bool gemv = k == 0 || n <= kGemvMaxN[B->dtype];
   const int kind = gemv ? NVFP4A_ITEM_GEMV : B->dtype == NVFP4A_INT8 && device_info().sass >= 61
                                                ? NVFP4A_ITEM_GEMM_DP4A : NVFP4A_ITEM_GEMM;
-  if (plan) return plan_items(fn, kind, m, n, k, A, lda, ldsa, B, ldb, ldsb, beta, C, D, bias, e, ex, EX, f, plan);
+  if (split && (kind != NVFP4A_ITEM_GEMV || n > 8 || k == 0))
+    return fail(NVFP4A_NOT_SUPPORTED, "%s: the cut along k is for the GEMV on CUDA cores with 1 .. 8 columns", fn);
+  if (plan) return plan_items(fn, kind, m, n, k, A, lda, ldsa, B, ldb, ldsb, beta, C, D, bias, e, ex, EX, f, plan, split, k_parts, partials);
   const cudaError_t err = gemv
                               ? launch_gemv_groups(B->dtype, f, a, lda, sa, ldsa, b, ldb, sb, ldsb, m, n, k, e, ex, EX, stream)
                               : launch_gemm(B->dtype, f, a, lda, sa, ldsa, b, ldb, sb, ldsb, m, n, k, e, ex, EX, stream);
@@ -478,6 +556,60 @@ static nvfp4a_status make_epilogue_ex(const char *fn, const nvfp4a_epilogue *x, 
   return NVFP4A_OK;
 }
 }  // namespace nvfp4a
+
+extern "C" nvfp4a_status nvfp4a_gemm_grouped(int groups, int m, int k, int rows, float alpha, const nvfp4a_tensor *A, int lda,
+                                             const nvfp4a_tensor *B, int ldb, float beta, const nvfp4a_tensor *C, int ldc,
+                                             const nvfp4a_tensor *D, int ldd, const nvfp4a_tensor *bias, const int *seg,
+                                             cudaStream_t stream) {
+  using namespace nvfp4a::kern;
+  nvfp4a::clear_error();
+  const char *fn = "nvfp4a_gemm_grouped";
+  const auto dense = [](const nvfp4a_tensor *t) { return t->dtype >= NVFP4A_BF16 && t->dtype <= NVFP4A_FP32; };
+  const auto blocked = [](const nvfp4a_tensor *t) { return t->dtype == NVFP4A_NVFP4 || t->dtype == NVFP4A_INT8; };
+  const auto aligned = [](const void *p, unsigned a) { return ((uintptr_t)p & (a - 1)) == 0; };
+  const auto bytes = [](nvfp4a_dtype t) { return t == NVFP4A_FP32 ? 4 : 2; };
+  if (!A || !B || !D || !seg || !A->data || !B->data || !D->data)
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: A, B, D, seg or their data is NULL", fn);
+  if (groups < 0 || m < 0 || k < 0 || rows < 0)
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: negative size (groups=%d m=%d k=%d rows=%d)", fn, groups, m, k, rows);
+  if (A->dtype != NVFP4A_NVFP4) return nvfp4a::fail(NVFP4A_NOT_SUPPORTED, "%s: A must be NVFP4 (dtype %d)", fn, (int)A->dtype);
+  if (!blocked(B) && !dense(B)) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: invalid B dtype %d", fn, (int)B->dtype);
+  if (!dense(D)) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: D must be BF16, FP16 or FP32 (dtype %d)", fn, (int)D->dtype);
+  if (groups == 0 || m == 0 || rows == 0) return NVFP4A_OK;
+  if (k == 0 || k % 64) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: k = %d is not a positive multiple of 64", fn, k);
+  if (lda % 64 || ldb % 64 || lda < k || ldb < k)
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: lda = %d / ldb = %d must be multiples of 64 and >= k = %d", fn, lda, ldb, k);
+  if (!aligned(A->data, 16) || !aligned(B->data, 16)) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: A and B must be 16-byte aligned", fn);
+  if (ldd < m) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: ldd = %d < m = %d", fn, ldd, m);
+  if ((long long)groups * m > INT_MAX / 2) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: groups * m exceeds the 32-bit range", fn);
+  int ldsa = 0, ldsb = 0;
+  for (const nvfp4a_tensor *t : {A, B}) {
+    if (!blocked(t)) {
+      if (t->flags) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: flags are for NVFP4 tensors (dtype %d)", fn, (int)t->dtype);
+      continue;
+    }
+    const unsigned sa = t->dtype == NVFP4A_INT8 ? 16 : 4;
+    if (!t->block_scale) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: NVFP4 / INT8 operand without block_scale", fn);
+    if (!aligned(t->block_scale, sa) || t->ld_scale % 4 || (t->ld_scale && t->ld_scale < k / 16))
+      return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: block scales must be %u-byte aligned with ld_scale a multiple of 4 and >= k / 16 "
+                          "(ld_scale = %d)", fn, sa, t->ld_scale);
+    if (nvfp4a_status st = nvfp4a::check_scales(fn, t == A ? "A" : "B", t, t == A ? groups * m : rows, k, t == A ? &ldsa : &ldsb))
+      return st;
+  }
+  if (bias && bias->data && !dense(bias)) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: invalid bias dtype %d", fn, (int)bias->dtype);
+  if (beta != 0.f && C && C->data && (!dense(C) || ldc < m))
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: C must be BF16, FP16 or FP32 with ldc >= m", fn);
+  if (nvfp4a_status st = nvfp4a::check_device()) return st;
+  int f;
+  GroupedArgs a{};
+  a.e = nvfp4a::make_epilogue(alpha, A, B, beta, C, ldc, D, ldd, bias, &f);
+  a.A = (const uint8_t *)A->data; a.SA = (const uint8_t *)A->block_scale;
+  a.B = (const uint8_t *)B->data; a.SB = (const uint8_t *)B->block_scale;
+  a.seg = seg; a.lda = lda; a.ldsa = ldsa; a.ldb = ldb; a.ldsb = ldsb; a.m = m; a.k = k; a.groups = groups;
+  a.d_bytes = bytes(D->dtype);
+  a.c_bytes = a.e.c ? bytes((nvfp4a_dtype)a.e.c_dtype) : 0;
+  return nvfp4a::cuda_status(launch_grouped(B->dtype, f, a, rows, stream), fn);
+}
 
 extern "C" nvfp4a_status nvfp4a_gemm(int m, int n, int k, float alpha, const nvfp4a_tensor *A, int lda,
                                      const nvfp4a_tensor *B, int ldb, float beta, const nvfp4a_tensor *C, int ldc,
@@ -725,7 +857,7 @@ namespace nvfp4a {
 static nvfp4a_status gemv_tc_run(const char *fn, int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B,
                                  int ldb, float beta, const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd,
                                  const nvfp4a_tensor *bias, const kern::EpilogueEx &x, int EX, cudaStream_t stream,
-                                 nvfp4a_items *plan = nullptr) {
+                                 nvfp4a_items *plan = nullptr, int split = 0, int k_parts = 1, float *partials = nullptr) {
   using namespace nvfp4a::kern;
   const auto dense = [](const nvfp4a_tensor *t) { return t->dtype >= NVFP4A_BF16 && t->dtype <= NVFP4A_FP32; };
   const auto aligned = [](const void *p, unsigned a) { return ((uintptr_t)p & (a - 1)) == 0; };
@@ -766,7 +898,7 @@ static nvfp4a_status gemv_tc_run(const char *fn, int m, int n, int k, float alph
   // aligned and k a multiple of 256 (no partial group)
   const int xs = (f & kF_BSWZ) ? 1 : (ldsb % 16 == 0 && aligned(B->block_scale, 16) && k % 256 == 0) ? 2 : 0;
   const uint8_t *ia = (const uint8_t *)A->data, *xb = (const uint8_t *)B->data, *sxb = (const uint8_t *)B->block_scale;
-  if (plan) return plan_items(fn, NVFP4A_ITEM_GEMV_TC, m, n, k, A, 0, 0, B, ldb, ldsb, beta, C, D, bias, e, x, EX, f, plan);
+  if (plan) return plan_items(fn, NVFP4A_ITEM_GEMV_TC, m, n, k, A, 0, 0, B, ldb, ldsb, beta, C, D, bias, e, x, EX, f, plan, split, k_parts, partials);
   if (EX) {
     if (f & kF_AUE) return fail(NVFP4A_NOT_SUPPORTED, "%s: the extended epilogue takes A with E4M3 scales", fn);
     if (!gemv_ex_dtype(B->dtype)) return fail(NVFP4A_NOT_SUPPORTED, "%s: the extended epilogue takes B BF16 or INT8", fn);
@@ -822,6 +954,138 @@ extern "C" nvfp4a_status nvfp4a_gemv_tc_ex_items(int m, int n, int k, float alph
   return nvfp4a::gemv_tc_run("nvfp4a_gemv_tc_ex_items", m, n, k, alpha, A, B, ldb, beta, C, ldc, D, ldd, bias, x, EX, 0, items);
 }
 
+extern "C" nvfp4a_status nvfp4a_tc_image_b_items(int n, int k, const nvfp4a_tensor *B, int ldb, void *image, nvfp4a_items *items) {
+  using namespace nvfp4a::kern;
+  nvfp4a::clear_error();
+  const char *fn = "nvfp4a_tc_image_b_items";
+  if (!items || !B || !B->data || !image) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: items, B, its data or the image is NULL", fn);
+  const bool q8 = B->dtype == NVFP4A_INT8;
+  if (B->dtype != NVFP4A_BF16 && !q8) return nvfp4a::fail(NVFP4A_NOT_SUPPORTED, "%s: B must be BF16 or INT8", fn);
+  if (n <= 0 || k <= 0 || k % 64 || ldb % 64 || ldb < k) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: n = %d, k = %d, ldb = %d", fn, n, k, ldb);
+  if (((uintptr_t)B->data | (uintptr_t)image) & 15) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: B and the image must be 16-byte aligned", fn);
+  if (q8 && (!B->block_scale || ((uintptr_t)B->block_scale & 15) || B->ld_scale % 4 || (B->ld_scale && B->ld_scale < k / 16)))
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: INT8 B needs 16-byte aligned FP32 block scales, ld_scale a multiple of 4 and >= k / 16", fn);
+  if (nvfp4a_status st = tc_device(fn, B->dtype)) return st;
+  const int tiles = k / 64, lsc = q8 ? (B->ld_scale ? B->ld_scale : k / 16) : 0;
+  const long long count = q8 ? (long long)((tiles + 1) / 2) * ((n + 127) / 128) : (long long)tiles * ((n + 127) / 128);
+  if (count > INT_MAX) return nvfp4a::fail(NVFP4A_NOT_SUPPORTED, "%s: work-item count exceeds INT_MAX", fn);
+  cudaFuncAttributes fa{};
+  if (cudaError_t err = cudaFuncGetAttributes(&fa, q8 ? image_b8_kernel_ptr() : image_bh_kernel_ptr())) return nvfp4a::cuda_status(err, fn);
+  *items = nvfp4a_items{};
+  items->kind = NVFP4A_ITEM_IMAGE_B;
+  items->items = (int)count;
+  items->rows = 0;
+  items->cols = 128;
+  items->threads = tc::kImgThreads;
+  items->regs = fa.numRegs;
+  items->arch = fa.ptxVersion;
+  if (q8) {
+    snprintf(items->entry, sizeof items->entry, "nvfp4a::kern::tc::image_b8_item");
+    snprintf(items->args_type, sizeof items->args_type, "nvfp4a::kern::tc::ImageB8ItemArgs");
+    const tc::ImageB8ItemArgs a{(const uint8_t *)B->data, (const float *)B->block_scale, (uint8_t *)image, ldb, lsc, n, tiles, nullptr};
+    nvfp4a::put_args(items->args.bytes, a);
+    items->args_bytes = (int)sizeof a;
+  } else {
+    snprintf(items->entry, sizeof items->entry, "nvfp4a::kern::tc::image_bh_item");
+    snprintf(items->args_type, sizeof items->args_type, "nvfp4a::kern::tc::ImageBhItemArgs");
+    const tc::ImageBhItemArgs a{(const uint16_t *)B->data, (uint8_t *)image, ldb, n, tiles, nullptr};
+    nvfp4a::put_args(items->args.bytes, a);
+    items->args_bytes = (int)sizeof a;
+  }
+  nvfp4a::ItemGeom g{};
+  g.kind = items->kind; g.cols = 128; g.n = n; g.k = k; g.ldb = ldb; g.b_eb = q8 ? 1 : 2; g.ldsb = lsc;
+  memcpy(items->geom, &g, sizeof g);
+  return NVFP4A_OK;
+}
+
+namespace nvfp4a {
+namespace kern {
+const void *quantize_int8_kernel_ptr(int dtype);  // nvfp4effma.cu
+}
+}  // namespace nvfp4a
+
+extern "C" nvfp4a_status nvfp4a_quantize_int8_items(const nvfp4a_tensor *src, int lds, const nvfp4a_tensor *dst, int ldd, int rows, int cols,
+                                                    nvfp4a_items *items) {
+  using namespace nvfp4a::kern;
+  nvfp4a::clear_error();
+  const char *fn = "nvfp4a_quantize_int8_items";
+  if (!items || !src || !dst || !src->data || !dst->data || !dst->block_scale) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: items, src, dst, their data or the scales is NULL", fn);
+  if (src->dtype != NVFP4A_BF16 && src->dtype != NVFP4A_FP16 && src->dtype != NVFP4A_FP32)
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: src must be BF16, FP16 or FP32", fn);
+  if (dst->dtype != NVFP4A_INT8 || dst->flags) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: dst must be INT8 without flags", fn);
+  if (rows <= 0 || cols <= 0 || cols % 16 || lds % 16 || ldd % 16 || lds < cols || ldd < cols)
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: rows = %d, cols = %d, lds = %d, ldd = %d (multiples of 16, ld >= cols)", fn, rows, cols, lds, ldd);
+  const int lsc = dst->ld_scale ? dst->ld_scale : cols / 16;
+  if (lsc < cols / 16 || ((uintptr_t)src->data & 15) || ((uintptr_t)dst->data & 15) || ((uintptr_t)dst->block_scale & 3))
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: ld_scale >= cols / 16; src and dst 16-byte, the scales 4-byte aligned", fn);
+  if (nvfp4a_status st = nvfp4a::check_device()) return st;
+  const void *kernel = quantize_int8_kernel_ptr(src->dtype);
+  cudaFuncAttributes fa{};
+  if (cudaError_t err = cudaFuncGetAttributes(&fa, kernel)) return nvfp4a::cuda_status(err, fn);
+  const int bpr = cols / 16, rpi = std::max(1, kQuantItemThreads / bpr);
+  *items = nvfp4a_items{};
+  items->kind = NVFP4A_ITEM_QUANT_INT8;
+  items->items = (rows + rpi - 1) / rpi;
+  items->rows = rpi;
+  items->threads = kQuantItemThreads;
+  items->regs = fa.numRegs;
+  items->arch = fa.ptxVersion;
+  snprintf(items->entry, sizeof items->entry, "nvfp4a::kern::quantize_int8_item<%d>", (int)src->dtype);
+  snprintf(items->args_type, sizeof items->args_type, "nvfp4a::kern::QuantizeItemArgs");
+  const QuantizeItemArgs a{(const uint8_t *)src->data, (int8_t *)dst->data, (float *)dst->block_scale, lds, ldd, lsc, rows, cols, rpi, nullptr};
+  nvfp4a::put_args(items->args.bytes, a);
+  items->args_bytes = (int)sizeof a;
+  nvfp4a::ItemGeom g{};
+  g.kind = items->kind; g.rows = rpi; g.n = rows; g.k = cols; g.ldb = lds; g.b_eb = src->dtype == NVFP4A_FP32 ? 4 : 2; g.ldd = ldd; g.ldsb = lsc;
+  memcpy(items->geom, &g, sizeof g);
+  return NVFP4A_OK;
+}
+
+extern "C" nvfp4a_status nvfp4a_items_n_device(nvfp4a_items *items, const int *n_device) {
+  using namespace nvfp4a::kern;
+  nvfp4a::clear_error();
+  const char *fn = "nvfp4a_items_n_device";
+  if (!items || !n_device) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: items or n_device is NULL", fn);
+  if (items->kind == NVFP4A_ITEM_GEMV && items->cols) {
+    GemvItemArgs a;
+    memcpy(&a, items->args.bytes, sizeof a);
+    a.x.n_dev = n_device;
+    nvfp4a::put_args(items->args.bytes, a);
+  } else if (items->kind == NVFP4A_ITEM_GEMM || items->kind == NVFP4A_ITEM_GEMM_DP4A) {
+    GemmItemArgs a;
+    memcpy(&a, items->args.bytes, sizeof a);
+    a.x.n_dev = n_device;
+    nvfp4a::put_args(items->args.bytes, a);
+  } else if (items->kind == NVFP4A_ITEM_GEMM_TC) {
+    GemmTcItemArgs a;
+    memcpy(&a, items->args.bytes, sizeof a);
+    a.xd.n_dev = n_device;
+    nvfp4a::put_args(items->args.bytes, a);
+  } else if (items->kind == NVFP4A_ITEM_IMAGE_B) {
+    nvfp4a::ItemGeom g;
+    memcpy(&g, items->geom, sizeof g);
+    if (g.b_eb == 1) {  // INT8
+      tc::ImageB8ItemArgs a;
+      memcpy(&a, items->args.bytes, sizeof a);
+      a.n_dev = n_device;
+      nvfp4a::put_args(items->args.bytes, a);
+    } else {
+      tc::ImageBhItemArgs a;
+      memcpy(&a, items->args.bytes, sizeof a);
+      a.n_dev = n_device;
+      nvfp4a::put_args(items->args.bytes, a);
+    }
+  } else if (items->kind == NVFP4A_ITEM_QUANT_INT8) {
+    QuantizeItemArgs a;
+    memcpy(&a, items->args.bytes, sizeof a);
+    a.n_dev = n_device;
+    nvfp4a::put_args(items->args.bytes, a);
+  } else {
+    return nvfp4a::fail(NVFP4A_NOT_SUPPORTED, "%s: only the GEMM items (more than 8 columns) take the column count", fn);
+  }
+  return NVFP4A_OK;
+}
+
 extern "C" int nvfp4a_item_access(const nvfp4a_items *items, int item, nvfp4a_item_range *ranges, int max) {
   if (!items || item < 0 || item >= items->items || max < 0 || (max && !ranges)) return -1;
   nvfp4a::ItemGeom g;
@@ -832,8 +1096,30 @@ extern "C" int nvfp4a_item_access(const nvfp4a_items *items, int item, nvfp4a_it
     if (cnt < max) ranges[cnt] = nvfp4a_item_range{arg, write, offset, bytes, stride, (int)rows};
     ++cnt;
   };
+  if (g.kind == NVFP4A_ITEM_IMAGE_B) {  // k-tile(s) kt of the 128-column block cb: 64 values of each of its columns -> one record each
+    const long long tiles = g.k / 64, q8 = g.b_eb == 1, per = q8 ? 2 : 1, groups = (tiles + per - 1) / per;
+    const long long kt = item % groups * per, cb = item / groups, c0 = cb * 128, cc = g.n - c0 < 128 ? g.n - c0 : 128;
+    const long long nt = tiles - kt < per ? tiles - kt : per, rec = q8 ? nvfp4a::kern::tc::RB8 : nvfp4a::kern::tc::RBH;
+    add(NVFP4A_ARG_B, 0, (c0 * g.ldb + 64 * kt) * g.b_eb, 64 * nt * g.b_eb, g.ldb * g.b_eb, cc);
+    if (q8) add(NVFP4A_ARG_B_SCALES, 0, (c0 * g.ldsb + 4 * kt) * 4, 4 * nt * 4, g.ldsb * 4, cc);
+    add(NVFP4A_ARG_B_IMAGE, 1, (cb * tiles + kt) * rec, nt * rec, 0, 1);
+    return cnt;
+  }
+  if (g.kind == NVFP4A_ITEM_QUANT_INT8) {  // rows r0 .. of src -> the same rows of the data and the scales
+    const long long r0 = (long long)item * g.rows, rr = g.n - r0 < g.rows ? g.n - r0 : g.rows;
+    add(NVFP4A_ARG_Q_SRC, 0, r0 * g.ldb * g.b_eb, g.k * g.b_eb, g.ldb * g.b_eb, rr);
+    add(NVFP4A_ARG_Q_DATA, 1, r0 * g.ldd, g.k, g.ldd, rr);
+    add(NVFP4A_ARG_Q_SCALES, 1, r0 * g.ldsb * 4, g.k / 16 * 4, g.ldsb * 4, rr);
+    return cnt;
+  }
   // the item's row block mb and column block nb (tiles: the kernel's raster, groups of 8 row blocks)
-  long long mb = item, nb = 0;
+  long long mb = item, nb = 0, part = 0;
+  const bool tc_part = g.kind == NVFP4A_ITEM_GEMV_TC_PART, tc_combine = g.kind == NVFP4A_ITEM_GEMV_TC_COMBINE;
+  const bool is_part = g.kind == NVFP4A_ITEM_GEMV_PART || tc_part, is_combine = g.kind == NVFP4A_ITEM_GEMV_COMBINE || tc_combine;
+  if (is_part) {
+    const long long blocks = (g.m + g.rows - 1) / g.rows;
+    mb = item % blocks; part = item / blocks;
+  }
   if (g.kind == NVFP4A_ITEM_GEMM_TC) {
     const long long nt = (g.n + g.cols - 1) / g.cols, mt = (g.m + g.rows - 1) / g.rows, grp = item / (8 * nt), first = grp * 8;
     const long long gsz = mt - first < 8 ? mt - first : 8, t = item - grp * 8 * nt;
@@ -844,40 +1130,67 @@ extern "C" int nvfp4a_item_access(const nvfp4a_items *items, int item, nvfp4a_it
   }
   const long long r0 = mb * g.rows, rr = g.m - r0 < g.rows ? g.m - r0 : g.rows;
   const long long c0 = g.cols ? nb * g.cols : 0, cc = !g.cols ? g.n : g.n - c0 < g.cols ? g.n - c0 : g.cols;
-  const bool raw = g.kind == NVFP4A_ITEM_GEMV || g.kind == NVFP4A_ITEM_GEMM || g.kind == NVFP4A_ITEM_GEMM_DP4A;
-  if (raw) {
-    add(NVFP4A_ARG_A, 0, r0 * (g.lda / 2), g.k / 2, g.lda / 2, rr);
-    add(NVFP4A_ARG_A_SCALES, 0, r0 * g.ldsa, g.k / 16, g.ldsa, rr);
+  const bool raw = g.kind == NVFP4A_ITEM_GEMV || g.kind == NVFP4A_ITEM_GEMM || g.kind == NVFP4A_ITEM_GEMM_DP4A || g.kind == NVFP4A_ITEM_GEMV_PART;
+  int pk0 = 0, pk1 = (int)g.k;  // the part's values of k (the whole k for the others)
+  int tg0 = 0, tg1 = 0;         // the part's groups of the slice's image
+  if (g.kind == NVFP4A_ITEM_GEMV_PART) nvfp4a::kern::gemv_part_range((int)g.k, (int)g.kparts, (int)part, &pk0, &pk1);
+  if (tc_part) {
+    nvfp4a::kern::gemv_tc_part_range((int)g.k / 64, (int)g.kparts, (int)part, &tg0, &tg1);
+    pk0 = 256 * tg0;
+    pk1 = 256 * tg1 < (int)g.k ? 256 * tg1 : (int)g.k;
+  }
+  const long long prr = tc_part || tc_combine ? g.rows : rr;  // the partials' rows: a slice's 16 whole
+  const long long kb0 = pk0, kb1 = pk1;
+  if (is_combine) {
+    // the block's partials: [part][column][ROWS] floats of the block, the blocks one after the other
+    const long long block_floats = g.kparts * g.n * g.rows;
+    const long long base = mb * block_floats * 4, stride = g.n * g.rows * 4;
+    if (prr == g.rows) add(NVFP4A_ARG_PARTIALS, 0, base, stride, stride, g.kparts);
+    else
+      for (long long j = 0; j < g.n; ++j) add(NVFP4A_ARG_PARTIALS, 0, base + j * g.rows * 4, prr * 4, stride, g.kparts);
+  } else if (raw) {
+    add(NVFP4A_ARG_A, 0, r0 * (g.lda / 2) + kb0 / 2, (kb1 - kb0) / 2, g.lda / 2, rr);
+    add(NVFP4A_ARG_A_SCALES, 0, r0 * g.ldsa + kb0 / 16, (kb1 - kb0) / 16, g.ldsa, rr);
     if (r0 && rr < g.rows) {  // gemv_warp: inactive rows load row 0.
-      add(NVFP4A_ARG_A, 0, 0, g.k / 2, 0, 1);
-      add(NVFP4A_ARG_A_SCALES, 0, 0, g.k / 16, 0, 1);
+      add(NVFP4A_ARG_A, 0, kb0 / 2, (kb1 - kb0) / 2, 0, 1);
+      add(NVFP4A_ARG_A_SCALES, 0, kb0 / 16, (kb1 - kb0) / 16, 0, 1);
     }
+  } else if (tc_part) {  // the part's groups of the slice's image
+    const long long groups = g.a_img / nvfp4a::kern::tc::GV;
+    add(NVFP4A_ARG_A, 0, (mb * groups + tg0) * nvfp4a::kern::tc::GV, (tg1 - tg0) * nvfp4a::kern::tc::GV, 0, 1);
   } else {  // the image's slices of the rows (a tile: its 8)
     const long long sl = g.rows / 16;
     add(NVFP4A_ARG_A, 0, mb * sl * g.a_img, sl * g.a_img, 0, 1);
   }
-  if (g.ga) add(NVFP4A_ARG_A_GLOBAL, 0, g.ga == 2 ? r0 * 4 : 0, g.ga == 2 ? rr * 4 : 4, 0, 1);
-  if (g.kind != NVFP4A_ITEM_GEMV && g.kind != NVFP4A_ITEM_GEMV_TC && g.ga == 2 && r0 && rr < g.rows)
+  if (g.ga && !is_part) add(NVFP4A_ARG_A_GLOBAL, 0, g.ga == 2 ? r0 * 4 : 0, g.ga == 2 ? rr * 4 : 4, 0, 1);
+  if (g.kind != NVFP4A_ITEM_GEMV && g.kind != NVFP4A_ITEM_GEMV_TC && !is_part && !is_combine && g.ga == 2 && r0 && rr < g.rows)
     add(NVFP4A_ARG_A_GLOBAL, 0, 0, 4, 0, 1);  // gemm_tc_body's padded epilogue rows.
-  if (g.b_img) add(NVFP4A_ARG_B, 0, nb * g.b_img, g.b_img, 0, 1);
-  else {
+  if (is_combine) {
+    // B is read by the part items alone
+  } else if (g.b_img) {
+    add(NVFP4A_ARG_B, 0, nb * g.b_img, g.b_img, 0, 1);
+  } else {
     const long long bc = g.b_rows ? (g.n - c0 < g.b_rows ? g.n - c0 : g.b_rows) : cc;
-    add(NVFP4A_ARG_B, 0, c0 * g.ldb * g.b_eb, g.k * g.b_eb, g.ldb * g.b_eb, bc);
-    if (g.ldsb) add(NVFP4A_ARG_B_SCALES, 0, c0 * g.ldsb * 4, g.k / 16 * 4, g.ldsb * 4, bc);
-    if (raw && g.kind != NVFP4A_ITEM_GEMV && c0 && bc < g.b_rows) {
+    add(NVFP4A_ARG_B, 0, (c0 * g.ldb + kb0) * g.b_eb, (kb1 - kb0) * g.b_eb, g.ldb * g.b_eb, bc);
+    if (g.ldsb) add(NVFP4A_ARG_B_SCALES, 0, (c0 * g.ldsb + kb0 / 16) * 4, (kb1 - kb0) / 16 * 4, g.ldsb * 4, bc);
+    if (raw && g.kind != NVFP4A_ITEM_GEMV && !is_part && c0 && bc < g.b_rows) {
       add(NVFP4A_ARG_B, 0, 0, g.k * g.b_eb, 0, 1);
       if (g.ldsb) add(NVFP4A_ARG_B_SCALES, 0, 0, g.k / 16 * 4, 0, 1);
     }
   }
+  if (is_part) {  // the lanes' sums of this block and part
+    add(NVFP4A_ARG_PARTIALS, 1, (mb * g.kparts + part) * g.n * g.rows * 4, prr * 4, g.rows * 4, g.n);
+    return cnt;
+  }
   if (g.gb) add(NVFP4A_ARG_B_GLOBAL, 0, g.gb == 2 ? c0 * 4 : 0, g.gb == 2 ? cc * 4 : 4, 0, 1);
-  if (g.gb == 2 && c0 && cc < g.cols && g.kind != NVFP4A_ITEM_GEMV)
+  if (g.gb == 2 && c0 && cc < g.cols && g.kind != NVFP4A_ITEM_GEMV && !is_combine)
     add(NVFP4A_ARG_B_GLOBAL, 0, 0, 4, 0, 1);
   if (g.bias_eb) add(NVFP4A_ARG_BIAS, 0, r0 * g.bias_eb, rr * g.bias_eb, 0, 1);
   if (g.kind == NVFP4A_ITEM_GEMM_DP4A && g.bias_eb && !g.c_eb && !g.np && !g.swiglu && !g.d2_eb && r0 && rr < g.rows)
     add(NVFP4A_ARG_BIAS, 0, 0, g.bias_eb, 0, 1);
   if (g.c_eb) add((int)g.c_arg, 0, (c0 * g.ldc + r0) * g.c_eb, rr * g.c_eb, g.ldc * g.c_eb, cc);
   if (g.np) add(NVFP4A_ARG_NORM_PARTS, 0, c0 * g.norm_ld * 4, g.np * 4, g.norm_ld * 4, cc);
-  if (g.np && c0 && cc < g.cols && g.kind != NVFP4A_ITEM_GEMV)
+  if (g.np && c0 && cc < g.cols && g.kind != NVFP4A_ITEM_GEMV && !is_combine)
     add(NVFP4A_ARG_NORM_PARTS, 0, 0, g.np * 4, 0, 1);
   if (g.w2_eb) add(NVFP4A_ARG_W2, 0, r0 * g.w2_eb, rr * g.w2_eb, 0, 1);
   if (g.swiglu) add(NVFP4A_ARG_D, 1, (c0 * g.ldd + r0 / 2) * g.d_eb, rr / 2 * g.d_eb, g.ldd * g.d_eb, cc);
@@ -900,4 +1213,75 @@ extern "C" nvfp4a_status nvfp4a_gemm_tc_ex_items(int m, int n, int k, float alph
   int EX;
   if (nvfp4a_status st = nvfp4a::make_epilogue_ex("nvfp4a_gemm_tc_ex_items", ex, m, n, beta, ldd, &x, &EX)) return st;
   return nvfp4a::gemm_tc_run("nvfp4a_gemm_tc_ex_items", m, n, k, alpha, A, B, beta, C, ldc, D, ldd, bias, nullptr, x, EX, 0, items);
+}
+
+// ---- the GEMV cut along k -----------------------------------------------------------------------------------------------
+
+static int split_ex_mask(const nvfp4a_epilogue *x) {
+  using namespace nvfp4a::kern;
+  return x ? (x->norm_parts ? kEX_NORM : 0) | (x->swiglu ? kEX_SWIGLU : 0) | (x->d2 ? kEX_OUT2 : 0) : 0;
+}
+
+extern "C" int nvfp4a_gemv_split_max_parts(int k) { return k > 0 ? (k + 511) / 512 : 0; }
+
+extern "C" size_t nvfp4a_gemv_split_workspace_bytes(int m, int n, int k_parts, nvfp4a_dtype b_dtype, const nvfp4a_epilogue *ex) {
+  using namespace nvfp4a::kern;
+  int R, MX;
+  const void *kernel;
+  if (m <= 0 || n < 1 || n > 8 || k_parts < 1 || !gemv_item_config(b_dtype, split_ex_mask(ex), n, &R, &MX, &kernel)) return 0;
+  const long long rows = 8LL * R;
+  return static_cast<size_t>((m + rows - 1) / rows * k_parts * n * rows * 4);
+}
+
+extern "C" nvfp4a_status nvfp4a_gemv_split_items(int m, int n, int k, float alpha, const nvfp4a_tensor *A, int lda, const nvfp4a_tensor *B,
+                                                 int ldb, float beta, const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D, int ldd,
+                                                 const nvfp4a_tensor *bias, const nvfp4a_epilogue *ex, int k_parts, float *partials,
+                                                 nvfp4a_items *part, nvfp4a_items *combine) {
+  const char *fn = "nvfp4a_gemv_split_items";
+  if (!part || !combine) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: part or combine is NULL", fn);
+  if (m <= 0 || n <= 0 || n > 8 || k <= 0) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: m = %d, n = %d, k = %d (n is 1 .. 8)", fn, m, n, k);
+  if (k_parts < 1 || k_parts > nvfp4a_gemv_split_max_parts(k))
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: k_parts = %d (1 .. %d for k = %d)", fn, k_parts, nvfp4a_gemv_split_max_parts(k), k);
+  if (!partials || (reinterpret_cast<uintptr_t>(partials) & 15))
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: the partials must be 16-byte aligned", fn);
+  nvfp4a::kern::EpilogueEx x;
+  int EX;
+  if (nvfp4a_status st = nvfp4a::make_epilogue_ex(fn, ex, m, n, beta, ldd, &x, &EX)) return st;
+  for (int pass = 1; pass <= 2; ++pass)
+    if (nvfp4a_status st = nvfp4a::gemm_run(fn, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc, D, ldd, bias, x, EX, 0,
+                                            pass == 1 ? part : combine, pass, k_parts, partials))
+      return st;
+  return NVFP4A_OK;
+}
+
+// ---- the tensor-core GEMV cut along k ------------------------------------------------------------------------------------
+
+extern "C" int nvfp4a_gemv_tc_split_max_parts(int k) { return k > 0 ? (k / 64 + 3) / 4 : 0; }
+
+extern "C" size_t nvfp4a_gemv_tc_split_workspace_bytes(int m, int n, int k_parts) {
+  if (m <= 0 || n < 1 || n > 8 || k_parts < 1) return 0;
+  return static_cast<size_t>((m + 15) / 16) * k_parts * n * 16 * 4;
+}
+
+extern "C" nvfp4a_status nvfp4a_gemv_tc_split_items(int m, int n, int k, float alpha, const nvfp4a_tensor *A, const nvfp4a_tensor *B,
+                                                    int ldb, float beta, const nvfp4a_tensor *C, int ldc, const nvfp4a_tensor *D,
+                                                    int ldd, const nvfp4a_tensor *bias, const nvfp4a_epilogue *ex, int k_parts,
+                                                    float *partials, nvfp4a_items *part, nvfp4a_items *combine) {
+  const char *fn = "nvfp4a_gemv_tc_split_items";
+  nvfp4a::clear_error();
+  if (!part || !combine) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: part or combine is NULL", fn);
+  if (m <= 0 || n <= 0 || n > 8 || k <= 0) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: m = %d, n = %d, k = %d (n is 1 .. 8)", fn, m, n, k);
+  if (k % 64) return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: k = %d is not a multiple of 64", fn, k);
+  if (k_parts < 1 || k_parts > nvfp4a_gemv_tc_split_max_parts(k))
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: k_parts = %d (1 .. %d for k = %d)", fn, k_parts, nvfp4a_gemv_tc_split_max_parts(k), k);
+  if (!partials || (reinterpret_cast<uintptr_t>(partials) & 15))
+    return nvfp4a::fail(NVFP4A_INVALID_VALUE, "%s: the partials must be 16-byte aligned", fn);
+  nvfp4a::kern::EpilogueEx x;
+  int EX;
+  if (nvfp4a_status st = nvfp4a::make_epilogue_ex(fn, ex, m, n, beta, ldd, &x, &EX)) return st;
+  for (int pass = 1; pass <= 2; ++pass)
+    if (nvfp4a_status st = nvfp4a::gemv_tc_run(fn, m, n, k, alpha, A, B, ldb, beta, C, ldc, D, ldd, bias, x, EX, 0,
+                                               pass == 1 ? part : combine, pass, k_parts, partials))
+      return st;
+  return NVFP4A_OK;
 }

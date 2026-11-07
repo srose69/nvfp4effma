@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// NVFP4EffMA quantization / dequantization kernels (the arithmetic of Transformer Engine) and the entry
-// points of their instance objects (quant_nvfp4effma_inst.cu).  Host API: nvfp4effma.cu.
-//
-// The NVFP4 side's format is a template parameter QF (one instance per combination, no format test in a
-// kernel loop): kQ_SWZ swizzled scales (sld = -padded columns), kQ_UE UE5M3 scales, kQ_AMAX the global is an
-// amax (else a decode factor; NULL = 1), kQ_ROW one global per row.  The quantization kernels with one
-// global take the amax / decode factor choice at run time (QuantOut::amax): it only enters the encode /
-// decode factors, computed once per thread; with per-row globals (once per block) it stays in QF.
+// NVFP4EffMA quantization / dequantization kernels (the arithmetic of Transformer Engine) and the entry points of their
+// instance objects (quant_nvfp4effma_inst.cu); host API: nvfp4effma.cu.  The NVFP4 side's format is the template parameter QF
+// (one instance per combination, no format test in a kernel loop).
 #pragma once
 #include <type_traits>
 #include "nvfp4effma.cuh"
@@ -15,6 +10,9 @@
 namespace nvfp4a {
 namespace kern {
 
+// QF bits: kQ_SWZ swizzled scales (sld = -padded columns), kQ_UE UE5M3 scales, kQ_AMAX the global is an amax (else a decode
+// factor; NULL = 1), kQ_ROW one global per row.  Kernels with one global choose amax / decode factor at run time (QuantOut::amax),
+// which only enters the encode / decode factors computed once per thread; with per-row globals (once per block) it stays in QF.
 constexpr int kQ_SWZ = 1, kQ_UE = 2, kQ_AMAX = 4, kQ_ROW = 8, kQFormats = 16;
 // combinations Transformer Engine defines: 4over6 with an amax global and E4M3 scales; per-row globals on
 // the rowwise 1 x 16 quantization
@@ -91,12 +89,9 @@ __device__ __forceinline__ void unpack4(uint4 w, float *v) {
 template <int T>
 __device__ __forceinline__ void unpack4(uint2 w, float *v) { unpack2<T>(w.x, v[0], v[1]); unpack2<T>(w.y, v[2], v[3]); }
 
-// Rowwise 16 x 16 tiles, one warp per 16 rows x 8 blocks: each lane loads 4 values of each of the 16 rows (a
-// warp reads 8 consecutive blocks per row) and keeps them in registers, 4 lanes per block.  4 values per
-// lane, not 16 bytes: with 8 BF16 per lane the per-lane work doubles at the same occupancy (measured 2.9x
-// slower).  The tile amax, the scale and the inverse are shared by the 16 rows.  Nibbles: 16 bits per lane
-// and row (coalesced stores).  Without 4over6 only: 4over6 is bound by its divisions, and its 16 x 16 form
-// runs best on the 16-lane units (a lane per row: no error sums passed between lanes).
+// Rowwise 16 x 16 tiles, one warp per 16 rows x 8 blocks: each lane loads 4 values of each of the 16 rows (a warp reads 8 consecutive
+// blocks per row) and keeps them in registers, 4 lanes per block; tile amax, scale and inverse are shared by the 16 rows; nibbles: 16
+// bits per lane and row (coalesced stores).  Without 4over6 only: its 16 x 16 form uses 16-lane units, a lane per row (no error sums passed).
 template <int T, int QF>
 __device__ __forceinline__ void quant_tiles16(const uint8_t *__restrict__ src, int lds, int rows, int cols, const QuantOut &o,
                                               const QuantGlobal &G, float &mx) {
@@ -173,13 +168,9 @@ __device__ __forceinline__ void quant_block(const float x[16], float bmax, const
   }
 }
 
-// One output matrix per launch: the rowwise quantization of src [rows][cols] (COL = false), or the
-// columnwise one (the quantization of src^T, [cols][rows]).
-//   rowwise 1 x 16: one thread per block, consecutive threads on consecutive blocks of a row (coalesced).
-//   rowwise 16 x 16 without 4over6: quant_tiles16.
-//   16 x 16 with 4over6 and columnwise: a unit of 16 consecutive lanes owns one block column c of 16 consecutive
-//   output rows (one 16 x 16 tile), lane i the block of output row 16t + i; tiles reduce over the unit.
-//   Elements outside the matrix are 0.
+// One output matrix per launch: rowwise quantization of src [rows][cols] (COL = false) or columnwise (of src^T); elements outside
+// the matrix are 0.  Rowwise 1 x 16: a thread per block, consecutive threads on consecutive blocks (coalesced); rowwise 16 x 16 without
+// 4over6: quant_tiles16; 16 x 16 with 4over6 and columnwise: 16 consecutive lanes own a block column of 16 output rows, lane i row 16t + i.
 template <int T, bool COL, int TILE, int FOS, int QF>
 __global__ void __launch_bounds__(256)
 quantize_kernel(const uint8_t *__restrict__ src, int lds, int rows, int cols, QuantOut o, float *stat) {

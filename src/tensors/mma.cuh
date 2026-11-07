@@ -3,16 +3,6 @@
 // Warp-level instructions of the tensor-core GEMM (sm_75 .. sm_89): the integer mma of one NVFP4 block, ldmatrix, named
 // barriers, shared-memory flags; from sm_80 the BF16 mma, cp.async, mbarriers.  A wrapper an architecture lacks is not
 // declared in its device pass.
-//
-// One mma covers exactly one block of 16 k (PTX ISA, Matrix Fragments for mma.m16n8k16 with integer type;
-// g = lane / 4, t = lane % 4):
-//   A [16 m][16 k] s8   a0 = row g, k 4t .. 4t + 3;  a1 = row g + 8
-//   B [16 k][8 n] s8    b  = k 4t .. 4t + 3 of column g
-//   D [16 m][8 n] s32   d0, d1 = row g, columns 2t, 2t + 1;  d2, d3 = row g + 8
-// so the block sum p of every output is an exact integer (|p| <= 16 * 12 * 128 < 2^15) and the DP4A kernel's scale
-// steps apply to it unchanged: the accumulator starts at the bits of 1.5 * 2^23 (MAGIC), D read as FP32 is
-// 1.5 * 2^23 + p exactly.  m16n8k16 runs at the full int8 rate (an m16n8k32 sums two blocks and cannot be split);
-// sm_75: two m8n8k16 (rows 0 - 7 with a0, 8 - 15 with a1) on the same registers.
 #pragma once
 #ifndef __CUDACC_RTC__  // (NVRTC: nvfp4effma.cuh's libcu++)
 #include <stdint.h>
@@ -29,6 +19,8 @@ namespace nvfp4a {
 namespace kern {
 namespace tc {
 
+// The block sum p of every output is an exact integer (|p| <= 16 * 12 * 128 < 2^15); an accumulator starting at kMagic reads back
+// as FP32 1.5 * 2^23 + p exactly, so the DP4A kernel's scale steps apply unchanged.
 constexpr uint32_t kMagic = 0x4B400000u;  // FP32 bits of 1.5 * 2^23
 constexpr float kMagicF = 12582912.f;     // 1.5 * 2^23
 
@@ -61,12 +53,14 @@ __device__ __forceinline__ uint32_t zero_of(uint32_t b) {
   return z;
 }
 
-// d = c + A B for one block (A rows 0 - 7: a0, 8 - 15: a1); c = the MAGIC quad
+// d = c + A B for one block of 16 k (A rows 0 - 7: a0, 8 - 15: a1); c = the MAGIC quad.  Fragments of mma.m16n8k16 s8 (PTX ISA;
+// g = lane / 4, t = lane % 4): A [16 m][16 k]: a0 = row g, k 4t .. 4t + 3, a1 = row g + 8; B [16 k][8 n]: b = k 4t .. 4t + 3 of
+// column g; D [16 m][8 n] s32: d0, d1 = row g, columns 2t, 2t + 1, d2, d3 = row g + 8.  m16n8k32 would sum two blocks: not used.
 __device__ __forceinline__ void imma_block(uint32_t (&d)[4], uint32_t a0, uint32_t a1, uint32_t b, const uint32_t (&c)[4]) {
 #ifdef NVFP4A_TC80
   asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};"
       : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3]) : "r"(a0), "r"(a1), "r"(b), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]));
-#else
+#else  // sm_75: two m8n8k16 (rows 0 - 7 with a0, 8 - 15 with a1) on the same registers
   asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};"
       : "=r"(d[0]), "=r"(d[1]) : "r"(a0), "r"(b), "r"(c[0]), "r"(c[1]));
   asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0, %1}, {%2}, {%3}, {%4, %5};"

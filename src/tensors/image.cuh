@@ -1,33 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// Tensor-core images of the operands: their bytes (NVFP4 nibbles, INT8, BF16 / FP16) and raw block scale bytes in the
-// order the tensor-core kernels consume them, nothing added (rows padded with zeros).  The transcoders read every
-// source byte once.
-//
-// A (the weight): one image serves the GEMM (gemm_tc.cuh) and the GEMV (gemv_tc.cuh) -- A16 for BF16 B (W4A16), A8 for
-// INT8 / NVFP4 B (W4A8, W4A4).  [m16 slice][group of 4 k-tiles][GV = 2304 bytes], rows padded to a multiple of 128 (8
-// slices): a slice's groups along k one after the other, each its lanes' 16-byte words of the four k-tiles (data [tile
-// 4][lane 32], 512 bytes a tile) and its scales (256 bytes).  The GEMV streams a slice's groups (every load a warp's 512
-// contiguous bytes, or the scales of 4 k-tiles); the GEMM gathers a k-tile's 8 slices (512 bytes each, and their
-// groups' scales) into a slot.  Fragments (lane = 4 g + t; the k order within a k-tile is the images' choice, the same
-// for A and B):
-//   A16  the BF16 mma's 16 k need not be one NVFP4 block (the scale is in A): lane (g, t) holds block t of rows g and
-//        g + 8, word j = (row g bytes 2 j, 2 j + 1) | (row g + 8's) << 16 = k 16 t + 4 j .. + 3, those of the mma j's
-//        slots 2 t, 2 t + 1 (A0 / B0) and 2 t + 8, 2 t + 9 (A2 / B1).  Scales [lane 32][tile 4][row g, row g + 8]
-//        bytes: the lane's block t
-//   A8   the integer mma's 16 k are one block: word j = block j, lane (g, t) its k 4 t .. 4 t + 3 (bytes 2 t, 2 t + 1) of
-//        rows g (low half) and g + 8, the mma's k 4 t .. 4 t + 3.  Scales [g 8][tile 4][word row g, word row g + 8]
-//        (byte kb = block kb)
-// B (the activations, per call): one record per 128 columns and k-tile, the records of a 128-column block consecutive
-// along k, in the k order of A's image:
-//   NVFP4 (RB4 = 4608): data [0, 4096) [n8 slice pair 8][lane 32][slice 2][word 2]: word w = block 2 w's 16 bits of
-//        lane t (bytes 2 t, 2 t + 1: k 4 t .. 4 t + 3; low half), block 2 w + 1's (high); scales [4096, 4608)
-//        [pair 8][t 4][slice 2][column 2 t + c 2] words (byte kb = block kb)
-//   INT8 (RB8 = 10240): data [0, 8192) [block 4][n8 slice quad 4][lane 32][slice 4] words: column g's k 4 t .. 4 t + 3 of
-//        the block; scales [8192, 10240) [block 4][n8 slice octet 2][t 4][slice 8][column 2 t + c 2] FP32
-//   BF16 / FP16 (RBH = 16384): [column 128][16-byte chunk 8], chunk c = 2 kb + h of column r at c ^ (r % 8) (ldmatrix
-//        reads 8 columns' chunk without bank conflicts): its words (BF16 pairs) 8 t + 2 kb + h of the column's 32, so
-//        that ldmatrix gives lane t the k 16 t + 4 kb + 2 h, + 1 of the mma kb, A16's
+// Tensor-core images of the operands: their bytes (NVFP4 nibbles, INT8, BF16 / FP16) and raw block scale bytes in the order the
+// tensor-core kernels consume them, nothing added (rows padded with zeros); the transcoders read every source byte once.  Fragments:
+// lane = 4 g + t; the k order within a k-tile is the images' choice, the same for A and B.
 #pragma once
 #include "../nvfp4effma.cuh"
 #include "mma.cuh"
@@ -35,6 +10,31 @@
 namespace nvfp4a {
 namespace kern {
 namespace tc {
+
+// A (the weight): one image serves the GEMM (gemm_tc.cuh) and the GEMV (gemv_tc.cuh) -- A16 for BF16 B (W4A16), A8 for INT8 / NVFP4 B
+// (W4A8, W4A4).  [m16 slice][group of 4 k-tiles][GV = 2304 bytes], rows padded to a multiple of 128 (8 slices): a slice's groups along k
+// one after the other, each its lanes' 16-byte words of the four k-tiles (data [tile 4][lane 32], 512 bytes a tile) and its scales (256 bytes).
+
+// The GEMV streams a slice's groups (every load a warp's 512 contiguous bytes, or the scales of 4 k-tiles); the GEMM gathers a k-tile's
+// 8 slices (512 bytes each, and their groups' scales) into a slot.
+
+// A16: the BF16 mma's 16 k need not be one NVFP4 block (the scale is in A): lane (g, t) holds block t of rows g and g + 8, word j = (row g
+// bytes 2 j, 2 j + 1) | (row g + 8's) << 16 = k 16 t + 4 j .. + 3, those of the mma j's slots 2 t, 2 t + 1 (A0 / B0) and 2 t + 8, 2 t + 9
+// (A2 / B1).  Scales [lane 32][tile 4][row g, row g + 8] bytes: the lane's block t.
+
+// A8: the integer mma's 16 k are one block: word j = block j, lane (g, t) its k 4 t .. 4 t + 3 (bytes 2 t, 2 t + 1) of rows g (low half)
+// and g + 8, the mma's k 4 t .. 4 t + 3.  Scales [g 8][tile 4][word row g, word row g + 8] (byte kb = block kb).
+
+// B (the activations, per call): one record per 128 columns and k-tile, the records of a 128-column block consecutive along k, in the k
+// order of A's image.  NVFP4 (RB4): data [0, 4096) [n8 slice pair 8][lane 32][slice 2][word 2]: word w = block 2 w's 16 bits of lane t
+// (bytes 2 t, 2 t + 1: k 4 t .. 4 t + 3; low half), block 2 w + 1's (high); scales [4096, 4608) [pair 8][t 4][slice 2][column 2 t + c 2] words.
+
+// INT8 (RB8): data [0, 8192) [block 4][n8 slice quad 4][lane 32][slice 4] words: column g's k 4 t .. 4 t + 3 of the block; scales
+// [8192, 10240) [block 4][n8 slice octet 2][t 4][slice 8][column 2 t + c 2] FP32.
+
+// BF16 / FP16 (RBH): [column 128][16-byte chunk 8], chunk c = 2 kb + h of column r at c ^ (r % 8) (ldmatrix reads 8 columns' chunk without
+// bank conflicts): its words (BF16 pairs) 8 t + 2 kb + h of the column's 32, so that ldmatrix gives lane t the k 16 t + 4 kb + 2 h, + 1 of
+// the mma kb, A16's.
 
 // RA: A's data in a GEMM slot (a k-tile's 8 slices, 512 bytes each; its scales go to the slot converted); B records
 constexpr int RA = 4096, RB4 = 4608, RB8 = 10240, RBH = 16384;
@@ -177,21 +177,26 @@ __global__ void __launch_bounds__(kImgThreads) image_b4_kernel(const uint8_t *__
   reinterpret_cast<uint32_t *>(rec + RD4)[((j >> 1) * 4 + (g >> 1)) * 4 + (j & 1) * 2 + (g & 1)] = scale_word(SB, c, n, ldsb, kt);
 }
 
-// B, INT8 [n][ldb bytes] with FP32 scales [n][ldsb] -> image.  Thread = (record, n8 slice j, g): column g of slice j.
-__global__ void __launch_bounds__(kImgThreads) image_b8_kernel(const uint8_t *__restrict__ B, int ldb, const float *__restrict__ SB, int ldsb,
-                                                      int n, int tiles, uint8_t *__restrict__ img) {
-  const int tid = threadIdx.x, kt = blockIdx.x * 2 + (tid >> 7), j = (tid >> 3) & 15, g = tid & 7;
+#endif  // NVFP4A_TC_IMAGES
+
+// B, INT8 [n][ldb bytes] with FP32 scales [n][ldsb] -> image, k-tile kt of the 128-column block cb.  Thread = (record, n8 slice
+// j, g): column g of slice j; tid >> 7 selects one of the pair of k-tiles a CTA takes (kt0 + 0 / 1, valid below `tiles`).
+template <bool CG>
+__device__ __forceinline__ void image_b8_tile(const uint8_t *B, int ldb, const float *SB, int ldsb, int n, int tiles, uint8_t *img, int kt0, int cb,
+                                              unsigned tid) {
+  const int kt = kt0 + (tid >> 7), j = (tid >> 3) & 15, g = tid & 7;
   if (kt >= tiles) return;
-  const int c = blockIdx.y * 128 + 8 * j + g;
+  const int c = cb * 128 + 8 * j + g;
   uint4 v[4] = {};
   float4 sc = make_float4(0.f, 0.f, 0.f, 0.f);
   if (c < n) {
     const uint4 *q = reinterpret_cast<const uint4 *>(B + (size_t)c * ldb + 64 * (size_t)kt);
+    const float4 *s = reinterpret_cast<const float4 *>(SB + (size_t)c * ldsb + 4 * (size_t)kt);
 #pragma unroll
-    for (int kb = 0; kb < 4; ++kb) v[kb] = __ldg(q + kb);
-    sc = __ldg(reinterpret_cast<const float4 *>(SB + (size_t)c * ldsb + 4 * (size_t)kt));
+    for (int kb = 0; kb < 4; ++kb) v[kb] = CG ? __ldcg(q + kb) : __ldg(q + kb);
+    sc = CG ? __ldcg(s) : __ldg(s);
   }
-  uint8_t *rec = img + ((size_t)blockIdx.y * tiles + kt) * RB8;
+  uint8_t *rec = img + ((size_t)cb * tiles + kt) * RB8;
   uint32_t *d = reinterpret_cast<uint32_t *>(rec) + (j >> 2) * 128 + 16 * g + (j & 3);  // block 0, lane 4 g
   float *ds = reinterpret_cast<float *>(rec + RD8) + ((j >> 3) * 4 + (g >> 1)) * 16 + (j & 7) * 2 + (g & 1);
   const float sv[4] = {sc.x, sc.y, sc.z, sc.w};
@@ -203,16 +208,42 @@ __global__ void __launch_bounds__(kImgThreads) image_b8_kernel(const uint8_t *__
     ds[128 * kb] = sv[kb];
   }
 }
+#ifdef NVFP4A_TC_IMAGES
+__global__ void __launch_bounds__(kImgThreads) image_b8_kernel(const uint8_t *__restrict__ B, int ldb, const float *__restrict__ SB, int ldsb,
+                                                      int n, int tiles, uint8_t *__restrict__ img) {
+  image_b8_tile<false>(B, ldb, SB, ldsb, n, tiles, img, blockIdx.x * 2, blockIdx.y, threadIdx.x);
+}
+#endif  // NVFP4A_TC_IMAGES
 
-// B, BF16 / FP16 [n][ldb] -> image.  Thread = (column r, h): the column's 32 words of the k-tile, its chunks 2 kb + h =
-// words 8 t + 2 kb + h, t = 0 .. 3.
-__global__ void __launch_bounds__(kImgThreads) image_bh_kernel(const uint16_t *__restrict__ B, int ldb, int n, int tiles, uint8_t *__restrict__ img) {
-  const int kt = blockIdx.x, r = threadIdx.x >> 1, h = threadIdx.x & 1, col = blockIdx.y * 128 + r;
-  uint4 *rec = reinterpret_cast<uint4 *>(img + ((size_t)blockIdx.y * tiles + kt) * RBH);
+// The work item: the pair of k-tiles item % ((tiles + 1) / 2) of the 128-column block item / ((tiles + 1) / 2) (kImgThreads threads).
+struct ImageB8ItemArgs {
+  const uint8_t *b;
+  const float *sb;
+  uint8_t *img;
+  int ldb, ldsb, n, tiles;
+  const int *n_dev;
+};
+__device__ __forceinline__ void image_b8_item(const ImageB8ItemArgs &a, int item, unsigned thread, void *) {
+  const int pairs = (a.tiles + 1) / 2, n = a.n_dev ? min(a.n, __ldcg(a.n_dev)) : a.n;
+  const int cb = item / pairs;
+  if (cb * 128 >= n) return;
+  image_b8_tile<true>(a.b, a.ldb, a.sb, a.ldsb, n, a.tiles, a.img, 2 * (item % pairs), cb, thread);
+}
+
+// B, BF16 / FP16 [n][ldb] -> image, k-tile kt of the 128-column block cb.  Thread = (column r, h): the column's 32 words of the
+// k-tile, its chunks 2 kb + h = words 8 t + 2 kb + h, t = 0 .. 3.  CG: B read through L2 (produced in the same launch).
+template <bool CG>
+__device__ __forceinline__ void image_bh_tile(const uint16_t *B, int ldb, int n, int tiles, uint8_t *img, int kt, int cb, unsigned tid) {
+  const int r = tid >> 1, h = tid & 1, col = cb * 128 + r;
+  uint4 *rec = reinterpret_cast<uint4 *>(img + ((size_t)cb * tiles + kt) * RBH);
   uint32_t wd[32];
 #pragma unroll
   for (int c = 0; c < 8; ++c) {
-    const uint4 v = col < n ? __ldg(reinterpret_cast<const uint4 *>(B + (size_t)col * ldb + 64 * (size_t)kt) + c) : make_uint4(0, 0, 0, 0);
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (col < n) {
+      const uint4 *q = reinterpret_cast<const uint4 *>(B + (size_t)col * ldb + 64 * (size_t)kt) + c;
+      v = CG ? __ldcg(q) : __ldg(q);
+    }
     wd[4 * c] = v.x; wd[4 * c + 1] = v.y; wd[4 * c + 2] = v.z; wd[4 * c + 3] = v.w;
   }
 #pragma unroll
@@ -223,7 +254,25 @@ __global__ void __launch_bounds__(kImgThreads) image_bh_kernel(const uint16_t *_
     rec[r * 8 + (c ^ (r & 7))] = make_uint4(w0, w1, w2, w3);
   }
 }
+#ifdef NVFP4A_TC_IMAGES
+__global__ void __launch_bounds__(kImgThreads) image_bh_kernel(const uint16_t *__restrict__ B, int ldb, int n, int tiles, uint8_t *__restrict__ img) {
+  image_bh_tile<false>(B, ldb, n, tiles, img, blockIdx.x, blockIdx.y, threadIdx.x);
+}
 #endif  // NVFP4A_TC_IMAGES
+
+// The work item: k-tile kt = item % tiles of the 128-column block item / tiles (kImgThreads threads, no shared memory).
+// The columns computed are min(n, *n_dev); the record of a block wholly past them is left alone.
+struct ImageBhItemArgs {
+  const uint16_t *b;
+  uint8_t *img;
+  int ldb, n, tiles;
+  const int *n_dev;
+};
+__device__ __forceinline__ void image_bh_item(const ImageBhItemArgs &a, int item, unsigned thread, void *) {
+  const int kt = item % a.tiles, cb = item / a.tiles, n = a.n_dev ? min(a.n, __ldcg(a.n_dev)) : a.n;
+  if (cb * 128 >= n) return;
+  image_bh_tile<true>(a.b, a.ldb, n, a.tiles, a.img, kt, cb, thread);
+}
 
 }  // namespace tc
 }  // namespace kern

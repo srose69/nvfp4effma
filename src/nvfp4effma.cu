@@ -122,6 +122,13 @@ __global__ void quantize_int8_kernel(const uint8_t *__restrict__ src, int lds, i
   if (amax) amax_commit(amax, mx);
 }
 
+// the kernel whose resources the INT8 quantization items stand for
+const void *quantize_int8_kernel_ptr(int dtype) {
+  return dtype == NVFP4A_BF16   ? reinterpret_cast<const void *>(&quantize_int8_kernel<NVFP4A_BF16>)
+         : dtype == NVFP4A_FP16 ? reinterpret_cast<const void *>(&quantize_int8_kernel<NVFP4A_FP16>)
+                                : reinterpret_cast<const void *>(&quantize_int8_kernel<NVFP4A_FP32>);
+}
+
 }  // namespace kern
 
 nvfp4a_status check_device() {

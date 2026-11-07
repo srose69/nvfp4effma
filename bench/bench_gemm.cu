@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// nvfp4a_gemm throughput: NVFP4 weights x NVFP4 / INT8 / BF16 / FP16 / FP32 activations -> BF16, and FP32
-// accumulation, vs cuBLAS SGEMM of the same shape (FP32 in/out).  Median time per row; % of FP32 peak =
-// SMs x 128 FFMA x the SM clock measured during that very row (see bench_util.h) -- the DP4A kernel
-// (NVFP4 x NVFP4 / INT8, sm_61+) does more than one MAC per FP32 issue slot and can exceed 100 %.
+// nvfp4a_gemm: NVFP4 weights x NVFP4 / INT8 / BF16 / FP16 / FP32 activations -> BF16, and FP32 accumulation,
+// vs cuBLAS SGEMM of the same shape. Median time per row; % of FP32 peak = SMs x 128 FFMA x the row's mean SM
+// clock (bench_util.h); the DP4A kernel (NVFP4 x NVFP4 / INT8, sm_61+) does >1 MAC per FFMA slot, so can exceed 100 %.
 #include <vector>
 #include <cublas_v2.h>
 #include "../include/nvfp4effma.h"

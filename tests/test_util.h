@@ -4,17 +4,22 @@
 // documented operation order (include/nvfp4effma.h): exact block sums for NVFP4 x NVFP4 in the tiled
 // kernels, one FFMA per MAC for a dense B, and the GEMV kernel's lane order.
 #pragma once
+#include <algorithm>
+#include <atomic>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <string>
+#include <thread>
 #include <vector>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include "../include/nvfp4effma.h"
 #include "../src/nvfp4effma.cuh"  // f32_to_e2m1 / f32_to_e4m3 (host + device)
 
-static uint32_t rng = 0x2545F491u;
+static thread_local uint32_t rng = 0x2545F491u;
 static uint32_t rnd() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
 static float frnd() { return (float)(rnd() & 0xFFFFFF) / 16777216.0f * 2.f - 1.f; }
 static const char *DN[] = {"NVFP4", "BF16", "FP16", "FP32", "INT8"};  // by nvfp4a_dtype
@@ -124,10 +129,9 @@ struct Case {
   int ma = 0, mb = 0;           // their scale_max
 };
 
-// Every operand format: the block scale formats of the kernel instances (src/nvfp4effma.cuh kF_*, bits 0..3)
-// and the kinds of globals the epilogue handles (bits 4..6 here: amax, per-row A, per-row B) as NVFP4 flags of
-// A / B; the amax bit goes to A, B or both by v, scale_max 448 / 256 alternating for E4M3.  kTestFormats for
-// NVFP4 B; the other B dtypes have no B bits: test_format_a(i), i < kTestFormatsA.
+// Every operand format: the block scale formats of the kernel instances (src/nvfp4effma.cuh kF_*, bits 0..3) and the kinds of globals
+// (bits 4..6 here: amax, per-row A, per-row B) as NVFP4 flags of A / B; the amax bit goes to A, B or both by v, scale_max 448 / 256
+// alternating for E4M3.  kTestFormats for NVFP4 B; other B dtypes have no B bits: test_format_a(i), i < kTestFormatsA.
 constexpr int kTF_AMAX = 16, kTF_AROW = 32, kTF_BROW = 64, kTestFormats = 128, kTestFormatsA = 16;
 inline int test_format_a(int i) { return (i & 3) | (i & 4 ? kTF_AMAX : 0) | (i & 8 ? kTF_AROW : 0); }
 static void set_formats(Case &c, int f, int v) {
@@ -146,15 +150,25 @@ static void set_formats(Case &c, int f, int v) {
   c.mb = (c.fb & NVFP4A_GLOBAL_AMAX) && !(f & kF_BUE) && v % 4 >= 2 ? 256 : 0;
 }
 
-// Runs nvfp4a_gemm on random data and compares D and amax bit for bit with the host emulation.
-// nvfp4a_gemm_tc (B NVFP4, INT8, BF16) is tried on every case; NVFP4A_NOT_SUPPORTED from the library (no tensor-core
-// path for this B on this device or build) is reported, not failed.  Its FP32 sums are the tensor cores' (order and
-// rounding inside the mma) and stream-K's (a tile's parts summed), so its outputs are checked against a float64
-// reference within the bound of an FP32 accumulation over k plus the output's rounding instead of bit for bit.
+// Runs nvfp4a_gemm on random data and compares D and amax bit for bit with the host emulation.  nvfp4a_gemm_tc (B NVFP4, INT8, BF16) is
+// tried on every case (NVFP4A_NOT_SUPPORTED, no tensor-core path for this B on this device or build, is reported, not failed); its sums follow
+// the tensor cores' order and stream-K, so it is checked against a float64 reference within an FP32 accumulation bound plus output rounding.
 static bool tc_dtype(nvfp4a_dtype bt) { return bt == NVFP4A_NVFP4 || bt == NVFP4A_INT8 || bt == NVFP4A_BF16; }
 // relative half-ulp of an output dtype (and its smallest normal step, as an absolute floor)
 static double out_rel(nvfp4a_dtype t) { return t == NVFP4A_BF16 ? 0x1p-8 : t == NVFP4A_FP16 ? 0x1p-11 : 0x1p-24; }
 static double out_abs(nvfp4a_dtype t) { return t == NVFP4A_FP16 ? 0x1p-24 : t == NVFP4A_BF16 ? 0x1p-133 : 0x1p-149; }
+
+// A case's report goes to its own buffer when the cases run on several threads (run_cases), else to stdout.
+static thread_local std::string *report_sink = nullptr;
+static void say(const char *fmt, ...) {
+  char text[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(text, sizeof text, fmt, args);
+  va_end(args);
+  if (report_sink) *report_sink += text;
+  else fputs(text, stdout);
+}
 
 static int run_case(const Case &c) {
   const bool fp4b = c.bt == NVFP4A_NVFP4, q8b = c.bt == NVFP4A_INT8, blk = fp4b || q8b;
@@ -221,7 +235,7 @@ static int run_case(const Case &c) {
       cudaMemcpy(got3.data(), dD2, got3.size(), cudaMemcpyDeviceToHost); cudaMemcpy(&gamax3, damax2, 4, cudaMemcpyDeviceToHost);
     }
     for (void *q : {ia, ib, (void *)dD2, (void *)damax2}) cudaFree(q);
-    if (st2 == NVFP4A_NOT_SUPPORTED) { printf("   nvfp4a_gemm_tc: %s\n", nvfp4a_last_error()); tc = false; st2 = NVFP4A_OK; }
+    if (st2 == NVFP4A_NOT_SUPPORTED) { say("   nvfp4a_gemm_tc: %s\n", nvfp4a_last_error()); tc = false; st2 = NVFP4A_OK; }
   }
 
   auto Bval = [&](int j, int kk) { return fp4b ? hBq.val(j, kk) : hload(c.bt, hB.data(), (size_t)j * ldb + kk); };
@@ -305,18 +319,45 @@ static int run_case(const Case &c) {
   const bool amax_ok = gamax == eamax, amax2_ok = !tc || fabs(gamax2 - eamax) <= 0x1p-7 * eamax;
   const bool amax3_ok = !tc || got3.empty() || fabs(gamax3 - eamax) <= 0x1p-7 * eamax;
   const int fail = st != NVFP4A_OK || st2 != NVFP4A_OK || ce != cudaSuccess || bad || bad2 || bad3 || !amax_ok || !amax2_ok || !amax3_ok;
-  printf("%s m=%4d n=%4d k=%5d B=%-5s D=%s C=%-5s bias=%-4s a=%.2f b=%5.2f fa=%x/%d fb=%x/%d : %s%s\n", gemv ? "gemv" : "gemm",
+  say("%s m=%4d n=%4d k=%5d B=%-5s D=%s C=%-5s bias=%-4s a=%.2f b=%5.2f fa=%x/%d fb=%x/%d : %s%s\n", gemv ? "gemv" : "gemm",
          c.m, c.n, c.k, DN[c.bt], DN[c.dt], c.ct >= 0 ? DN[c.ct] : "accum", c.bias >= 0 ? DN[c.bias] : "-", c.alpha, c.beta,
          c.fa, c.ma, c.fb, c.mb, fail ? "FAIL" : "ok", amax_ok ? "" : " (amax mismatch)");
-  if (bad) printf("   %zu bytes differ\n", bad);
-  if (tc) printf("   nvfp4a_gemm_tc: max |error| / bound = %.3f%s%s\n", worst, bad2 ? " (out of bound)" : "", amax2_ok ? "" : " (amax mismatch)");
+  if (bad) say("   %zu bytes differ\n", bad);
+  if (tc) say("   nvfp4a_gemm_tc: max |error| / bound = %.3f%s%s\n", worst, bad2 ? " (out of bound)" : "", amax2_ok ? "" : " (amax mismatch)");
   if (tc && !got3.empty())
-    printf("   nvfp4a_gemv_tc: max |error| / bound = %.3f%s%s\n", worst3, bad3 ? " (out of bound)" : "", amax3_ok ? "" : " (amax mismatch)");
-  if (st != NVFP4A_OK) printf("   status %s: %s\n", nvfp4a_status_string(st), nvfp4a_last_error());
-  if (st2 != NVFP4A_OK) printf("   nvfp4a_gemm_tc status %s: %s\n", nvfp4a_status_string(st2), nvfp4a_last_error());
-  if (ce) printf("   cuda %s\n", cudaGetErrorString(ce));
+    say("   nvfp4a_gemv_tc: max |error| / bound = %.3f%s%s\n", worst3, bad3 ? " (out of bound)" : "", amax3_ok ? "" : " (amax mismatch)");
+  if (st != NVFP4A_OK) say("   status %s: %s\n", nvfp4a_status_string(st), nvfp4a_last_error());
+  if (st2 != NVFP4A_OK) say("   nvfp4a_gemm_tc status %s: %s\n", nvfp4a_status_string(st2), nvfp4a_last_error());
+  if (ce) say("   cuda %s\n", cudaGetErrorString(ce));
   for (void *p : {(void *)dA, (void *)dSA, (void *)dB, (void *)dSB, (void *)dC, (void *)dD, (void *)dbias, (void *)dga,
                   (void *)dgb, (void *)damax})
     cudaFree(p);
   return fail;
+}
+
+// The cases on one thread each (the host emulation is the time), reports printed in order; the data of a case depends on
+// its number alone.  Returns the number of failed cases.
+static int run_cases(const std::vector<Case> &cases) {
+  std::vector<std::string> reports(cases.size());
+  std::vector<int> failed(cases.size(), 0);
+  std::atomic<size_t> next{0};
+  const auto worker = [&] {
+    cudaFree(nullptr);
+    for (size_t i; (i = next++) < cases.size();) {
+      rng = 0x2545F491u + 0x9E3779B9u * static_cast<uint32_t>(i);
+      report_sink = &reports[i];
+      failed[i] = run_case(cases[i]);
+      report_sink = nullptr;
+    }
+  };
+  std::vector<std::thread> pool;
+  const size_t threads = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), cases.size());
+  for (size_t t = 0; t < threads; ++t) pool.emplace_back(worker);
+  for (std::thread &t : pool) t.join();
+  int fails = 0;
+  for (size_t i = 0; i < cases.size(); ++i) {
+    fputs(reports[i].c_str(), stdout);
+    fails += failed[i];
+  }
+  return fails;
 }

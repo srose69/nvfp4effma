@@ -1,22 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 // Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
-// NVFP4EffMA core (src/nvfp4effma.cuh), exhaustively, and nvfp4a_quantize / nvfp4a_dequantize:
-//  1. block  : the DP4A kernel's scale step -- y = fma(bits(0x4B400000 + p), sa, -1.5 * 2^23 * sa) ==
-//              p * sa exactly, for every block sum p in [-24384, 24384] (NVFP4 x NVFP4: |p| <= 2304,
-//              NVFP4 x INT8: |p| <= 16 * 12 * 127) and every finite E4M3 scale.
-//  2. dec4   : the PRMT lookup (4 nibbles -> 4 int8) == 2 * value for all 2^16 inputs, and the FP32
-//              decode e2m1_value<0 / 1> of every nibble at every position of a word.
-//  3. prod   : the dense-B MAC operands -- mul_rn(e2m1, sa) times every BF16 / FP16 value, for every
-//              nibble and finite scale (2^28 cases each), equals the exact product whenever that is a
-//              normal FP32 number (checked in double).
-//  4. rne    : FP32 -> BF16 rounding on every FP32 bit pattern vs an independent remainder-comparison
-//              RNE (NaN -> 0x7FC0).
-//  5. e2m1, e4m3 : FP32 -> E2M1 / E4M3 encoding on every FP32 bit pattern vs an independent search for
-//              the nearest value (midpoint table, ties to the even code, saturation; NaN: E2M1 +-6, E4M3
-//              0x7F).
-//  6. nvfp4a_quantize / nvfp4a_dequantize: BF16 / FP16 / FP32 data with zero, tiny and saturating
-//              blocks, padded leading dimensions, against the host emulation of the documented formulas;
-//              nvfp4a_quantize to INT8 likewise.
+// NVFP4EffMA core (src/nvfp4effma.cuh), exhaustively, and nvfp4a_quantize / nvfp4a_dequantize (cases listed beside their runs in main).
 // Build with -DNVFP4A_NEGATIVE_CONTROLS to check that deliberately broken variants are rejected.
 #include "test_util.h"
 
@@ -488,18 +472,29 @@ int main(int argc, char **argv) {
   const uint64_t blocks = (2ull * 24384 + 1) * 256;
 #ifndef NVFP4A_NEGATIVE_CONTROLS
   int fails = 0;
+  // block: the DP4A kernel's scale step y = fma(bits(0x4B400000 + p), sa, -1.5 * 2^23 * sa) == p * sa exactly, for every block sum p in
+  // [-24384, 24384] (NVFP4 x NVFP4: |p| <= 2304, NVFP4 x INT8: |p| <= 16 * 12 * 127) and every finite E4M3 scale
   fails += run("block", BLOCK(block_ok), blocks);
+  // dec4: the PRMT lookup (4 nibbles -> 4 int8) == 2 * value for all 2^16 inputs; e2m1 decode: the FP32 e2m1_value<0 / 1> of every
+  // nibble at every position of a word
   fails += run("dec4", DEC4(dec4_ok), 1ull << 16);
   fails += run("e2m1 decode", [](uint64_t, uint64_t, Err *d) { k_e2m1_decode<<<1, 128>>>(d); }, 128);
+  // prod: the dense-B MAC operands, mul_rn(e2m1, sa) times every BF16 / FP16 value, for every nibble and finite scale (2^28 cases each),
+  // equal the exact product whenever that is a normal FP32 number (checked in double)
   fails += run("prod bf16", PROD(NVFP4A_BF16), 1ull << 28);
   fails += run("prod fp16", PROD(NVFP4A_FP16), 1ull << 28);
+  // rne: FP32 -> BF16 rounding on every FP32 bit pattern vs an independent remainder-comparison RNE (NaN -> 0x7FC0)
   fails += run("rne", RNE(rne_ok), total);
+  // e2m1, e4m3: FP32 -> E2M1 / E4M3 encoding on every FP32 bit pattern vs an independent search for the nearest value (midpoint
+  // table, ties to the even code, saturation; NaN: E2M1 +-6, E4M3 0x7F)
   fails += run("e2m1", ENC(4, e2m1_ok), total);
   fails += run("e2m1 sel", ENC(4, e2m1_sel_ok), total);
   fails += run("div 1536", [](uint64_t b, uint64_t n, Err *d) { k_div<1536><<<1024, 256>>>(b, n, d); }, total);
   fails += run("div 2688", [](uint64_t b, uint64_t n, Err *d) { k_div<2688><<<1024, 256>>>(b, n, d); }, total);
   fails += run("e4m3", ENC(8, e4m3_ok), total);
   fails += run("ue5m3", ENC(5, ue5m3_ok), total);
+  // nvfp4a_quantize / nvfp4a_dequantize: BF16 / FP16 / FP32 data with zero, tiny and saturating blocks, padded leading dimensions,
+  // against the host emulation of the documented formulas; nvfp4a_quantize to INT8 likewise
   for (nvfp4a_dtype t : {NVFP4A_BF16, NVFP4A_FP16, NVFP4A_FP32}) {
     fails += test_quant_simple(t, 3, 16);
     fails += test_quant_simple(t, 517, 1056);

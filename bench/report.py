@@ -2,10 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only WITH AdditionRef-Linking-Attribution-Exception
 # Copyright (C) 2026 srose69. NVFP4EffMA; see NOTICE, LICENSE and LICENSE-EXCEPTION (additional terms).
 """Turn a bench/run_bench.sh result directory into benches/<gpu>.md and its row in benches/table.md.
-
-usage: bench/report.py <result dir> [<benches dir>]
-The result directory holds env.txt (key=value lines), bench_gemm.txt, bench_gemv.txt,
-bench_quant.txt and clocks_<bench>.csv as written by bench/run_bench.sh.
+usage: bench/report.py <result dir> [<benches dir>]  (env.txt, bench_{gemm,gemv,quant}.txt, clocks_<bench>.csv)
 """
 import csv, os, re, sys
 
@@ -84,8 +81,7 @@ def main(res, out_dir):
     q = quant_rows(os.path.join(res, 'bench_quant.txt'))
     cl = {b: clocks(os.path.join(res, f'clocks_bench_{b}.csv')) for b in ('gemm', 'gemv', 'quant')}
     cub = g.get('cuBLAS SGEMM FP32 -> FP32, TN') or g.get('cuBLAS SGEMM TN FP32 -> FP32')
-    # SM count and bus width come from cudaDeviceProp via the benchmark headers (nvidia-smi -q no
-    # longer reports them on recent drivers)
+    # SM count and bus width come from cudaDeviceProp via the benchmark headers
     sms = re.search(r', (\d+) SMs;', open(os.path.join(res, 'bench_gemm.txt')).read())
     if sms and not env.get('sms'): env['sms'] = sms.group(1)
     if vh.get('bus') and 'bus' not in env.get('memory', ''): env['memory'] = f"{env.get('memory', '?')}, {vh['bus']}-bit bus"

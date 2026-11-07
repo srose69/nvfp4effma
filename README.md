@@ -89,8 +89,14 @@ and creating them costs more than using them — quantize once, not per call
 - **Every NVIDIA NVFP4 variant** in GEMM, GEMV, quantization and dequantization, with Transformer Engine's
   arithmetic bit for bit (see [NVIDIA NVFP4 variants](#nvidia-nvfp4-variants)); scale layout conversion
   (linear ↔ GEMM-swizzled) and the transpose of 16 × 16-tiled tensors.
+- **Grouped GEMM for mixture-of-experts layers** (`nvfp4a_gemm_grouped`, `grouped_linear`): the experts' stacked NVFP4
+  weights times each expert's rows in one launch, for every operand format of `nvfp4a_gemm` (scales E4M3 / UE5M3, linear or
+  swizzled, B NVFP4 / INT8 / dense, bias, C), with the row counts on the device (no host synchronization,
+  graph-capturable); each output is `nvfp4a_gemm`'s byte for byte.
+- **Every Python call is a PyTorch operator** (`torch.ops.nvfp4effma.*`) with a schema and a Meta kernel: `torch.compile`
+  traces it as one node and CUDA graphs capture it (nothing is read back to the host).
 - **PyTorch bindings**: functional API (`quantize`, `quantize_int8`, `dequantize`, `linear` with
-  `act="auto" / "exact" / "int8" / "nvfp4"`), `NVFP4Tensor`, `Int8Tensor`, `TCWeight`, and `NVFP4Linear` with
+  `act="auto" / "exact" / "int8" / "nvfp4"`, `grouped_linear`), `NVFP4Tensor`, `Int8Tensor`, `TCWeight`, and `NVFP4Linear` with
   `quantize_linear_`, which swaps the `nn.Linear` layers of a model; `get_include()` for CUDA extensions
   that build on the device-side codecs.
 - **Strict input checking** with readable errors in C (`nvfp4a_last_error`) and Python (`TypeError` /

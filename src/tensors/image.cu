@@ -28,6 +28,9 @@ cudaError_t tc_image_a_raw(bool h, const uint8_t *src, int m, int k, uint8_t *da
   else tc::image_a_convert_kernel<false, true><<<grid, 128, 0, s>>>(src, data, m, tiles, ldd, lds, scales);
   return cudaGetLastError();
 }
+const void *image_bh_kernel_ptr() { return reinterpret_cast<const void *>(&tc::image_bh_kernel); }
+const void *image_b8_kernel_ptr() { return reinterpret_cast<const void *>(&tc::image_b8_kernel); }
+
 cudaError_t tc_image_b(int tb, const uint8_t *B, int ldb, const uint8_t *SB, int ldsb, int n, int k, uint8_t *img, cudaStream_t s) {
   const int tiles = k / 64;
   const dim3 grid((tiles + 1) / 2, (n + 127) / 128);

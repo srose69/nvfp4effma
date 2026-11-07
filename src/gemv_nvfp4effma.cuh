@@ -9,35 +9,26 @@
 namespace nvfp4a {
 namespace kern {
 
-// ---------------------------------------------------------------------------------------------
-// GEMV / small batch (A NVFP4 m x k, x n <= 8 rows of k values, NVFP4 / INT8 / BF16 / FP16 / FP32): every byte
-// of A read once.  A warp owns R rows; per pass a lane reads one NVFP4 block (8 bytes + its scale) of
-// each row; x values are converted once per pass and reused for all R rows.  Dense x: 16 x NB FFMAs per
-// row and pass (x in two halves of 8, which bounds the registers), lane l accumulating k = 512c + 16l + j
-// in (c, j) order.  NVFP4 / INT8 x: per row, column and block the exact block sum, lane l accumulating the
-// blocks 32c + l.  Lanes are then combined with a butterfly (xor 16, 8, 4, 2, 1) -- tests/test_gemv.cu
-// emulates exactly this order.
-// ---------------------------------------------------------------------------------------------
-// MAXNB: largest n the configuration is a candidate for (beyond it R x NB accumulators and x values
-// exceed the register budget on every target -- all have 64K registers per SM).
+// GEMV / small batch (A NVFP4 m x k, x n <= 8 rows of k values, NVFP4 / INT8 / BF16 / FP16 / FP32): every byte of A is read once.
+// A warp owns R rows; per pass a lane reads one NVFP4 block (8 bytes + its scale) of each row, x values are converted once per
+// pass and reused for all R rows.  Lanes combine with a butterfly (xor 16, 8, 4, 2, 1) -- tests/test_gemv.cu emulates this order.
 template <int R_, int MAXNB_>
 struct GemvCfg {
+  // MAXNB: largest n the configuration is a candidate for (beyond it R x NB accumulators and x values exceed the register
+  // budget on every target -- all have 64K registers per SM)
   static constexpr int R = R_, WARPS = 8, MAXNB = MAXNB_;
   template <int NB, int XT> struct On { static constexpr bool value = true; };
 };
 
-// The rows row0 .. row0 + R - 1 of a warp (`lane` its lane), over k in [k0, k1) (k0 a multiple of 512): every sum of a
-// (row, column), reduced over the lanes and scaled back exactly (not by the epilogue's scale), goes to
-// out.store(row, column, value) on the lane that owns it (between out.begin() and out.end()), rows past m skipped.  The
-// R rows' loads of a pass are issued together.  The work of a warp of gemv_kernel and of a caller that gives its warps
-// rows itself (a persistent program).
-// F: operand formats (kF_*).  The scales of the x rows of a launch start at SX (the host offsets SX to the
-// launch's first row, a multiple of 8, so in the swizzled layout row b of the launch is 16 b bytes on).
-// CG: x and its block scales read through L2 for an intra-launch consumer.
+// Rows row0 .. row0 + R - 1 of a warp (`lane` its lane) over k in [k0, k1) (k0 a multiple of 512), for gemv_kernel and persistent callers:
+// every (row, column) sum, reduced over the lanes and scaled back exactly (not by the epilogue's scale), goes to out.store(row, column,
+// value) on the lane that owns it (between out.begin() and out.end()), rows past m skipped; the R rows' loads of a pass are issued together.
 template <int R, int NB, int XT, int F, class Out, bool CG = false>
 __device__ __forceinline__ void gemv_warp(const uint8_t *__restrict__ A, int lda, const uint8_t *__restrict__ SA, int ldsa,
                                           const uint8_t *__restrict__ X, int ldx, const uint8_t *__restrict__ SX, int ldsx, int m,
                                           int row0, int lane, int k0, int k1, Out &out) {
+  // F: operand formats (kF_*); CG: x and its block scales read through L2 for an intra-launch consumer; SX: the scales of the
+  // launch's x rows (the host offsets it to the launch's first row, a multiple of 8: in the swizzled layout row b is 16 b bytes on)
   float acc[R][NB];
 #pragma unroll
   for (int r = 0; r < R; ++r)
@@ -62,8 +53,8 @@ __device__ __forceinline__ void gemv_warp(const uint8_t *__restrict__ A, int lda
       else sa[r] = scale_val<UEA>(SA[row * ldsa + kb / 16]);
     }
     if (XT == NVFP4A_NVFP4 || XT == NVFP4A_INT8) {
-      // NVFP4 / INT8 x: the exact block sum p of every (row, column), then acc = fma(p * sa, sx, acc) -- the
-      // values of the tiled kernels.  DP4A on int8 from sm_61, FFMA on integer-valued floats below.
+      // NVFP4 / INT8 x: the exact block sum p of every (row, column), lane l accumulating blocks 32c + l, acc = fma(p * sa, sx, acc)
+      // -- the values of the tiled kernels.  DP4A on int8 from sm_61, FFMA on integer-valued floats below.
       float sx[NB];
 #pragma unroll
       for (int b = 0; b < NB; ++b)
@@ -113,9 +104,9 @@ __device__ __forceinline__ void gemv_warp(const uint8_t *__restrict__ A, int lda
         }
 #endif
     } else {
-      // dense x: one FFMA per MAC with a = e2m1 * sa * 2^-9 (2^-15 for UE5M3 scales, up to 2^17), decoded
-      // with a single FMUL (the raw E2M1 encoding value * 2^-126 times sa * 2^117 / 2^111, which cannot
-      // overflow); the 2^9 / 2^15 returns before the epilogue, exactly
+      // dense x: 16 x NB FFMAs per row and pass (x in two halves of 8, which bounds the registers), lane l accumulating
+      // k = 512c + 16l + j in (c, j) order; a = e2m1 * sa * 2^-9 (2^-15 for UE5M3) by one FMUL (raw E2M1 encoding value * 2^-126
+      // times sa * 2^117 / 2^111, cannot overflow); the 2^9 / 2^15 is restored exactly before the epilogue
 #pragma unroll
       for (int r = 0; r < R; ++r) sa[r] = mul_rn(sa[r], UEA ? 0x1p111f : 0x1p117f);
 #pragma unroll
@@ -268,6 +259,7 @@ __device__ __forceinline__ void gemv_item(const GemvItemArgs &a, int item, unsig
 template <class C, int XT, int EX, int N, bool CG = true>
 __device__ __forceinline__ void gemv_group_item(const GemvItemArgs &base, int item, unsigned thread, void *smem) {
   const int mt = (base.m + C::WARPS * C::R - 1) / (C::WARPS * C::R), j0 = item / mt * 8;
+  if (j0 >= items_columns(base.x, N)) return;  // (CTA-uniform) a group past the columns computed
   GemvItemArgs a = base;
   const auto bytes = [](int t) { return t == NVFP4A_FP32 ? 4 : 2; };
   a.X += (size_t)j0 * a.ldx * Elem<XT>::bytes;
@@ -285,12 +277,66 @@ __device__ __forceinline__ void gemv_group_item(const GemvItemArgs &base, int it
   else gemv_item<C, 8, XT, 0, EX, CG>(a, item % mt, thread, smem);
 }
 
-// The EX tail lowers ptxas's register allocation of INT8 (127 -> 100) and with it the k-loop's
-// memory-level parallelism: the loop runs at ~0.6x the plain kernel's bandwidth (the BF16 kernels'
-// loops stay identical).  A 2-CTA floor restores the budget (124 registers, the plain kernel's load
-// schedule; measured in handoff_fbla/tools/probe_gemv_ex.cu).  BF16 needs its full 133 registers
-// (a 128 cap spills 8 bytes and slows gate_up by ~8%), so it keeps the plain kernel's bound.  The two
-// variants are overloads on a hand-rolled SFINAE guard: <type_traits> does not compile under NVRTC.
+// The GEMV cut along k (include/nvfp4effma_items.h): part items -- a block of rows over a part of k, the lanes' reduced sums
+// to FP32 partials -- and combine items -- a block of rows: its parts added in order, then the epilogue.  The partials of a
+// block: [part][column][ROWS] floats, the blocks one after the other.
+struct GemvSplitArgs {
+  GemvItemArgs g;
+  float *partials;
+  int parts;
+};
+// part p of `parts` over k: the 512-value units [p U / parts, (p + 1) U / parts)
+__host__ __device__ __forceinline__ void gemv_part_range(int k, int parts, int part, int *k0, int *k1) {
+  const long long units = (k + 511) / 512;
+  const long long u1 = (part + 1) * units / parts;
+  *k0 = static_cast<int>(part * units / parts) * 512;
+  *k1 = u1 * 512 < k ? static_cast<int>(u1) * 512 : k;
+}
+template <int ROWS>
+struct PartOut {
+  float *dst;  // [column][ROWS] of this block and part
+  int r0;
+  __device__ __forceinline__ void begin() {}
+  __device__ __forceinline__ void store(int i, int j, float v) { __stcg(dst + j * ROWS + (i - r0), v); }
+  __device__ __forceinline__ void end() {}
+};
+template <class C, int NB, int XT, int F>
+__device__ __forceinline__ void gemv_part_item(const GemvSplitArgs &s, int item, unsigned thread, void *) {
+  constexpr int ROWS = C::WARPS * C::R;
+  const int blocks = (s.g.m + ROWS - 1) / ROWS, block = item % blocks, part = item / blocks;
+  int k0, k1;
+  gemv_part_range(s.g.k, s.parts, part, &k0, &k1);
+  PartOut<ROWS> out{s.partials + (static_cast<size_t>(block) * s.parts + part) * NB * ROWS, block * ROWS};
+  gemv_rows<C, NB, XT, F, PartOut<ROWS>, true>(s.g.A, s.g.lda, s.g.SA, s.g.ldsa, s.g.X, s.g.ldx, s.g.SX, s.g.ldsx, s.g.m, block, thread, k0, k1,
+                                              out);
+}
+template <class C, int NB, int EX>
+__device__ __forceinline__ void gemv_combine_item(const GemvSplitArgs &s, int item, unsigned thread, void *smem) {
+  constexpr int ROWS = C::WARPS * C::R;
+  const float *p = s.partials + static_cast<size_t>(item) * s.parts * NB * ROWS;
+  const auto run = [&](auto &out) {
+    out.begin();
+    for (int o = static_cast<int>(thread); o < ROWS * NB; o += C::WARPS * 32) {
+      const int r = o / NB, j = o - r * NB, row = item * ROWS + r;
+      if (row >= s.g.m) continue;
+      float v = __ldcg(p + j * ROWS + r);
+      for (int q = 1; q < s.parts; ++q) v = __fadd_rn(v, __ldcg(p + (static_cast<size_t>(q) * NB + j) * ROWS + r));
+      out.store(row, j, v);
+    }
+    out.end();
+  };
+  if (EX) {
+    EpiOutEx<C, NB, EX, true> out{s.g.e, s.g.x, static_cast<float *>(smem), item * ROWS, s.g.m, static_cast<int>(thread & 31), static_cast<int>(thread), {}};
+    run(out);
+  } else {
+    EpiOut<true> out{s.g.e, {}};
+    run(out);
+  }
+}
+
+// The EX tail lowers ptxas's register allocation for INT8, cutting the k-loop's memory-level parallelism; a 2-CTA floor
+// restores the plain kernel's load schedule.  BF16 keeps the plain kernel's bound (a 128-register cap spills).  The two variants
+// are overloads on a hand-rolled SFINAE guard: <type_traits> does not compile under NVRTC.
 template <bool B> struct GemvExOnly;  // (undefined when the guard fails)
 template <> struct GemvExOnly<true> { using type = int; };
 
