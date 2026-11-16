@@ -8,10 +8,10 @@
 #include <stdint.h>
 #endif
 
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900)
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 900) || __CUDA_ARCH__ >= 1000
 #define NVFP4A_TC 1
 #endif
-#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 900)
+#if !defined(__CUDA_ARCH__) || (__CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 900) || __CUDA_ARCH__ >= 1000
 #define NVFP4A_TC80 1
 #endif
 

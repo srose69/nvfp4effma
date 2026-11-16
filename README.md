@@ -139,7 +139,7 @@ swizzled=True, ...)`, `NVFP4Tensor.from_te`).
 | Ampere / Orin | sm_80, sm_86, sm_87 | ⚙️ compiles, untested; tensor-core paths as on Ada |
 | Ada | sm_89 | ✅ tensor-core paths tested (L40S) |
 | Hopper | sm_90 | ⚙️ compiles, untested, no tensor-core path (DP4A / FFMA) |
-| Blackwell | sm_100+ | ❌ excluded on purpose — native FP4, use cuBLASLt / TE |
+| Blackwell | sm_100+ | ⚙️ builds and uses the legacy `mma.sync` (INT8, BF16) and CUDA-core paths, untested on hardware. Its native FP4 mma takes FP4 on both operands, so the mixed W4A16 / W4A8 products of this library have no native form; FP4 x FP4 (cuBLASLt / TE) is faster there |
 
 ## Installation
 

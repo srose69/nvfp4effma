@@ -26,8 +26,8 @@ make install PREFIX=...     # header, static library, pkg-config file
 Variables: `ARCHS`, `GPU`, `CUDA_HOME` (default `/usr/local/cuda`), `CCBIN`, `JOBS`, `JOB_MB`,
 `OBJDIR` (where the multi-architecture objects go), `PREFIX`, `DESTDIR`.
 
-The library ships SASS only (no PTX), so it is never JIT-compiled onto GPUs it was not built for — in
-particular not onto sm_100+, which has native FP4; building for those targets stops with `#error`. A
+The library ships SASS only (no PTX), so it is never JIT-compiled onto GPUs it was not built for. sm_100+
+(native FP4) builds too and runs the legacy `mma.sync` and CUDA-core paths there. A
 GPU missing from `ARCHS` gets a clear error at run time (`nvfp4a_last_error`).
 
 ## Parallel build

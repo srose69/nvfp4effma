@@ -22,10 +22,13 @@ using cuda::std::size_t; using cuda::std::uintptr_t;
 #include <cuda_fp16.h>
 #include "../include/nvfp4effma.h"
 
-// Build policy: only for targets without native FP4 (sm_100+ has it: use cuBLASLt / TE there).
+// Build policy: sm_50 and newer. sm_100+ has FP4 support, but not the whole of it and not quite the kind this library
+// needs: the block-scaled mma takes FP4 on BOTH operands (e2m1, ue4m3 / ue8m0 scales per 16 / 32 of k), so the
+// mixed products here (NVFP4 weights x BF16 / INT8 activations, linear scales, the global encoding) have no native
+// form. They keep running on the legacy mma.sync (INT8, BF16) and CUDA-core paths, which sm_100+ still executes.
 #if defined(__CUDA_ARCH__)
-#if __CUDA_ARCH__ < 500 || __CUDA_ARCH__ >= 1000
-#error "NVFP4EffMA targets sm_50..sm_90 (no native FP4); exclude it from sm_100+ builds."
+#if __CUDA_ARCH__ < 500
+#error "NVFP4EffMA targets sm_50 and newer."
 #endif
 #endif
 
@@ -453,8 +456,8 @@ constexpr bool gemv_selected(int cc, int id, int xt, int nb) {
 #endif
 
 // Host: the current device's SM count and table (src/nvfp4effma.cu).  sass = the SASS version the device runs (DP4A from 61);
-// ptx = the PTX version its code was built from, which decides the tensor-core paths (tc: 75 to 89, W4A16 from 80; NVFP4A_DP4A=1
-// turns them off), equal to sass for SASS builds.  supported = false for native FP4 (sm_100+), < sm_50, or no runnable SASS.
+// ptx = the PTX version its code was built from, which decides the tensor-core paths (tc: 75 to 89 and 100+, W4A16 from 80;
+// NVFP4A_DP4A=1 turns them off), equal to sass for SASS builds.  supported = false for < sm_50 or no runnable SASS.
 struct DeviceInfo { int cc, sass, ptx, sms; bool supported, tc; const ArchTable *table; };
 const DeviceInfo &device_info();
 

@@ -47,9 +47,9 @@ const DeviceInfo &device_info() {
     if (!loads) cudaGetLastError();  // "no kernel image" is reported by check_device, not left sticky
     d.sass = loads ? fa.binaryVersion : 0;
     d.ptx = loads ? fa.ptxVersion : 0;
-    d.supported = loads && d.cc >= 50 && d.cc < 100;
+    d.supported = loads && d.cc >= 50;
     const char *dp4a = getenv("NVFP4A_DP4A");
-    d.tc = loads && d.ptx >= 75 && d.ptx <= 89 && !(dp4a && dp4a[0] == '1');
+    d.tc = loads && d.ptx >= 75 && (d.ptx <= 89 || d.ptx >= 100) && !(dp4a && dp4a[0] == '1');
     d.table = &kTables[loads && d.sass == d.cc ? table_index(d.cc) : 0];
   }
   return d;
@@ -137,9 +137,6 @@ nvfp4a_status check_device() {
   if (e != cudaSuccess) return cuda_status(e, "cudaGetDevice");
   const kern::DeviceInfo &d = kern::device_info();
   if (d.supported) return NVFP4A_OK;
-  if (d.cc >= 100)
-    return fail(NVFP4A_NOT_SUPPORTED, "device %d is sm_%d, which has native FP4: use cuBLASLt / Transformer Engine "
-                "(NVFP4EffMA targets sm_50..sm_90)", dev, d.cc);
   if (d.cc < 50) return fail(NVFP4A_NOT_SUPPORTED, "device %d is sm_%d; NVFP4EffMA needs sm_50 or newer", dev, d.cc);
   return fail(NVFP4A_NOT_SUPPORTED, "device %d is sm_%d, but this build of the library has no code for it: "
               "rebuild with ARCHS including %d", dev, d.cc, d.cc);
